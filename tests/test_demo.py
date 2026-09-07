@@ -25,7 +25,7 @@ def corpus(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     directory = tmp_path_factory.mktemp("corpus")
     db_path = directory / "demo.db"
     manifest_path = directory / "manifest.json"
-    seed_demo(db_path, manifest_path)
+    seed_demo(db_path, manifest_path, directory / "decoys.json")
     return db_path, manifest_path
 
 
@@ -42,8 +42,8 @@ def _manifest(manifest_path: Path) -> list[dict[str, Any]]:
 def test_seed_is_byte_identical_across_runs(tmp_path: Path) -> None:
     """Faker is seeded, so the ground truth must not drift between runs."""
     first, second = tmp_path / "a.json", tmp_path / "b.json"
-    seed_demo(tmp_path / "a.db", first)
-    seed_demo(tmp_path / "b.db", second)
+    seed_demo(tmp_path / "a.db", first, tmp_path / "a-decoys.json")
+    seed_demo(tmp_path / "b.db", second, tmp_path / "b-decoys.json")
     assert first.read_bytes() == second.read_bytes()
 
 

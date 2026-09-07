@@ -31,6 +31,7 @@ from faker import Faker
 
 from veil_pii_middleware.core.detector import (
     EntityType,
+    detect_regex,
     valid_card,
     valid_dni,
     valid_iban,
@@ -38,11 +39,20 @@ from veil_pii_middleware.core.detector import (
     valid_spanish_phone,
 )
 
-__all__ = ["Instance", "DEFAULT_DB_PATH", "DEFAULT_MANIFEST_PATH", "SEED", "seed_demo"]
+__all__ = [
+    "Decoy",
+    "Instance",
+    "DEFAULT_DB_PATH",
+    "DEFAULT_DECOYS_PATH",
+    "DEFAULT_MANIFEST_PATH",
+    "SEED",
+    "seed_demo",
+]
 
 SEED: Final = 20260907
 DEFAULT_DB_PATH: Final = Path("demo/veil_demo.db")
 DEFAULT_MANIFEST_PATH: Final = Path("demo/manifest.json")
+DEFAULT_DECOYS_PATH: Final = Path("demo/decoys.json")
 
 N_CUSTOMERS: Final = 20
 N_USERS: Final = 50
@@ -89,6 +99,9 @@ CREATE TABLE error_logs (
 CREATE TABLE webhooks (
     id INTEGER PRIMARY KEY, event TEXT NOT NULL, payload TEXT NOT NULL
 );
+CREATE TABLE decoy_samples (
+    id INTEGER PRIMARY KEY, category TEXT NOT NULL, note TEXT NOT NULL
+);
 """
 
 
@@ -104,12 +117,32 @@ class Instance:
     value: str
 
 
+@dataclass(frozen=True, slots=True)
+class Decoy:
+    """A value that must never be detected: invalid PII, or a PII look-alike.
+
+    Recorded separately from `Instance` and never written to the manifest.
+    The recall gate has a known-positive set to measure itself against; this
+    is the known-negative counterpart, so a false-positive gate has something
+    concrete to test itself against too -- including the case where a
+    check-digit validator silently regresses to accepting everything.
+    """
+
+    table: str
+    column: str
+    row_id: int
+    offset: int
+    value: str
+    reason: str
+
+
 class _Corpus:
     """Accumulates rows and the ground truth describing them."""
 
     def __init__(self, faker: Faker) -> None:
         self.faker = faker
         self.instances: list[Instance] = []
+        self.decoys: list[Decoy] = []
 
     def note(
         self, table: str, column: str, row_id: int, text: str, value: str, entity_type: str
@@ -129,6 +162,47 @@ class _Corpus:
                 offset=offset,
                 entity_type=entity_type,
                 value=value,
+            )
+        )
+
+    def note_decoy(
+        self, table: str, column: str, row_id: int, text: str, value: str, reason: str
+    ) -> None:
+        """Record ``value`` as a known-negative: it must never produce a span.
+
+        Unlike `note`, nothing here is validated as *correct* PII -- the whole
+        point is that it either fails its check digit or was never PII to
+        begin with. It goes to `self.decoys`, not `self.instances`, so it
+        never reaches the manifest.
+
+        Checked against the *whole* detection surface, not just the decoy's
+        own entity type: a card deliberately failing Luhn could still be
+        picked up by an unrelated pattern with a looser floor (the
+        zero-padded-account decoy is exactly this shape for
+        ``valid_international_phone``). A decoy that validates by accident,
+        under any entity type, defeats the mechanism before it starts, so
+        this fails loudly here instead of surfacing as an unexplained hit in
+        `demo/eval.py` later.
+        """
+        offset = text.find(value)
+        if offset < 0:
+            raise ValueError(f"decoy {value!r} is not present in {table}.{column}")
+        collisions = [
+            span for span in detect_regex(text) if span.start == offset and span.text == value
+        ]
+        if collisions:
+            raise ValueError(
+                f"decoy {value!r} ({reason}) is actually detected as "
+                f"{collisions[0].entity_type} -- construct a different decoy"
+            )
+        self.decoys.append(
+            Decoy(
+                table=table,
+                column=column,
+                row_id=row_id,
+                offset=offset,
+                value=value,
+                reason=reason,
             )
         )
 
@@ -271,10 +345,139 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         corpus.note("webhooks", "payload", webhook_id, payload, national_id, EntityType.DNI)
 
 
+# --------------------------------------------------------------------------
+# Decoys: deliberately invalid PII, and non-PII that resembles it. Inserted
+# into the database, never into the manifest, so the false-positive gate in
+# `demo/eval.py` has a known-negative set to test itself against -- the same
+# way the manifest gives the recall gate a known-positive set.
+# --------------------------------------------------------------------------
+
+_DNI_DECOY_LETTERS: Final = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Spanish thousands-separated figures. Nine digits opening 6, 7 or 9 would be
+# read as a phone if the dot were ever accepted as a separator again -- see
+# the separator policy in `core/detector.py`.
+_THOUSANDS_DECOYS: Final = ("912.345.678", "612.345.678")
+# Semantic version strings: three dot-separated groups, not four, so today's
+# IP pattern already ignores them. A regression guard against a looser one.
+_VERSION_DECOYS: Final = ("1.2.3", "10.4.2")
+# Zero-padded reference/account numbers. `0012345678` is eight digits after a
+# `00` prefix, one short of the legacy international-phone floor of nine.
+_ZERO_PADDED_DECOYS: Final = ("0012345678", "0098765432")
+
+
+def _bad_dni_letters(faker: Faker, count: int) -> list[str]:
+    """DNI-shaped values whose control letter is deliberately wrong."""
+    values: list[str] = []
+    for _ in range(count):
+        digits = "".join(str(faker.random_digit()) for _ in range(8))
+        for letter in _DNI_DECOY_LETTERS:
+            candidate = f"{digits}{letter}"
+            if not valid_dni(candidate):
+                values.append(candidate)
+                break
+        else:  # pragma: no cover - 23 candidate letters, one is always wrong
+            raise ValueError(f"could not construct an invalid DNI from {digits!r}")
+    return values
+
+
+def _bad_luhn_cards(faker: Faker, count: int) -> list[str]:
+    """Card-shaped digit runs whose Luhn checksum is deliberately wrong."""
+    values: list[str] = []
+    for _ in range(count):
+        digits = "".join(str(faker.random_digit()) for _ in range(16))
+        if valid_card(digits):
+            digits = digits[:-1] + str((int(digits[-1]) + 1) % 10)
+        if valid_card(digits):  # pragma: no cover - Luhn always changes on a +1 bump
+            raise ValueError(f"could not construct a Luhn-failing card from {digits!r}")
+        values.append(digits)
+    return values
+
+
+def _bad_mod97_ibans(faker: Faker, count: int) -> list[str]:
+    """Valid-shaped IBANs whose mod-97 check digit is deliberately wrong."""
+    values: list[str] = []
+    for _ in range(count):
+        iban = faker.iban()
+        if valid_iban(iban):
+            last = iban[-1]
+            # Spanish IBANs (this corpus's only locale) always end in a digit.
+            bumped = str((int(last) + 1) % 10) if last.isdigit() else "X"  # pragma: no cover
+            iban = iban[:-1] + bumped
+        if valid_iban(iban):  # pragma: no cover - mod-97 is sensitive to every digit
+            raise ValueError(f"could not construct a mod-97-failing IBAN from {iban!r}")
+        values.append(iban)
+    return values
+
+
+def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
+    """Insert every decoy into its own table and record it as a known-negative.
+
+    A dedicated `decoy_samples` table keeps decoy offsets independent of the
+    real corpus's row content, so neither can perturb the other's offsets.
+    """
+    faker = corpus.faker
+    cursor = connection.cursor()
+
+    samples: list[tuple[str, str, str]] = []  # (category, note, decoy value)
+
+    for dni in _bad_dni_letters(faker, 2):
+        samples.append(
+            (
+                "DNI_BAD_LETTER",
+                f"DNI del solicitante: {dni} (verificar antes de aprobar).",
+                dni,
+            )
+        )
+    for card in _bad_luhn_cards(faker, 2):
+        samples.append(
+            (
+                "CARD_BAD_LUHN",
+                f"Referencia de cobro rechazada, la tarjeta {card} no coincide.",
+                card,
+            )
+        )
+    for iban in _bad_mod97_ibans(faker, 2):
+        samples.append(
+            (
+                "IBAN_BAD_MOD97",
+                f"IBAN provisional pendiente de confirmar: {iban}.",
+                iban,
+            )
+        )
+    for number in _THOUSANDS_DECOYS:
+        samples.append(
+            (
+                "THOUSANDS_SEPARATOR",
+                f"El importe acumulado asciende a {number} euros.",
+                number,
+            )
+        )
+    for version in _VERSION_DECOYS:
+        samples.append(("VERSION_STRING", f"Cliente actualizado a la version {version}.", version))
+    for account in _ZERO_PADDED_DECOYS:
+        samples.append(
+            ("ZERO_PADDED_ACCOUNT", f"Cuenta de referencia {account} sin movimientos.", account)
+        )
+
+    for row_id, (category, note, value) in enumerate(samples, start=1):
+        cursor.execute("INSERT INTO decoy_samples VALUES (?, ?, ?)", (row_id, category, note))
+        corpus.note_decoy(
+            "decoy_samples",
+            "note",
+            row_id,
+            note,
+            value,
+            reason=f"{category}: deliberately invalid or non-PII value; must never be detected",
+        )
+
+
 def seed_demo(
-    db_path: Path = DEFAULT_DB_PATH, manifest_path: Path = DEFAULT_MANIFEST_PATH
+    db_path: Path = DEFAULT_DB_PATH,
+    manifest_path: Path = DEFAULT_MANIFEST_PATH,
+    decoys_path: Path = DEFAULT_DECOYS_PATH,
 ) -> list[Instance]:
-    """Regenerate the demo database and manifest from the fixed seed."""
+    """Regenerate the demo database, manifest and decoy set from the fixed seed."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_path.unlink(missing_ok=True)
 
@@ -288,7 +491,14 @@ def seed_demo(
     with sqlite3.connect(db_path) as connection:
         connection.executescript(SCHEMA)
         _build(corpus, connection)
+        _build_decoys(corpus, connection)
         connection.commit()
+
+    decoy_payload: list[dict[str, Any]] = [asdict(decoy) for decoy in corpus.decoys]
+    decoys_path.write_text(
+        json.dumps(decoy_payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
     payload: list[dict[str, Any]] = [asdict(instance) for instance in corpus.instances]
     manifest_path.write_text(
@@ -302,9 +512,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
+    parser.add_argument("--decoys", type=Path, default=DEFAULT_DECOYS_PATH)
     args = parser.parse_args(argv)
 
-    instances = seed_demo(args.db, args.manifest)
+    instances = seed_demo(args.db, args.manifest, args.decoys)
     by_type: dict[str, int] = {}
     for instance in instances:
         by_type[instance.entity_type] = by_type.get(instance.entity_type, 0) + 1

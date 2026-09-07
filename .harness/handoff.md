@@ -2,214 +2,196 @@
 
 ## Summary
 
-The deterministic regex detection layer is implemented, together with the
-synthetic corpus and the evaluation that measures it. All six gate rows are
-green, and both independent validators have run against a fresh context.
+The gate is no longer blind to a sabotaged check-digit validator. A new
+false-positive gate scores the detector against twelve deliberate decoys —
+six categories, two variants each — that must never be detected: a DNI with
+the wrong check letter, a card failing Luhn, an IBAN failing mod-97, a
+Spanish thousands-separated figure, a version string, and a zero-padded
+account number. None of them appear in `demo/manifest.json`. All six gate
+rows are green, and both independent validators have run against a fresh
+context.
 
-The security-focused review returned two blocking findings — real false
-negatives in the guaranteed floor — which are fixed and re-verified below.
-Ready for human review. Nothing is committed; no remote exists.
-
-Read the Issues Found section first. Five genuine detection defects surfaced
-during this mission, and the mechanisms that caught them matter more than the
-line count.
+The code-reviewer's pass found a real gap — the card and IBAN decoy
+generators only checked their own type's validator, not the full detection
+surface, so a Luhn-failing card could in principle be picked up by an
+unrelated, looser pattern (a reproduced, concrete collision with
+`valid_international_phone`). That is fixed below and re-verified. Ready for
+human review. Nothing is committed; no remote exists.
 
 ## Implemented
 
-- `core/detector.py`: `EntityType` and `Detector` as `StrEnum`, a frozen
-  `Span` whose `__post_init__` refuses offsets that disagree with its own
-  text, the check-digit validators (`valid_dni`, `valid_nie`, `valid_iban`,
-  `valid_card`, `valid_ipv4`, `valid_spanish_phone`), `merge_spans()` and
-  `detect_regex()`.
-- `demo/seed.py`: a 7-table SQLite corpus, ~740 PII instances, deterministic
-  under a fixed Faker seed. It validates every value it generates against the
-  same check digit the detector will apply, so a broken corpus fails loudly at
-  generation instead of quietly costing recall.
-- `demo/eval.py`: recall and precision per entity type and per detector,
-  strict `(offset, value)` matching, a `--min-recall` threshold, and the
-  concrete list of misses.
-- `tests/test_detector.py` (check digits, offsets, overlap policy, regressions)
-  and `tests/test_demo.py` (corpus integrity, measured contract).
-- `.harness/bin/verify`: one new `eval` row that seeds, then scores at
-  `--min-recall 1.0`.
-- `pyproject.toml`: Faker added to the dev extras, pinned to one minor line.
-- `.gitignore`: the generated manifest joins the generated database.
+- `demo/seed.py`: `Decoy` dataclass, `_Corpus.decoys` / `note_decoy()`, a new
+  `decoy_samples` table, and generators for the six decoy categories
+  (`_bad_dni_letters`, `_bad_luhn_cards`, `_bad_mod97_ibans`, plus the fixed
+  thousands/version/zero-padded value tuples), all deterministic under the
+  existing fixed Faker seed. `note_decoy()` now runs `detect_regex()` over
+  the full rendered text and raises if *any* span — of any entity type —
+  lands on the decoy's offset and value, not only the type it was built to
+  fail. `DEFAULT_DECOYS_PATH` and `demo/decoys.json` output added alongside
+  the existing manifest write.
+- `demo/eval.py`: `DecoyHit`, `DecoyReport.exceeds()`, `evaluate_decoys()`
+  (strict offset+value matching against the decoy set, symmetric to how
+  `evaluate()` matches the manifest), `--decoys` and `--max-false-positives`
+  CLI flags (default `0`), and a printed decoy section naming every hit's
+  table, column, row id, value and reason — not only a count.
+- `.harness/bin/verify`: the `eval` row now runs
+  `--min-recall 1.0 --max-false-positives 0`, both thresholds explicit.
+- `.gitignore`: `demo/decoys.json` joins `demo/manifest.json` as a generated,
+  git-ignored artifact.
+- `tests/test_decoys.py` (new): decoys are disjoint from the manifest and
+  live only in `decoy_samples`; all six categories are present; zero decoy
+  hits under the real, unmodified validators; decoy-set determinism across
+  two seed runs; a parametrized test sabotaging `valid_dni`, `valid_card` and
+  `valid_iban` in turn (by monkeypatching the module-level `_PATTERNS` tuple,
+  never `detector.py` itself) that proves each one flips
+  `DecoyReport.exceeds(0)` to `True`.
+- `tests/test_demo.py`: the existing fixture and the seed-determinism test
+  now pass an explicit temp `decoys_path`, so they stop writing to the
+  repo's real `demo/decoys.json` during test runs.
+- `.harness/mission.md`, `.harness/validation.md`: written for this mission.
+- `docs/missions/mission-1/`, `docs/missions/mission-2/`: the prior
+  (detector) mission's and this mission's harness paperwork archived here,
+  per the user's request to keep per-mission history outside the live,
+  overwritten `.harness/*` files.
 
 ## Left Undone
 
-- **Person names.** 250 instances sit in the corpus at 0.000 recall, reported
-  as `(not gated)`. No regex can prove a name; this is the LLM layer's work
-  and is published rather than hidden, per BRIEF section 4.1.
-- **Dot-separated phone numbers are missed by design.** In Spanish the dot is
-  the thousands separator, so accepting it as a digit separator laid claim to
-  every nine-digit figure opening 6, 7 or 9. `912.345.678` is therefore read as
-  a number, not a phone. The rule is recorded in the module docstring and
-  reverses with one character if the trade ever looks wrong.
-- Everything in the mission's Non-Goals: substitution, tokens, the vault,
-  the audit log, adapters, the frontend, content-block caching.
+Nothing beyond this mission's own Non-Goals: `core/detector.py` is untouched
+(confirmed empty diff), no new entity type or pattern, no manifest schema
+change, no increase in corpus volume beyond the twelve decoys.
 
 ## Commands Run
 
 | Command | Exit Code | Notes |
 |---|---:|---|
-| `bash .harness/bin/verify` | 0 | All 6 rows green |
-| `.venv/Scripts/pytest` | 0 | 74 passed in 0.66s |
-| `.venv/Scripts/mypy` | 0 | strict, 17 source files, no `type: ignore` anywhere |
-| `.venv/Scripts/ruff check . && ruff format --check .` | 0 | `.harness` excluded as vendored |
-| `python -m veil_pii_middleware.demo.seed` | 0 | 743 instances; byte-identical across 3 runs |
-| `python -m veil_pii_middleware.demo.eval --min-recall 1.0` | 0 | 1.000 recall on all 7 structured types, 0 false positives |
-| `python -m build --no-isolation` | 0 | ~1.3s |
+| `bash .harness/bin/verify` | 0 | All 6 rows green, both before and after the reviewer fix |
+| `.venv/Scripts/pytest -v` | 0 | 84 passed (was 74 before this mission; +7 in `test_decoys.py`, +3 from the parametrized sabotage case) |
+| `.venv/Scripts/mypy` | 0 | strict, 18 source files, no `type: ignore` |
+| `.venv/Scripts/ruff check . && ruff format --check .` | 0 | |
+| `python -m veil_pii_middleware.demo.seed` | 0 | manifest and decoys both byte-identical across reruns |
+| `python -m veil_pii_middleware.demo.eval --max-false-positives 0` | 0 | 0 decoy hits, recall 1.000 on all structured types |
+| Manual sabotage: patched `valid_dni` to `return True` in a live copy of `detector.py`, ran eval, restored | 1, then 0 | Recall stayed 1.000; decoy section reported 2 DNI hits by name (`decoy_samples.note#1/#2`); exit 1. Restored, reran, exit 0, `git status` confirmed no diff on `detector.py` |
+| Reproduced the reviewer's collision directly: constructed `0087654321987654` (fails Luhn) and called `note_decoy` on it | raises `ValueError` | Confirms the fix: caught as "actually detected as PHONE" before the fix would have shipped silently |
 
 ## Files Changed
 
 ```
-M  .claude/hooks/grill-guard.sh          M  pyproject.toml
-M  .claude/hooks/mission-state-guard.sh  M  veil_pii_middleware/core/detector.py
-M  .gitignore                            M  veil_pii_middleware/demo/eval.py
-M  .harness/bin/verify                   M  veil_pii_middleware/demo/seed.py
-M  .harness/mission.md                   ?? tests/test_demo.py
-M  .harness/validation.md                ?? tests/test_detector.py
+M  .gitignore                        M  veil_pii_middleware/demo/eval.py
+M  .harness/bin/verify                M  veil_pii_middleware/demo/seed.py
+M  .harness/mission.md
+M  .harness/validation.md
+M  tests/test_demo.py
+?? docs/missions/
+?? tests/test_decoys.py
 ```
 
 ## Issues Found
 
-Seven real detection defects, in the order they surfaced. Every one was a
-false negative except number 5, which is the interesting exception.
+Two issues, both from the independent code-reviewer pass, neither from the
+goal-verifier (which passed all six acceptance criteria on the first check
+but flagged that this file was still the *prior* mission's handoff — fixed
+by writing this one).
 
-1. **An IP at the end of a sentence was invisible.** The trailing guard was
-   `(?![0-9.])`, so the full stop closing a log line killed the match — a
-   silent miss in the single highest-volume case for addresses. Caught by the
-   corpus-coverage test.
-2. **A 12-digit Maestro PAN was below the validator's floor.** `valid_card`
-   required 13 digits; Faker generated a valid 12-digit card and the seed's
-   self-check refused to proceed. Fixed by widening the detector, not by
-   trimming the corpus — which the validation contract explicitly forbids.
-3. **Zero-padded octets were missed.** `192.168.001.001` returned nothing.
-   Octets are now range-checked in `valid_ipv4` rather than pattern-matched.
-4. **Dot-separated phone and card numbers were missed.** Reported by the
-   security review, on the premise that dots are the house style on Spanish
-   invoices. Fixed by widening the separator class — and then reversed, see 5.
-5. **Accepting the dot as a phone separator was itself a defect.** Human
-   challenge to the premise, checked against evidence: in Spanish the dot is
-   the *thousands separator*, so `El importe asciende a 912.345.678 euros`
-   was being tokenized as a phone. Not a leak, but a systematic false positive
-   that destroys an invoice total — breaking the debugging workflow the
-   product exists to serve. A phone carries no check digit, so nothing
-   downstream would ever have caught it. Dots were removed from phone and
-   card, and kept for DNI and NIE, where the control letter filters what the
-   looser pattern over-claims. That principle is now written down.
-6. **Phone grouping was hard-coded to 3-3-3**, so `91 234 56 78` — simply how
-   a Madrid landline is printed — was invisible. Now any grouping of nine
-   digits is accepted and `valid_spanish_phone` decides.
-7. **Dotted national IDs were briefly supported, then removed.** Added on the
-   same reasoning as 5 — a check digit filters what a loose pattern
-   over-claims — and reverted on the owner's call: the dotted form is rare,
-   the cost is not zero (3.6% false positives on a dotted eight-digit number
-   followed by an isolated letter, though none on realistic billing text), and
-   the guaranteed floor is partial by construction anyway, since names already
-   depend on the LLM layer. No pattern now accepts the dot.
-
-The country prefix was also hard-coded to `+34`/`0034`; international numbers
-are now recognised generically, so `+44 20 7946 0958` is detected.
-
-Two corpus defects surfaced as well, both caught by the seed validating its own
-ground truth: an email variant recorded in canonical form while the text held a
-capitalized one, and — the important one — **the corpus only ever generated
-bare nine-digit phones**, which is exactly why defects 4 and 6 sat behind a
-green gate. It now cycles five written forms and includes dotted DNIs.
-
-Nothing was ever resolved by weakening a check.
+1. **Should-fix, real and reproduced.** `_bad_luhn_cards` and
+   `_bad_mod97_ibans` only checked the value against their own type's
+   validator (`valid_card`, `valid_iban`), never against the full
+   `detect_regex()` surface. The reviewer traced a concrete collision: a
+   16-digit Luhn-failing card decoy starting with `"00"` would be picked up
+   by the unmodified `_PHONE_INTL` pattern, since `valid_international_phone`
+   is a length floor with no checksum. Today's fixed seed happens not to draw
+   such a value, so every gate passed — but that was incidental to the seed,
+   not guaranteed by the generator's logic. Fixed by moving the check into
+   `note_decoy()` itself: it now runs the *whole* detector over the rendered
+   text and raises if any span, of any entity type, lands on the decoy's
+   offset and value. Reproduced the exact collision manually against the
+   patched code and confirmed it now raises instead of silently shipping.
+2. **Nits.** An unreachable `"X"` fallback branch in `_bad_mod97_ibans`
+   (Spanish IBANs always end in a digit) marked `# pragma: no cover` instead
+   of left silently untested; `read_text("utf-8")` in the new test file
+   changed to the codebase's `read_text(encoding="utf-8")` convention.
 
 ## Gotchas Learned
 
 | Trigger | Symptom | Root Cause | Fix | Prevention | Evidence |
 |---|---|---|---|---|---|
-| Writing `.harness/mission.md` through Edit/Write on Windows | `grill-guard.sh` blocked the write, demanding a filled Intake Grill | The guard's `.harness/*` exemption uses forward slashes; the host normalizes `file_path` to backslashes, so it never matched. The guard deadlocked on the very file it demands be filled | Added a backslash pattern to the `case` in both guards | Probe path guards with simulated payloads in the host's native path format before trusting them | `grill-guard.sh`, `mission-state-guard.sh`; both probed with synthetic payloads and confirmed to still block `detector.py` while the mission was unapproved |
-| Green recall gate on a narrow corpus | 1.000 recall on PHONE while dotted numbers were undetectable | The generator emitted one format; the manifest can only measure what it contains | Vary the generated formats | A recall gate proves coverage of the corpus, never of reality. Corpus breadth is part of the check, not a detail of it | Defect 2 above; corpus now covers 5 phone formats |
-| A reviewer's premise about a local convention | Dots were added as a phone separator, creating a systematic false positive on Spanish figures | The premise ("dots are the house style for Spanish phones") was accepted without checking, and the opposite fact — the dot is the thousands separator — is the decisive one | Removed dots from patterns with no check digit; kept them where a control character filters | Verify a domain-convention claim against the notation itself before widening a pattern. A reviewer and a native speaker can both be confident and only one be right | Defect 5; `test_spanish_thousands_separator_is_not_a_phone` |
-| A generator that shares a helper with the code under test | Ground truth could agree with a broken detector by construction | Circularity | Faker generates the values; the seed validates them; unit tests anchor the validators against published constants (`12345678Z`, `X1234567L`, the ISO IBAN example, `4111111111111111`) | Anchor check-digit logic on external published values, never on the implementation's own output | `tests/test_detector.py` |
+| A decoy generator validated against its own entity type only | A card decoy could theoretically be misclassified as PHONE by an unrelated, looser pattern, defeating the "always 0 false positives" guarantee | Multiple regex patterns compete for the same digit run; checking one type's validator says nothing about whether a *different* pattern's looser validator would still accept the same text at the same offset | `note_decoy()` now runs the full `detect_regex()` over the rendered text and rejects any decoy that produces a span under any entity type, not just its own | A "must never be detected" fixture needs to be checked against the whole detection surface, the same way a "must always be detected" fixture (`note()`, for real instances) already is — type-local validation is not equivalent to system-level validation | `_bad_luhn_cards`/`_bad_mod97_ibans` in `seed.py`; reproduced manually with `0087654321987654` |
 
 ## Procedure Compliance
 
-`.harness/mission.md` and `.harness/validation.md` were both written and
-approved before any implementation file was edited; the mission-state guard
-mechanically enforced this, and was observed blocking `detector.py` while the
-status was `awaiting approval`. The lane was `agent-with-checkpoint`, and the
-pre-code stop was honoured with explicit human approval. Validators ran as
-independent subagents with fresh context; the main session did not review its
-own work.
-
-One deviation: `.claude/hooks/*.sh` were edited outside the originally declared
-Scope. The human approved that fix explicitly at the checkpoint, but it was not
-written into the mission document at the time. The goal-verifier caught the
-omission and Scope has since been corrected to record it.
+`.harness/mission.md` and `.harness/validation.md` were written and approved
+(explicit human approval via `AskUserQuestion`) before any implementation
+file was edited. The lane was `agent-with-checkpoint`, high risk, and the
+pre-code stop was honoured. Validators ran as independent subagents with
+fresh context; the main session did not review its own work. Per the human's
+request mid-checkpoint, the prior mission's and this mission's harness
+paperwork were archived to `docs/missions/mission-1/` and
+`docs/missions/mission-2/` before the live `.harness/*` files were
+overwritten for this mission.
 
 ## Risk Review
 
-**High**, unchanged from the mission. This code decides what counts as personal
-data, and every defect above was a false negative — the failure mode that leaks.
-The mitigations that actually did work: check-digit validation as a hard filter,
-a corpus that validates its own ground truth, strict `(offset, value)` matching
-in the evaluation, and an independent security review that found two blocking
-misses the gate could not see.
+**High**, unchanged from the mission. `core/detector.py` itself was never
+touched — confirmed by an empty `git diff --stat` throughout, independently
+re-checked by both validators. The mitigations that worked: a false-positive
+gate with a concrete, named listing (not just a count); a sabotage test that
+patches the detector's actual dispatch table rather than a name that would
+have had no effect; and an independent security review that caught a
+generator-level gap the mission's own author-side testing had not surfaced.
 
-The residual risk is corpus breadth. Recall is 1.000 against 743 instances of
-synthetic Spanish data; it is not a claim about real traffic. Defect 2 is the
-proof — a green gate coexisted with an entire invisible number format.
+The residual risk is the same shape as the prior mission's: the decoy set is
+twelve values under one fixed seed. `note_decoy()`'s system-wide check now
+makes "this decoy is undetectable today" a build-time guarantee rather than
+an incidental measurement, but a category not yet imagined (a decoy shape
+nobody has thought of yet) is still not covered — the same partial-floor
+trade the detector itself already documents.
 
 ## Human Verification Guide
 
-Run everything below from **Git Bash**, not PowerShell and not WSL. The harness
-scripts shipped with CRLF line endings, which a POSIX bash refuses to parse,
-and WSL will not find the Windows virtualenv executables.
-
-Shortest path, about a minute:
+Run everything below from **Git Bash**.
 
 ```bash
-bash .harness/bin/verify                                   # expect: 6 rows green, exit 0
-.venv/Scripts/python -m veil_pii_middleware.demo.eval      # expect: 1.000 on all 7, PERSON 0.000 (not gated)
+bash .harness/bin/verify                                              # expect: 6 rows green, exit 0
+.venv/Scripts/python -m veil_pii_middleware.demo.eval                 # expect: recall 1.000 all types, decoys: 0 false positive(s), PASS
 ```
 
-Then confirm the gate cannot be satisfied dishonestly:
+Confirm the false-positive gate reacts to a sabotaged validator (take a copy
+first — this edits a live file):
 
 ```bash
-# 1. Stub a check digit to always accept, and watch the tests fail.
-#    Take a copy FIRST — this is a deliberate act of vandalism on a live file,
-#    and an editor undo is not a safety net if the edit goes wrong.
 cp veil_pii_middleware/core/detector.py /tmp/detector.bak
-#    Now make `valid_dni` return True as its first statement, and run:
-.venv/Scripts/pytest tests/test_detector.py -k check_digit
-#    Expect FAILED assertions. An import error or SyntaxError means the file
-#    got mangled, not that the check ran — restore and try again.
+# Make valid_dni's first statement `return True`, then:
+.venv/Scripts/python -m veil_pii_middleware.demo.eval --max-false-positives 0
+# expect: recall still 1.000, but a "decoys: 2 false positive(s)" section
+# naming the two DNI decoys by table/row/value, and exit 1.
 cp /tmp/detector.bak veil_pii_middleware/core/detector.py
-#    Once the change is committed, `git checkout -- <file>` restores it too.
-#    Until then it does not: the commit predates this work and would wipe it.
-
-# 2. Confirm the corpus really hides PII where column masking cannot reach.
-.venv/Scripts/python -c "import sqlite3;print(sqlite3.connect('demo/veil_demo.db').execute('select body from support_tickets limit 1').fetchone()[0])"
-
-# 3. Confirm the separator policy in both directions.
-.venv/Scripts/python -c "
-from veil_pii_middleware.core.detector import detect_regex
-for t in ['Telefono 91 234 56 78', 'Telefono +44 20 7946 0958', 'DNI 12.345.678-Z',
-          'El importe asciende a 912.345.678 euros', 'Servidor 91.234.56.78']:
-    print(t, '->', [(s.entity_type.value, s.text) for s in detect_regex(t)])"
-# expect: PHONE, PHONE, DNI, nothing, IP
+git status --short veil_pii_middleware/core/detector.py               # expect: no output
 ```
 
-Judgement calls worth a human eye, in priority order:
+Or run the equivalent as a test, no live edits required:
 
-1. **Card floor at 12 digits** (`valid_card`). Buys real Maestro PANs, costs
-   precision on 12-digit reference codes. Deliberate, and reversible in one line.
-2. **Zero-padded octets accepted** as IPv4, which RFC 3986 treats as ambiguous
-   with octal.
-3. **The separator policy**: no pattern accepts the dot, because in Spanish it
-   is the thousands separator. Spaces and hyphens only. A dotted national ID
-   is therefore a deliberate gap, left to the LLM layer alongside names.
-4. **The two `.claude/hooks/*.sh` edits** — security controls, changed outside
-   the original scope with approval. Worth reading the diff directly.
+```bash
+.venv/Scripts/pytest tests/test_decoys.py -v -k sabotag
+# expect: 3 passed (DNI, CARD, IBAN)
+```
+
+Judgement calls worth a human eye:
+
+1. **Zero-tolerance threshold** (`--max-false-positives 0`, hard-coded as the
+   default and explicit in the gate row). Any single decoy detected fails
+   the gate; there is no budget to raise quietly.
+2. **`note_decoy()`'s system-wide check** is new generation-time cost (one
+   `detect_regex()` call per decoy, twelve total) in exchange for a
+   structural guarantee instead of a seed-incidental one. Worth confirming
+   the reasoning holds: a "must never be detected" fixture should be checked
+   against everything that could detect it, not just the validator it was
+   built to fail.
+3. **Decoys live in a dedicated `decoy_samples` table**, not interleaved into
+   the seven real tables — keeps decoy offsets independent of the real
+   corpus, but means decoys don't currently exercise "a decoy next to real
+   PII in the same free-text cell," which is a plausible next iteration if
+   that scenario matters later.
 
 ## Verdict
 
-Ready for human review. Blocking review findings resolved and re-verified; not
-committed.
+Ready for human review. The code-reviewer's should-fix finding is resolved
+and re-verified (manually reproduced, then confirmed caught); not committed.

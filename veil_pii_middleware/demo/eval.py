@@ -26,9 +26,21 @@ from pathlib import Path
 from typing import Any, Final
 
 from veil_pii_middleware.core.detector import STRUCTURED_TYPES, Span, detect_regex
-from veil_pii_middleware.demo.seed import DEFAULT_DB_PATH, DEFAULT_MANIFEST_PATH
+from veil_pii_middleware.demo.seed import (
+    DEFAULT_DB_PATH,
+    DEFAULT_DECOYS_PATH,
+    DEFAULT_MANIFEST_PATH,
+)
 
-__all__ = ["Metrics", "Report", "evaluate", "main"]
+__all__ = [
+    "DecoyHit",
+    "DecoyReport",
+    "Metrics",
+    "Report",
+    "evaluate",
+    "evaluate_decoys",
+    "main",
+]
 
 _MAX_LISTED_MISSES: Final = 10
 
@@ -157,6 +169,68 @@ def evaluate(
     return Report(by_type=by_type, by_detector=by_detector, misses=misses)
 
 
+@dataclass(frozen=True, slots=True)
+class DecoyHit:
+    """A decoy that the regex layer detected anyway -- a false positive.
+
+    Every decoy is either deliberately invalid PII (a wrong check digit) or a
+    non-PII value that merely resembles PII. Under correct operation this
+    list is always empty; a hit here means the layer, or a validator inside
+    it, just started accepting something it must reject.
+    """
+
+    table: str
+    column: str
+    row_id: int
+    entity_type: str
+    value: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecoyReport:
+    hits: list[DecoyHit]
+
+    def exceeds(self, max_false_positives: int) -> bool:
+        return len(self.hits) > max_false_positives
+
+
+def evaluate_decoys(
+    db_path: Path = DEFAULT_DB_PATH, decoys_path: Path = DEFAULT_DECOYS_PATH
+) -> DecoyReport:
+    """Score the regex layer against values that must never be detected.
+
+    `decoys_path` is a known-negative set, symmetric to the manifest's
+    known-positive one: none of these values appear in the manifest, and a
+    span landing on one of them is a false positive by definition, not a
+    judgement call the way an unmatched span in `evaluate()` can be.
+    """
+    decoys: list[dict[str, Any]] = json.loads(decoys_path.read_text(encoding="utf-8"))
+    cells = {(str(d["table"]), str(d["column"]), int(d["row_id"])) for d in decoys}
+    texts = _load_texts(db_path, cells)
+
+    hits: list[DecoyHit] = []
+    for decoy in decoys:
+        cell = (str(decoy["table"]), str(decoy["column"]), int(decoy["row_id"]))
+        text = texts.get(cell)
+        if text is None:
+            raise ValueError(f"decoy points at a row that is not in the database: {cell}")
+        offset, value = int(decoy["offset"]), str(decoy["value"])
+        for span in detect_regex(text):
+            if span.start == offset and span.text == value:
+                hits.append(
+                    DecoyHit(
+                        table=cell[0],
+                        column=cell[1],
+                        row_id=cell[2],
+                        entity_type=str(span.entity_type),
+                        value=value,
+                        reason=str(decoy["reason"]),
+                    )
+                )
+    return DecoyReport(hits=hits)
+
+
 def _print_report(report: Report, min_recall: float) -> None:
     print(f"{'entity':<10}{'support':>9}{'found':>8}{'missed':>8}{'fp':>6}{'recall':>9}{'prec':>8}")
     print("-" * 58)
@@ -190,21 +264,50 @@ def _print_report(report: Report, min_recall: float) -> None:
         print(f"\nPASS — every structured entity type is at or above {min_recall:.2f} recall")
 
 
+def _print_decoy_report(decoy_report: DecoyReport, max_false_positives: int) -> None:
+    print(
+        f"\ndecoys: {len(decoy_report.hits)} false positive(s) (max allowed {max_false_positives})"
+    )
+    for hit in decoy_report.hits:
+        print(
+            f"  {hit.entity_type:<6} {hit.table}.{hit.column}#{hit.row_id} "
+            f"{hit.value!r} -- {hit.reason}"
+        )
+
+    if decoy_report.exceeds(max_false_positives):
+        print(f"FAIL — {len(decoy_report.hits)} decoy(s) detected, budget is {max_false_positives}")
+    else:
+        print(f"PASS — decoys at or below the {max_false_positives} false-positive budget")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Score the detector against the manifest.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
+    parser.add_argument("--decoys", type=Path, default=DEFAULT_DECOYS_PATH)
     parser.add_argument(
         "--min-recall",
         type=float,
         default=1.0,
         help="Fail when any structured entity type scores below this recall.",
     )
+    parser.add_argument(
+        "--max-false-positives",
+        type=int,
+        default=0,
+        help="Fail when more than this many decoys are detected.",
+    )
     args = parser.parse_args(argv)
 
     report = evaluate(args.db, args.manifest)
     _print_report(report, args.min_recall)
-    return 1 if report.failing_types(args.min_recall) else 0
+
+    decoy_report = evaluate_decoys(args.db, args.decoys)
+    _print_decoy_report(decoy_report, args.max_false_positives)
+
+    recall_failed = bool(report.failing_types(args.min_recall))
+    decoys_failed = decoy_report.exceeds(args.max_false_positives)
+    return 1 if recall_failed or decoys_failed else 0
 
 
 if __name__ == "__main__":

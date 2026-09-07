@@ -56,7 +56,7 @@ GATES=(
   # Regenerates the corpus before scoring it: the database is git-ignored, so
   # the gate cannot assume one is lying around. The threshold lives here on
   # purpose — lowering it is a visible change to the gate, not a quiet default.
-  "eval|$VENV_BIN/python$EXE -m veil_pii_middleware.demo.seed >/dev/null && $VENV_BIN/python$EXE -m veil_pii_middleware.demo.eval --min-recall 1.0"
+  "eval|$VENV_BIN/python$EXE -m veil_pii_middleware.demo.seed >/dev/null && $VENV_BIN/python$EXE -m veil_pii_middleware.demo.eval --min-recall 1.0 --max-false-positives 0"
   "build|$VENV_BIN/python$EXE -m build --no-isolation"
 )
 
