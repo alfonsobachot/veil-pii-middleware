@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+#
+# harness-memory.sh — repo-native persistent memory for the Blueprint Harness.
+#
+# Records durable, reviewable learning events under .harness/memory/. This is
+# project memory, not private user memory: do not record secrets, tokens, personal
+# data, or unreviewed external content.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+MEMORY_DIR="$ROOT/.harness/memory"
+EVENTS="$MEMORY_DIR/events.jsonl"
+LESSONS="$MEMORY_DIR/lessons.md"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  .harness/bin/memory record --type <type> --summary <text> [options]
+  .harness/bin/memory resolve (--match <substr> | --timestamp <ts>) --converted-to <ref>
+  .harness/bin/memory list [--limit N]
+  .harness/bin/memory audit
+  .harness/bin/memory distill
+
+Record options:
+  --source <path>      Evidence source, usually .harness/handoff.md or a command.
+  --tags <csv>         Comma-separated tags.
+  --impact <text>      Why this matters for future agents.
+  --prevention <text>  What future agents should do differently.
+
+Resolve options (close the failure->machinery loop):
+  --match <substr>     Resolve gotcha/failure/lesson events whose summary contains this.
+  --timestamp <ts>     Resolve the event with this exact timestamp.
+  --converted-to <ref> Required. The machinery the mistake became (hook, gate, skill, test).
+  Appends a `resolution` event (never mutates prior lines); `audit` joins them.
+
+Event types:
+  gotcha | failure | lesson | procedure | decision | skill-created | skill-improved
+
+Rules:
+  - Repo memory is append-only evidence by default.
+  - Do not record secrets, tokens, private user memory, or credentials.
+  - Distillation updates .harness/memory/lessons.md from recorded events.
+EOF
+}
+
+ensure_memory() {
+  mkdir -p "$MEMORY_DIR"
+  [ -f "$EVENTS" ] || : > "$EVENTS"
+  if [ ! -f "$LESSONS" ]; then
+    cat > "$LESSONS" <<'EOF'
+# Harness Lessons
+
+Persistent project lessons distilled from `.harness/memory/events.jsonl`.
+
+Agents may append memory events and propose distilled lessons. Humans review
+changes before they become durable team guidance.
+EOF
+  fi
+}
+
+# Pre-write secret scan: memory is append-only and human-reviewed — a leaked
+# credential would persist in git history (eval EV-47). Shared by record + resolve.
+secret_scan_or_die() {
+  local _field
+  for _field in "$@"; do
+    if ! printf '%s' "$_field" | python3 -c "
+import sys, re
+text = sys.stdin.read()
+patterns = [
+  r'AKIA[0-9A-Z]{16}',
+  r'-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY',
+  r'ghp_[A-Za-z0-9]{36,}',
+  r'sk-[a-zA-Z0-9]{32,}',
+  r'xox[baprs]-[0-9]{10,}',
+]
+sys.exit(1 if any(re.search(p, text) for p in patterns) else 0)
+" 2>/dev/null; then
+      printf 'ERROR: secret pattern detected in harness-memory args — aborting. Sanitize before recording.\n' >&2
+      exit 1
+    fi
+  done
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || { usage; exit 1; }
+shift || true
+
+case "$cmd" in
+  record)
+    type=""
+    summary=""
+    source=""
+    tags=""
+    impact=""
+    prevention=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --type) type="${2:-}"; shift 2 ;;
+        --summary) summary="${2:-}"; shift 2 ;;
+        --source) source="${2:-}"; shift 2 ;;
+        --tags) tags="${2:-}"; shift 2 ;;
+        --impact) impact="${2:-}"; shift 2 ;;
+        --prevention) prevention="${2:-}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$type" ] || { echo "--type is required" >&2; exit 1; }
+    [ -n "$summary" ] || { echo "--summary is required" >&2; exit 1; }
+    case "$type" in
+      gotcha|failure|lesson|procedure|decision|skill-created|skill-improved) ;;
+      *) echo "Invalid memory type: $type" >&2; exit 1 ;;
+    esac
+    secret_scan_or_die "$summary" "$prevention" "${source:-}" "${impact:-}" "${tags:-}"
+    ensure_memory
+    python3 - "$EVENTS" "$type" "$summary" "$source" "$tags" "$impact" "$prevention" <<'PY'
+import json, pathlib, sys
+from datetime import datetime, timezone
+
+path, typ, summary, source, tags, impact, prevention = sys.argv[1:]
+event = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "type": typ,
+    "summary": summary,
+    "source": source,
+    "tags": [t.strip() for t in tags.split(",") if t.strip()],
+    "impact": impact,
+    "prevention": prevention,
+}
+with pathlib.Path(path).open("a", encoding="utf-8") as fh:
+    fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+PY
+    echo "Recorded memory event: $type"
+    ;;
+
+  resolve)
+    match=""
+    ts=""
+    converted_to=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --match) match="${2:-}"; shift 2 ;;
+        --timestamp) ts="${2:-}"; shift 2 ;;
+        --converted-to) converted_to="${2:-}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$converted_to" ] || { echo "--converted-to is required" >&2; exit 1; }
+    [ -n "$match" ] || [ -n "$ts" ] || { echo "one of --match or --timestamp is required" >&2; exit 1; }
+    secret_scan_or_die "$converted_to" "$match" "$ts"
+    ensure_memory
+    python3 - "$EVENTS" "$match" "$ts" "$converted_to" <<'PY'
+import json, pathlib, sys
+from datetime import datetime, timezone
+
+path, match, ts, converted_to = sys.argv[1:]
+events = []
+with pathlib.Path(path).open(encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            events.append(json.loads(line))
+
+# timestamps already closed by a prior resolution — don't double-resolve
+already = {e.get("resolves") for e in events if e.get("type") == "resolution" and e.get("resolves")}
+
+def is_target(e):
+    if e.get("type") not in ("gotcha", "failure", "lesson"):
+        return False
+    if e.get("converted_to") or e.get("timestamp") in already:
+        return False
+    if ts:
+        return e.get("timestamp") == ts
+    return bool(match) and match in e.get("summary", "")
+
+targets = [e for e in events if is_target(e)]
+if not targets:
+    sys.stderr.write("resolve: no unresolved gotcha/failure/lesson event matched — nothing resolved.\n")
+    sys.exit(1)
+
+now = datetime.now(timezone.utc).isoformat()
+with pathlib.Path(path).open("a", encoding="utf-8") as fh:
+    for e in targets:
+        res = {
+            "timestamp": now,
+            "type": "resolution",
+            "resolves": e.get("timestamp"),
+            "converted_to": converted_to,
+            "summary": "resolved: " + e.get("summary", "")[:120],
+        }
+        fh.write(json.dumps(res, ensure_ascii=False, sort_keys=True) + "\n")
+print(f"Resolved {len(targets)} event(s) -> {converted_to}")
+PY
+    ;;
+
+  list)
+    limit="20"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --limit) limit="${2:-20}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+      esac
+    done
+    ensure_memory
+    python3 - "$EVENTS" "$limit" <<'PY'
+import json, sys
+events = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            events.append(json.loads(line))
+for event in events[-int(sys.argv[2]):]:
+    tags = ",".join(event.get("tags", []))
+    print(f"{event['timestamp']} [{event['type']}] {event['summary']} tags={tags}")
+PY
+    ;;
+
+  audit)
+    # Advisory: list gotcha/failure/lesson events that never converted into
+    # machinery (hook, validator, gate section, skill) — the failure-learning
+    # doctrine's conversion habit, made queryable (eval EV-46). Always exit 0.
+    ensure_memory
+    python3 - "$EVENTS" <<'PY'
+import json, sys
+events = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+resolved = {e.get("resolves") for e in events if e.get("type") == "resolution" and e.get("resolves")}
+unresolved = [e for e in events
+              if e.get("type") in ("gotcha", "failure", "lesson")
+              and not e.get("converted_to")
+              and e.get("timestamp") not in resolved]
+if unresolved:
+    print(f"{len(unresolved)} unresolved gotcha/failure/lesson events lacking 'converted_to':")
+    for e in unresolved:
+        print(f"  [{e.get('timestamp','')}] {e.get('type')}: {e.get('summary','')[:80]}")
+else:
+    print("All gotcha/failure/lesson events have a converted_to reference.")
+sys.exit(0)
+PY
+    ;;
+
+  distill)
+    ensure_memory
+    python3 - "$EVENTS" "$LESSONS" <<'PY'
+import json, pathlib, sys
+events_path = pathlib.Path(sys.argv[1])
+lessons_path = pathlib.Path(sys.argv[2])
+events = []
+for line in events_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if line:
+        events.append(json.loads(line))
+
+by_type = {}
+for event in events:
+    by_type.setdefault(event["type"], []).append(event)
+
+lines = [
+    "# Harness Lessons",
+    "",
+    "Persistent project lessons distilled from `.harness/memory/events.jsonl`.",
+    "",
+    "Agents may append memory events and propose distilled lessons. Humans review",
+    "changes before they become durable team guidance.",
+    "",
+    "## Distilled Patterns",
+]
+if not events:
+    lines += ["", "- No memory events recorded yet."]
+else:
+    for typ in sorted(by_type):
+        lines += ["", f"### {typ}"]
+        for event in by_type[typ][-10:]:
+            prevention = event.get("prevention") or event.get("impact") or "Review source evidence."
+            source = event.get("source") or "unspecified"
+            lines.append(f"- {event['summary']} Prevention: {prevention} Source: `{source}`")
+
+lessons_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+    echo "Updated $LESSONS"
+    ;;
+
+  --help|-h|help)
+    usage
+    ;;
+
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

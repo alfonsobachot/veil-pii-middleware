@@ -14,6 +14,11 @@ dependencies = []
 dev = [
   "ruff>=0.6",
   "pytest>=8.0",
+  "mypy>=1.11",
+  # `build` drives the build gate; `hatchling` is present so that gate can run
+  # with --no-isolation, keeping it fast and offline.
+  "build>=1.2",
+  "hatchling>=1.25",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -23,6 +28,8 @@ packages = ["veil_pii_middleware"]
 target-version = "py311"
 line-length = 100
 src = ["veil_pii_middleware", "tests"]
+# Vendored harness tooling: upstream code, not ours to restyle.
+extend-exclude = [".harness"]
 
 [tool.ruff.lint]
 select = [
@@ -36,6 +43,15 @@ select = [
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+files = ["veil_pii_middleware", "tests"]
+strict = true
+# Detection and vault code moves spans, bytes and ciphertext around; an
+# unchecked Any there hides exactly the class of bug that leaks PII.
+warn_unreachable = true
+disallow_any_generics = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# check-mission-contract.sh — the verify.sh `contract` gate.
+#
+# Runs the vendored agent-practices task-contract checker
+# (.harness/internal/check-task-contract.py) against the live mission through the repo
+# adapter (.harness/adapter.yaml). Skips with exit 0 while the mission is
+# `not started` so a fresh install stays unconfigured (verify.sh exit 2)
+# instead of failing paperwork nobody has written yet.
+#
+# Exit: 0 contract ok or mission not started, 1 findings, 2 usage error.
+
+set -uo pipefail
+
+MISSION=".harness/mission.md"
+ADAPTER=".harness/adapter.yaml"
+
+if [ ! -f "$MISSION" ]; then
+  echo "contract: $MISSION missing — skipped (not a harness work tree?)"
+  exit 0
+fi
+
+if grep -qiE '^[[:space:]]*not started' "$MISSION"; then
+  echo "contract: mission not started — skipped"
+  exit 0
+fi
+
+# Fast-path grill placeholder check (layer 2 of 3 — the vendored validator
+# repeats it, and the grill-guard hook blocks the edits that cause it). A
+# grill section whose every table row is still a placeholder means the
+# interview never happened; fail before handing off to python.
+if grep -q '^## Intake Grill' "$MISSION"; then
+  rows=$(awk '/^## Intake Grill/{f=1;next} /^#/{f=0} f && /^\|/ && $0 !~ /^[| :-]+$/ && $0 !~ /^\|[[:space:]]*Question/' "$MISSION")
+  if [ -n "$rows" ] && ! printf '%s\n' "$rows" | grep -qv '<PLACEHOLDER'; then
+    echo "ERROR: Intake Grill table contains only placeholder rows — complete the grill before running the contract check." >&2
+    exit 1
+  fi
+fi
+
+exec python3 .harness/internal/check-task-contract.py --adapter "$ADAPTER" "$MISSION"
