@@ -22,6 +22,7 @@ docs/private/
 
 # Vault: encrypted token <-> value mappings, never committed
 vault/
+.veil/
 *.vault
 *.vault.db
 
