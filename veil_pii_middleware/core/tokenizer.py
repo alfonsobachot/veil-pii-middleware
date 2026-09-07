@@ -8,12 +8,21 @@ values on the way back in.
 from __future__ import annotations
 
 import re
+import sys
 from typing import TypeAlias
 
 from veil_pii_middleware.core.detector import detect_regex, merge_spans
-from veil_pii_middleware.core.vault import Vault
+from veil_pii_middleware.core.vault import TokenNotFoundError, Vault, VaultIntegrityError
 
-__all__ = ["JSONValue", "TokenFormatOverflowError", "detokenize", "tokenize"]
+__all__ = [
+    "JSONValue",
+    "TokenFormatOverflowError",
+    "UNRESOLVED_TOKEN_PLACEHOLDER",
+    "IncrementalDetokenizer",
+    "detokenize",
+    "detokenize_lenient",
+    "tokenize",
+]
 
 #: A JSON-shaped value: a scalar, or a dict/list of the same. Only ``str``
 #: leaves are ever tokenized/detokenized; every other shape passes through
@@ -100,4 +109,149 @@ def detokenize(value: JSONValue, vault: Vault) -> JSONValue:
         return {key: detokenize(item, vault) for key, item in value.items()}
     if isinstance(value, list):
         return [detokenize(item, vault) for item in value]
+    return value
+
+
+#: Shown in place of a token that fails to resolve mid-stream (see
+#: ``IncrementalDetokenizer``). Distinct from ``detokenize``'s fail-closed
+#: behavior: a resolve failure on the response leg leaks no PII either way
+#: (the token itself is not PII), so this is a display/legibility choice,
+#: not a security one -- CLAUDE.md's fail-closed doctrine governs the
+#: *outbound* leg (``tokenize``) and is unrelated to this constant.
+UNRESOLVED_TOKEN_PLACEHOLDER = "[unresolved token]"
+
+# A generous upper bound on how long an entity-type name inside a token can
+# be before this is clearly not building toward a real token after all.
+# Every entity type minted by this codebase today (EMAIL, PHONE, DNI, NIE,
+# IBAN, CARD) is well under this; it exists only to stop an ordinary long
+# run of capital letters (which is not, and will never become, a token)
+# from being held back indefinitely -- the trailing ``[A-Z]`` run in
+# ``_PENDING_TOKEN_TAIL`` below is otherwise unbounded.
+_MAX_ENTITY_TYPE_LEN = 32
+
+# Matches a suffix of a buffer that could still be the start of a
+# `PII_<TYPE>_<NNNN>` token if more text arrives -- i.e. everything
+# `_TOKEN_PATTERN` could eventually match, at every stage of being typed
+# out one character at a time. Anchored to the end of the string; since
+# `re.search` returns the leftmost (hence longest) successful match among
+# these alternatives, this always finds the longest such pending suffix.
+# A *complete* four-digit token at the very end of the buffer does NOT
+# match here (`\d{1,3}$` cannot consume all four digits contiguously from
+# the `PII_` anchor) -- correctly, since a complete token is not "pending",
+# it is ready to resolve immediately.
+_PENDING_TOKEN_TAIL = re.compile(
+    r"P$|PI$|PII$|PII_$"
+    rf"|PII_[A-Z]{{1,{_MAX_ENTITY_TYPE_LEN}}}$"
+    rf"|PII_[A-Z]{{1,{_MAX_ENTITY_TYPE_LEN}}}_$"
+    rf"|PII_[A-Z]{{1,{_MAX_ENTITY_TYPE_LEN}}}_\d{{1,3}}$"
+)
+
+
+def _safe_flush_boundary(buffer: str) -> int:
+    """Return the index up to which ``buffer`` is safe to emit right now.
+
+    Everything before the index is guaranteed to contain no partial token
+    prefix; everything from the index onward must be retained because more
+    text could still arrive and complete it into a real token.
+    """
+    match = _PENDING_TOKEN_TAIL.search(buffer)
+    return match.start() if match else len(buffer)
+
+
+def _resolve_or_placeholder(text: str, vault: Vault) -> str:
+    """Like ``detokenize`` over a single string, but never raises.
+
+    A token this vault's session cannot resolve is replaced with
+    ``UNRESOLVED_TOKEN_PLACEHOLDER`` instead of propagating
+    ``TokenNotFoundError``/``VaultIntegrityError`` -- appropriate here
+    because this runs against a partial, already-in-flight response
+    stream where raising would either corrupt the chunked framing or
+    require silently truncating an otherwise-fine response (see
+    ``IncrementalDetokenizer``).
+
+    The two exceptions are not equally routine, though: ``TokenNotFoundError``
+    is an expected, benign case (e.g. a token minted under a different
+    gateway process/session), but ``VaultIntegrityError`` means a row's
+    AEAD authentication failed -- CLAUDE.md's vault doctrine treats that as
+    evidence of tampering or corruption, not a shrug. Silently collapsing
+    both into the same placeholder with zero visibility would discard a
+    security-relevant signal the vault was specifically built to surface, so
+    the integrity failure alone is also logged to stderr (token id only,
+    never plaintext or the ciphertext).
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        try:
+            return vault.resolve(token)
+        except VaultIntegrityError:
+            print(
+                f"veil: vault integrity check failed for token {token} "
+                "(possible tampering or corruption) -- substituting placeholder",
+                file=sys.stderr,
+            )
+            return UNRESOLVED_TOKEN_PLACEHOLDER
+        except TokenNotFoundError:
+            return UNRESOLVED_TOKEN_PLACEHOLDER
+
+    return _TOKEN_PATTERN.sub(_replace, text)
+
+
+class IncrementalDetokenizer:
+    """Chunk-boundary-safe ``detokenize`` for a single streaming text source.
+
+    Anthropic's streaming responses can split a token's text across two
+    separate deltas (confirmed live against the real API, mission-8); this
+    class buffers only what might be an in-progress token and resolves
+    everything else immediately, so a caller relaying a stream chunk by
+    chunk never emits a partial or literal token.
+
+    One instance per independent stream of text -- e.g. one Anthropic
+    ``content_block_index``. A token's text never spans two content
+    blocks, so an adapter must not share one instance across blocks.
+    """
+
+    def __init__(self, vault: Vault) -> None:
+        self._vault = vault
+        self._pending = ""
+
+    def feed(self, chunk: str) -> str:
+        """Feed newly-arrived text; return the portion now safe to emit."""
+        buffer = self._pending + chunk
+        boundary = _safe_flush_boundary(buffer)
+        safe, self._pending = buffer[:boundary], buffer[boundary:]
+        return _resolve_or_placeholder(safe, self._vault)
+
+    def flush(self) -> str:
+        """Call once at end of stream to emit whatever text is still held back.
+
+        Whatever remains was never completed into a token (a real token would
+        already have been resolved and emitted by ``feed``), so it is
+        returned as plain text -- never the unresolved-token placeholder.
+        """
+        remaining, self._pending = self._pending, ""
+        return remaining
+
+
+def detokenize_lenient(value: JSONValue, vault: Vault) -> JSONValue:
+    """Like ``detokenize``, but a token this vault cannot resolve becomes
+    ``UNRESOLVED_TOKEN_PLACEHOLDER`` instead of raising.
+
+    For a response the model already produced -- which must reach the client
+    one way or another (e.g. a buffered, non-streaming gateway response) --
+    discarding an otherwise-fine response over one bad token serves no
+    purpose ``detokenize``'s fail-closed doctrine exists for: that doctrine
+    stops raw PII from ever reaching an external API on the *outbound* leg,
+    and a resolve failure here leaks no PII either way (the token itself is
+    not PII).
+
+    Recurses into dicts and lists exactly like ``detokenize``; keys and
+    non-string scalars are returned unchanged. Does not mutate ``value``.
+    """
+    if isinstance(value, str):
+        return _resolve_or_placeholder(value, vault)
+    if isinstance(value, dict):
+        return {key: detokenize_lenient(item, vault) for key, item in value.items()}
+    if isinstance(value, list):
+        return [detokenize_lenient(item, vault) for item in value]
     return value

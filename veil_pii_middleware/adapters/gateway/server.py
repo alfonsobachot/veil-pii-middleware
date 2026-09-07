@@ -4,23 +4,39 @@ Listens locally and stands in for ``https://api.anthropic.com``. For every
 request: reads the full body, and if it is JSON, tokenizes every string leaf
 via ``core/tokenizer.py::tokenize()`` against a per-process
 ``core/vault.py::Vault`` before forwarding it upstream with an
-otherwise-untouched method/path/headers (including auth). The response is
-relayed back to the client exactly as received -- streaming or not -- with
-no rewriting at all.
+otherwise-untouched method/path/headers (including auth).
 
-That last point is a deliberate scope cut, not an oversight: BRIEF §6 flags
-that an SSE response can split a ``PII_<TYPE>_<NNNN>`` token across two
-chunks, which only matters if this gateway tried to rewrite the response.
-Since the architectural requirement ("zero raw PII to an external API")
-only constrains the *outbound* leg, this module never parses or rewrites
-response bytes, and the split-token risk does not apply to it. A future
-mission may add response-side rewriting with a real chunk-boundary-safe
-buffer; this one does not attempt it.
+The response is rewritten on the way back so a token the model echoes (e.g.
+``PII_EMAIL_0001``) resolves to its real value before it reaches the client
+(mission-8; mission-7 relayed the response untouched as an explicit,
+documented scope cut). Two response shapes are handled, both via
+``core/tokenizer.py`` -- this module never re-implements detection or
+substitution, only wires ``core/`` into the transport:
 
-Fails closed, matching every other adapter's doctrine: a request body that
-is not valid JSON, or a tokenization/vault failure, aborts the request with
-an error response of the gateway's own rather than forwarding the original
-bytes upstream unscanned.
+- **Streaming (``text/event-stream``)**: each ``content_block_delta`` event's
+  text-bearing field is fed through a ``core.tokenizer.IncrementalDetokenizer``
+  keyed by ``content_block_index``, live-verified against the real Anthropic
+  API (mission-8 spike) to confirm the event/delta shapes below and that an
+  SSE ``data:`` line is always one complete JSON event -- a token can only
+  split across the *text* of two such events, never mid-JSON. Any leftover
+  buffered text is flushed into a synthetic extra delta event right before
+  that block's ``content_block_stop``, so nothing is ever silently dropped.
+- **Buffered JSON (anything else that parses as JSON)**: detokenized in one
+  shot via ``core.tokenizer.detokenize_lenient()``.
+- **Anything else** (non-JSON, non-SSE): relayed byte-for-byte untouched,
+  same as mission-7's original behavior -- there is nothing to safely
+  detokenize about content with no recognized token-bearing structure.
+
+A token that fails to resolve (e.g. minted under a different gateway
+process/session) is replaced with ``core.tokenizer.UNRESOLVED_TOKEN_PLACEHOLDER``
+rather than raising or corrupting the stream -- a resolve failure here leaks
+no PII either way (the token itself is not PII), so this is a display
+choice, not the fail-closed doctrine that governs the *outbound* leg below.
+
+Fails closed on the request leg, matching every other adapter's doctrine: a
+request body that is not valid JSON, or a tokenization/vault failure, aborts
+the request with an error response of the gateway's own rather than
+forwarding the original bytes upstream unscanned.
 
 One ``Vault`` session per running gateway process: ``session_id`` is
 generated once at startup and reused by every request this process handles.
@@ -45,10 +61,16 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import httpx
 
-from veil_pii_middleware.core.tokenizer import JSONValue, tokenize
+from veil_pii_middleware.core.tokenizer import (
+    IncrementalDetokenizer,
+    JSONValue,
+    detokenize_lenient,
+    tokenize,
+)
 from veil_pii_middleware.core.vault import Vault
 
 __all__ = ["make_handler", "main"]
@@ -63,7 +85,6 @@ UPSTREAM_ENV_VAR = "VEIL_GATEWAY_UPSTREAM"
 _DEFAULT_UPSTREAM = "https://api.anthropic.com"
 
 _DEFAULT_PORT = 8787
-_CHUNK_SIZE = 8192
 
 # Headers that describe *this* hop's framing (connection lifecycle, body
 # length/encoding) rather than the payload itself -- recomputed or dropped
@@ -120,6 +141,191 @@ def _tokenize_body(raw_body: bytes, session_id: str) -> bytes:
     with _vault_lock, Vault(VAULT_DB_PATH, session_id) as vault:
         tokenized: JSONValue = tokenize(parsed, vault)
     return json.dumps(tokenized).encode()
+
+
+#: content-type prefix that routes a response through the SSE rewrite path
+#: rather than the buffered-JSON or untouched-relay paths.
+_SSE_CONTENT_TYPE = "text/event-stream"
+
+# Delta shapes confirmed live against the real Anthropic API (mission-8
+# spike, see handoff.md) that carry freeform, potentially token-bearing
+# display text, mapped to the JSON field holding that text. Substitution
+# here is a plain text replacement, safe for `text_delta`/`thinking_delta`
+# because the *outer* SSE envelope re-escapes the whole field via
+# `json.dumps(obj)` regardless of what characters the resolved value
+# contains. `signature_delta` -- also observed live -- is deliberately
+# excluded: it carries a cryptographic signature over the model's internal
+# state, never freeform text that could echo a token.
+#
+# `input_json_delta` (`partial_json`, tool-call arguments) is deliberately
+# NOT included, despite being string-bearing: its value is a raw fragment of
+# a *separate* JSON document that the client concatenates across deltas and
+# re-parses, not display text. A plain-text substitution there is only safe
+# if the resolved value never contains a `"` or `\` -- true for every entity
+# type this codebase mints today (EMAIL/DNI/NIE/IBAN/PHONE/CARD/IP), but not
+# guaranteed once a future free-text entity type lands, and this delta type
+# was never actually observed in the live spike (no tool call was
+# triggered) to validate the assumption against. Rewriting it correctly
+# would need escaping-aware substitution scoped to that field specifically;
+# deferred rather than shipped half-verified.
+_TEXT_BEARING_DELTA_FIELDS = {
+    "text_delta": "text",
+    "thinking_delta": "thinking",
+}
+
+
+def _split_sse_event(raw_event: str) -> tuple[list[str], dict[str, Any] | None, int]:
+    """Split one SSE event's raw text into lines, plus its parsed ``data:`` JSON.
+
+    Returns ``(lines, parsed_data, data_line_index)``; ``parsed_data`` and
+    ``data_line_index`` are ``None``/``-1`` if there is no ``data:`` line or
+    it is not valid JSON -- callers must treat the event as opaque then.
+    """
+    lines = raw_event.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("data:"):
+            try:
+                return lines, json.loads(line[len("data:") :].strip()), i
+            except json.JSONDecodeError:
+                return lines, None, -1
+    return lines, None, -1
+
+
+class _SseResponseRewriter:
+    """Resolves tokens in a live Anthropic SSE response, event by event.
+
+    One instance per HTTP response. Keeps one ``IncrementalDetokenizer`` per
+    ``content_block_index`` -- a token's text never spans two content
+    blocks (confirmed live: each block starts its own delta sequence) -- and
+    flushes a block's leftover buffered text into a synthetic delta event
+    immediately before that block's ``content_block_stop``, so nothing a
+    block was still holding back at its own end is ever silently dropped.
+    """
+
+    def __init__(self, vault: Vault) -> None:
+        self._vault = vault
+        self._detokenizers: dict[Any, IncrementalDetokenizer] = {}
+        self._delta_kinds: dict[Any, str] = {}
+
+    def rewrite(self, raw_event: str) -> list[str]:
+        """Return the raw SSE event text(s) to forward for one input event.
+
+        Normally a list of one (the input, rewritten in place if it carried
+        a token-bearing delta); occasionally two, when a block's leftover
+        buffered text must be flushed just before its ``content_block_stop``.
+        """
+        lines, obj, data_idx = _split_sse_event(raw_event)
+        if not isinstance(obj, dict):
+            return [raw_event]
+
+        event_type = obj.get("type")
+        if event_type == "content_block_delta":
+            return [self._rewrite_delta(raw_event, lines, obj, data_idx)]
+        if event_type == "content_block_stop":
+            return self._flush_block(obj.get("index")) + [raw_event]
+        return [raw_event]
+
+    def _rewrite_delta(
+        self, raw_event: str, lines: list[str], obj: dict[str, Any], data_idx: int
+    ) -> str:
+        index = obj.get("index")
+        delta = obj.get("delta")
+        delta_type = delta.get("type") if isinstance(delta, dict) else None
+        if index is None or not isinstance(delta, dict) or not isinstance(delta_type, str):
+            return raw_event
+        field = _TEXT_BEARING_DELTA_FIELDS.get(delta_type)
+        if field is None or not isinstance(delta.get(field), str):
+            return raw_event
+
+        detokenizer = self._detokenizers.setdefault(index, IncrementalDetokenizer(self._vault))
+        self._delta_kinds[index] = delta_type
+        delta[field] = detokenizer.feed(delta[field])
+        lines[data_idx] = "data: " + json.dumps(obj)
+        return "\n".join(lines)
+
+    def _flush_block(self, index: Any) -> list[str]:
+        if index is None or index not in self._detokenizers:
+            return []
+        leftover = self._detokenizers.pop(index).flush()
+        # `_rewrite_delta` always sets `_delta_kinds[index]` in lockstep with
+        # `_detokenizers[index]`, and the guard above already confirmed the
+        # latter -- so this key is always present here.
+        delta_type = self._delta_kinds.pop(index)
+        if not leftover:
+            return []
+        field = _TEXT_BEARING_DELTA_FIELDS[delta_type]
+        flush_event = {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": delta_type, field: leftover},
+        }
+        return ["event: content_block_delta\ndata: " + json.dumps(flush_event)]
+
+    def finish(self) -> list[str]:
+        """Flush every block still open at stream end (defensive; should not
+        normally trigger -- a well-formed response closes every block it opens).
+        """
+        events = []
+        for index in list(self._detokenizers):
+            events.extend(self._flush_block(index))
+        return events
+
+
+def _write_chunk(handler: BaseHTTPRequestHandler, data: bytes) -> None:
+    handler.wfile.write(f"{len(data):X}\r\n".encode())
+    handler.wfile.write(data)
+    handler.wfile.write(b"\r\n")
+
+
+def _relay_sse_response(
+    handler: BaseHTTPRequestHandler, upstream: httpx.Response, vault: Vault
+) -> None:
+    rewriter = _SseResponseRewriter(vault)
+    pending = ""
+    for text_chunk in upstream.iter_text():
+        pending += text_chunk
+        while "\n\n" in pending:
+            raw_event, pending = pending.split("\n\n", 1)
+            for out_event in rewriter.rewrite(raw_event):
+                _write_chunk(handler, out_event.encode() + b"\n\n")
+    for out_event in rewriter.finish():
+        _write_chunk(handler, out_event.encode() + b"\n\n")
+    if pending.strip():
+        # Genuinely malformed (no trailing blank line) -- forward whatever
+        # text is left rather than silently dropping it.
+        _write_chunk(handler, pending.encode())
+    handler.wfile.write(b"0\r\n\r\n")
+
+
+def _relay_buffered_response(
+    handler: BaseHTTPRequestHandler, upstream: httpx.Response, session_id: str
+) -> None:
+    # Fully buffers the body into memory before writing anything, unlike
+    # mission-7's original bounded, progressively-streamed relay -- a
+    # trade-off accepted here because detokenizing requires the whole JSON
+    # value up front, response bodies on this path (anything that isn't
+    # `text/event-stream`) are the small, non-streaming Anthropic API
+    # replies this gateway targets, and the byte-for-byte non-JSON case just
+    # below could stream but is kept in the same function for one code path.
+    body = upstream.read()
+    # Every token this codebase ever mints starts with the literal "PII_"
+    # (core/tokenizer.py's _TOKEN_PATTERN) -- if that substring is absent,
+    # nothing here could possibly resolve, so this skips opening the vault
+    # at all, the same way a GET with no request body never touches it.
+    if b"PII_" not in body:
+        _write_chunk(handler, body)
+        handler.wfile.write(b"0\r\n\r\n")
+        return
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _write_chunk(handler, body)
+    else:
+        VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with Vault(VAULT_DB_PATH, session_id) as vault:
+            rewritten: JSONValue = detokenize_lenient(parsed, vault)
+        _write_chunk(handler, json.dumps(rewritten).encode())
+    handler.wfile.write(b"0\r\n\r\n")
 
 
 def make_handler(
@@ -183,13 +389,14 @@ def make_handler(
                     self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
                     response_started = True
-                    for chunk in upstream.iter_bytes(_CHUNK_SIZE):
-                        if not chunk:
-                            continue
-                        self.wfile.write(f"{len(chunk):X}\r\n".encode())
-                        self.wfile.write(chunk)
-                        self.wfile.write(b"\r\n")
-                    self.wfile.write(b"0\r\n\r\n")
+
+                    content_type = upstream.headers.get("content-type", "")
+                    if content_type.startswith(_SSE_CONTENT_TYPE):
+                        VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        with Vault(VAULT_DB_PATH, session_id) as vault:
+                            _relay_sse_response(self, upstream, vault)
+                    else:
+                        _relay_buffered_response(self, upstream, session_id)
             except Exception:
                 if not response_started:
                     _write_error(self, 502, "upstream request failed")

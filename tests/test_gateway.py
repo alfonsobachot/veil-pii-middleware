@@ -26,6 +26,36 @@ import pytest
 from veil_pii_middleware.adapters.gateway import server as gateway_server
 
 _TEST_KEY_B64 = base64.b64encode(os.urandom(32)).decode()
+VALID_EMAIL = "alice@example.com"
+
+
+def _sse_body(events: list[dict[str, Any]]) -> bytes:
+    """Build a raw SSE response body from a list of Anthropic-shaped events."""
+    return b"".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode() for event in events
+    )
+
+
+def _extract_text_deltas(sse_text: str, index: int = 0) -> str:
+    """Reconstruct one content block's accumulated text the way a real client would.
+
+    Concatenates every ``content_block_delta`` text-bearing field for the
+    given ``index``, in order -- the only correct way to check a value that
+    may have been split across two separate delta events by the rewrite.
+    """
+    out = []
+    for raw_event in sse_text.split("\n\n"):
+        for line in raw_event.split("\n"):
+            if not line.startswith("data:"):
+                continue
+            obj = json.loads(line[len("data:") :].strip())
+            if obj.get("type") != "content_block_delta" or obj.get("index") != index:
+                continue
+            delta = obj.get("delta", {})
+            out.append(
+                delta.get("text") or delta.get("thinking") or delta.get("partial_json") or ""
+            )
+    return "".join(out)
 
 
 class _RecordingUpstream:
@@ -166,16 +196,11 @@ class TestRequestTokenization:
         assert not (tmp_path / ".veil" / "vault.db").exists()
 
 
-class TestResponseIsRelayedUntouched:
-    def test_response_body_is_not_rewritten_even_if_it_looks_like_a_token(
-        self, servers: _Servers
-    ) -> None:
-        servers.upstream_state.response_body = json.dumps(
-            {"content": [{"type": "text", "text": "your token is PII_EMAIL_0001"}]}
-        ).encode()
-        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
-        assert resp.status_code == 200
-        assert resp.json()["content"][0]["text"] == "your token is PII_EMAIL_0001"
+class TestResponseWithNoRecognizedTokenStructure:
+    """Content with no ``PII_`` substring (non-JSON) or that never touched the
+    vault at all is relayed exactly as mission-7 always did -- this mission
+    only changes behavior for content that actually carries a token.
+    """
 
     def test_large_response_relayed_byte_for_byte(self, servers: _Servers) -> None:
         big = ("x" * 50_000).encode()
@@ -190,6 +215,226 @@ class TestResponseIsRelayedUntouched:
         servers.upstream_state.response_body = b'{"type":"error"}'
         resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
         assert resp.status_code == 429
+
+    def test_get_with_json_response_but_no_pii_never_touches_the_vault(
+        self, servers: _Servers, tmp_path: Path
+    ) -> None:
+        resp = httpx.get(f"{servers.gateway_url}/v1/models", timeout=10)
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        assert not (tmp_path / ".veil" / "vault.db").exists()
+
+
+class TestResponseSideDetokenization:
+    """Mission-8: a token the model echoes back must resolve to its real
+    value before it reaches the client, in both response shapes.
+    """
+
+    def _mint_email_token(self, servers: _Servers) -> str:
+        httpx.post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+            timeout=10,
+        )
+        forwarded = json.loads(servers.upstream_state.requests[-1]["body"])
+        token = str(forwarded["messages"][0]["content"]).split()[-1]
+        assert token == "PII_EMAIL_0001"
+        return token
+
+    def test_buffered_json_response_resolves_a_previously_minted_token(
+        self, servers: _Servers
+    ) -> None:
+        token = self._mint_email_token(servers)
+        servers.upstream_state.response_body = json.dumps(
+            {"content": [{"type": "text", "text": f"on file: {token}"}]}
+        ).encode()
+
+        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
+
+        assert resp.status_code == 200
+        assert resp.json()["content"][0]["text"] == f"on file: {VALID_EMAIL}"
+
+    def test_buffered_json_response_with_unminted_token_gets_placeholder(
+        self, servers: _Servers
+    ) -> None:
+        servers.upstream_state.response_body = json.dumps(
+            {"content": [{"type": "text", "text": "your token is PII_EMAIL_0001"}]}
+        ).encode()
+
+        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
+
+        assert resp.status_code == 200
+        assert resp.json()["content"][0]["text"] == "your token is [unresolved token]"
+
+    def test_streaming_response_resolves_a_previously_minted_token(self, servers: _Servers) -> None:
+        token = self._mint_email_token(servers)
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {"type": "message_start"},
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": f"on file: {token}"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_stop"},
+            ]
+        )
+
+        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
+
+        assert resp.status_code == 200
+        assert _extract_text_deltas(resp.text) == f"on file: {VALID_EMAIL}"
+        assert token not in resp.text
+
+    def test_streaming_response_resolves_a_token_split_across_two_delta_events(
+        self, servers: _Servers
+    ) -> None:
+        token = self._mint_email_token(servers)
+        split_at = len(token) // 2
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {"type": "message_start"},
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": f"on file: {token[:split_at]}"},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": token[split_at:]},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_stop"},
+            ]
+        )
+
+        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
+
+        assert resp.status_code == 200
+        assert _extract_text_deltas(resp.text) == f"on file: {VALID_EMAIL}"
+        assert token not in resp.text
+        # The first half alone must never appear as a dangling fragment --
+        # proof the gateway actually held it back rather than flushing early.
+        assert token[:split_at] not in resp.text
+
+    def test_streaming_response_with_unresolved_token_gets_placeholder(
+        self, servers: _Servers
+    ) -> None:
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {"type": "message_start"},
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "your token is PII_EMAIL_0001"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_stop"},
+            ]
+        )
+
+        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
+
+        assert resp.status_code == 200
+        assert _extract_text_deltas(resp.text) == "your token is [unresolved token]"
+
+    def test_streaming_response_with_unresolved_token_has_valid_chunk_framing(
+        self, servers: _Servers
+    ) -> None:
+        """The unresolved-token path must never corrupt the chunked response --
+        exactly one status line, and the stream ends with a proper terminator.
+        """
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "your token is PII_EMAIL_0001"},
+                },
+                {"type": "content_block_stop", "index": 0},
+            ]
+        )
+        host_port = urlsplit(servers.gateway_url)
+        request = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 16\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            b'{"messages": []}'
+        )
+        with socket.create_connection((host_port.hostname, host_port.port), timeout=10) as sock:
+            sock.sendall(request)
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        raw_response = b"".join(chunks)
+
+        assert raw_response.count(b"HTTP/1.1") == 1
+        assert raw_response.endswith(b"0\r\n\r\n")
+        assert b"PII_EMAIL_0001" not in raw_response
+        assert b"[unresolved token]" in raw_response
+
+    def test_streaming_response_with_no_tokens_is_unaffected(self, servers: _Servers) -> None:
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {"type": "message_start"},
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "nothing sensitive here"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_stop"},
+            ]
+        )
+
+        resp = httpx.post(f"{servers.gateway_url}/v1/messages", json={"messages": []}, timeout=10)
+
+        assert resp.status_code == 200
+        assert _extract_text_deltas(resp.text) == "nothing sensitive here"
 
 
 class TestMidStreamUpstreamFailure:

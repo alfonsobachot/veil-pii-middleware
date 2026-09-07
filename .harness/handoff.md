@@ -1,126 +1,153 @@
 # Handoff
 
-Mission 7: gateway adapter at `ANTHROPIC_BASE_URL` (BRIEF work-plan day-2,
-items 9-10).
+Mission 8: response-side (model -> client) rewrite in the gateway, with a
+chunk-boundary-safe token buffer (BRIEF work-plan day-2 item 10b).
 
 ## Summary
 
-Implemented `veil_pii_middleware/adapters/gateway/server.py`: a reverse
-HTTP proxy that stands in for `https://api.anthropic.com`. For every
-request it reads the body; if it's JSON, tokenizes every string leaf via
-`core/tokenizer.py::tokenize()` against a per-process `core/vault.py::Vault`
-before forwarding to the real API with the original method/path/headers
-(including `Authorization`); the response is relayed back to the client
-byte-for-byte untouched, streaming or not — no response-side rewriting is
-attempted (deliberate scope cut, see Non-goals below). Fails closed on a
-non-JSON body or any tokenize/vault error: nothing is forwarded upstream in
-that case.
+Mission-7 tokenized only the outbound request leg and relayed the response
+byte-for-byte untouched, as an explicit scope cut. This mission closes that
+gap: a `PII_<TYPE>_<NNNN>` token the model echoes back now resolves to its
+real value before it reaches the client, in both response shapes the
+gateway can see, without ever re-implementing detection/substitution logic
+in the adapter layer.
 
-Added `httpx~=0.28.0` as a new runtime dependency (the project's first
-network-facing code; previously only `cryptography` for the vault).
+- `veil_pii_middleware/core/tokenizer.py` (additive; `tokenize()`/
+  `detokenize()`/`_TOKEN_PATTERN` unchanged, confirmed byte-for-byte by
+  diff): a new `IncrementalDetokenizer` class buffers only a possible
+  in-progress token's prefix and resolves everything else immediately, so a
+  caller feeding it text chunk by chunk never emits a partial or literal
+  token; `UNRESOLVED_TOKEN_PLACEHOLDER` and `detokenize_lenient()` give the
+  response leg a way to substitute a visible placeholder for a token that
+  fails to resolve instead of raising.
+- `veil_pii_middleware/adapters/gateway/server.py`: the response path now
+  branches on content-type. `text/event-stream` responses go through a new
+  `_SseResponseRewriter` that keeps one `IncrementalDetokenizer` per
+  `content_block_index` and flushes a block's leftover buffered text into a
+  synthetic delta event immediately before that block's
+  `content_block_stop`. Buffered JSON responses go through
+  `detokenize_lenient()` in one shot (skipping the vault entirely if the
+  body has no `PII_` substring, preserving the pre-existing "no-op request
+  never touches the vault" guarantee). Anything else — non-JSON, non-SSE —
+  is relayed byte-for-byte untouched, same as mission-7.
+- No new runtime dependency; `httpx`'s existing `iter_text()`/`.read()`
+  already used, both already gzip-decompression-aware.
+- `core/detector.py`, `core/vault.py`, `adapters/hooks/`,
+  `adapters/command/`, and the request-side of `server.py`/`tokenizer.py`
+  are untouched — confirmed via `git diff --stat`.
 
-`core/detector.py`, `core/vault.py`, `core/tokenizer.py`,
-`adapters/hooks/`, `adapters/command/` are untouched — confirmed via
-`git diff --stat` against those paths (empty).
+## Live spike — SSE event shape (gate before any buffer code was written)
 
-## Spike 1 — auth (go/no-go gate, run before any adapter code)
+**Method.** Reused mission-7's separate-process pattern
+(`ANTHROPIC_BASE_URL=http://127.0.0.1:<port> claude -p "<prompt>"`, never
+touching this session's own connection), but this time against a throwaway
+capture proxy that decoded and logged the *body content* — every SSE event
+— rather than only header names as mission-7's spike did. First attempt used
+`httpx`'s `iter_raw()` and failed to decode every chunk; that turned out to
+be a real, useful finding of its own (below), not a bug worth silently
+fixing and forgetting.
 
-**Result: GO.** `ANTHROPIC_BASE_URL` works with the existing subscription
-login; no `ANTHROPIC_API_KEY` is required.
+**Finding 1 — the response is gzip-compressed on the wire.** The real API
+returns `Content-Encoding: gzip`; raw network chunks start with the gzip
+magic bytes `\x1f\x8b`. `httpx`'s `iter_raw()` does not decompress;
+`iter_bytes()`/`iter_text()` do, transparently. The response-rewrite code
+uses `iter_text()` for exactly this reason — no manual decompression logic
+was written. (Checked incidentally: mission-7's existing `_HOP_BY_HOP` set
+already drops `content-encoding` when forwarding response headers, so there
+was no pre-existing mismatched-header bug to fix here, contrary to an
+initial suspicion during this spike — verified by `git diff` showing zero
+change needed there.)
 
-Method: a throwaway pass-through proxy (`http.client.HTTPSConnection`
-forwarding raw bytes to `api.anthropic.com`, no rewriting) listening on
-`127.0.0.1:8787`, not committed. A **separate** process —
-`ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude -p "Reply with exactly the
-single word: OK"` — was spawned from this session (never touching this
-session's own connection) and returned `OK`, exit `0`.
+**Finding 2 — SSE framing.** Every event is `event: <type>\ndata:
+{...}\n\n`; a `data:` line is always one complete, independently-parseable
+JSON object — confirmed across every event in the captured transcript, no
+event was ever split mid-JSON. This is why `_relay_sse_response` buffers at
+the `"\n\n"`-terminated-event granularity (safe regardless of how the
+underlying `iter_text()` chunks happen to land) rather than trying to track
+raw byte boundaries.
 
-Evidence, from the throwaway proxy's own stderr log (header *names* only —
-by design, values are never logged, so no secret appears here even in a
-throwaway spike):
+**Finding 3 — actual event/delta shapes observed live**, from a probe
+prompt asking for two sentences plus a literal `PII_EMAIL_0001`-shaped
+string echoed back:
 
 ```
-[proxy] listening on http://127.0.0.1:8787 -> https://api.anthropic.com
-[proxy] -> POST /v1/messages?beta=true headers=['Accept', 'Accept-Encoding',
-  'Authorization', 'Connection', 'Content-Length', 'Content-Type', 'Host',
-  'User-Agent', 'X-Claude-Code-Session-Id', 'X-Stainless-Arch', ...,
-  'anthropic-beta', 'anthropic-dangerous-direct-browser-access',
-  'anthropic-version', 'x-app'] body_len=4132
-[proxy] <- status=200 resp_headers=[...] body_len=647
-[proxy] -> POST /v1/messages?beta=true [...] body_len=129132
-[proxy] <- status=200 resp_headers=[...] body_len=671
+message_start
+content_block_start (content_block.type = "text")     -- a JSON "title" block, Claude Code's own title-gen
+content_block_delta (delta.type = "text_delta")
+content_block_stop
+message_delta / message_stop
+--- separate response, the actual reply ---
+message_start
+content_block_start (content_block.type = "thinking")
+content_block_delta (delta.type = "thinking_delta")
+content_block_delta (delta.type = "signature_delta")   -- base64 signature, not text
+content_block_stop
+content_block_start (content_block.type = "text")
+content_block_delta (delta.type = "text_delta")  x N
+content_block_stop
+message_delta / message_stop
 ```
 
-Two requests, both `200` (Claude Code appears to make a second call —
-consistent with a background title-generation request; not investigated
-further, out of scope). Key findings:
+`signature_delta` was a surprise (not named in the mission's intake
+question) and is **deliberately excluded** from detokenization: it carries
+a cryptographic signature over the model's internal state, never freeform
+text, so there is nothing to detokenize there — confirmed by inspecting its
+value in the capture (a long base64-looking blob, not conversational text).
 
-- Auth travels as an **`Authorization`** header (bearer token from the
-  subscription's OAuth flow), not `x-api-key`. The real gateway forwards
-  whatever auth header is present unchanged, so this holds regardless.
-- Endpoint is `POST /v1/messages?beta=true` — path *and* query string
-  matter; the gateway must forward both untouched (it does: `self.path`
-  includes the query string in `http.server.BaseHTTPRequestHandler`).
-- Response headers include `Transfer-Encoding` (chunked) — confirms
-  Spike 2's premise below: yes, the real response is delivered
-  chunked/streamed, not a single buffered blob.
+`input_json_delta` (`partial_json`, tool-call arguments) was **not**
+triggered by this probe (no tool call happened) — the intake grill's answer
+was to cover every string-bearing delta type "per what the spike actually
+observes," and this one wasn't observed. It is documented, stable Anthropic
+Messages API surface, so it was initially included anyway on that basis —
+but the code-reviewer pass (below) found a real structural problem with
+that and it was **removed** from scope rather than shipped half-verified.
+See "Independent review findings" below.
 
-The throwaway proxy process was killed after this check
-(`taskkill //PID <pid> //F`); nothing from it was committed.
+**No natural token split was observed** in this short probe — the
+`PII_EMAIL_0001`-shaped string the probe asked for landed intact in a
+single `text_delta`. The split-buffer's correctness therefore rests on
+deliberately-constructed unit and integration tests (below), not on having
+observed a real split in the wild. This is expected and was anticipated —
+BRIEF §6 and the mission's own risk framing already treated the split as a
+structural possibility to defend against, not something that needed to
+reproduce on demand to be real.
 
-## Spike 2 — SSE streaming (informational, not solved)
+Evidence artifacts (proxy script, captured log) were throwaway per the
+mission's Scope section and were not committed; the excerpts above are the
+durable record.
 
-Per the mission's agreed scope cut, this mission does not attempt
-chunk-boundary-safe response rewriting at all — see Non-goals. Spike 1's own
-log (above) confirms the premise this scope cut is judged against: the real
-API's response to Claude Code is in fact chunked/streamed
-(`Transfer-Encoding` present), not a single JSON blob, so a naive
-buffer-then-scan-then-forward approach on the response leg would have had
-real chunk-boundary risk to deal with. Deferred to an optional follow-up
-mission, not attempted here.
+## Manual end-to-end check (real gateway, real Claude Code, response-side rewrite)
 
-## Post-implementation live check (real gateway, real Claude Code, real PII)
+After implementation and the automated test suite passed, the finished
+gateway was pointed at the real `https://api.anthropic.com` and a separate
+`claude -p` process was run through it (fresh `VEIL_VAULT_KEY`, `cwd`
+outside this repo — see note below on why that matters) with a prompt
+containing a synthetic customer email (`jane.doe@example.com`, not a real
+person) asking the model to repeat it back verbatim.
 
-After the gateway was built and the automated test suite passed, a live
-check confirmed detection/tokenization actually fires on real conversation
-content flowing through the real code path — not just in the isolated unit
-tests against a fake upstream.
+**Result:** the CLI printed `Customer email on file: jane.doe@example.com`
+— the real value, not a literal `PII_EMAIL_0001` token. This is a direct,
+live confirmation of this mission's whole purpose: the outbound leg
+tokenized the email before it reached the real API (mission-7's existing,
+unmodified guarantee), the model echoed the token back, and this mission's
+new response-side rewrite resolved it back to the real value before it
+reached the terminal.
 
-Method: started the real gateway (`python -m
-veil_pii_middleware.adapters.gateway.server 8788`) with a fresh,
-process-local `VEIL_VAULT_KEY`. Spawned a separate `claude -p` process with
-`ANTHROPIC_BASE_URL=http://127.0.0.1:8788` and a prompt containing a real
-email address (`developer@example.com`); it replied normally
-(exit `0`).
-
-Verification: inspected `.veil/vault.db` directly (read-only, local,
-never transmitted) and found two new rows under that run's session id
-(`gateway-b914bcbb-...`), both entity type `EMAIL`. Decrypting them with the
-same process-local key (still exported in that terminal at the time)
-confirmed the two plaintext values were `developer@example.com` (the
-prompt's own PII) and `noreply@anthropic.com` (present somewhere in Claude
-Code's own system prompt/metadata, not something this mission put there).
-This confirms the detector fired on real content and the vault minted real
-tokens for it — the same code path (`_tokenize_body` in `server.py`) that
-the automated tests already prove never lets a raw value reach
-`client.stream(...)`.
-
-**Known limitation of this specific evidence, flagged by independent
-review:** the process-local `VEIL_VAULT_KEY` used for that run was
-generated fresh for the check and was not persisted afterward — correct
-per `MASTER_KEY_ENV_VAR`'s own doctrine (never from the repository, treated
-as ephemeral), but it also means those two specific ciphertext rows cannot
-be re-decrypted later by anyone, including a reviewer, to re-confirm this
-exact claim after the fact. The *mechanism* is not resting on that one
-irreproducible artifact, though: `tests/test_gateway.py`'s
-`TestRequestTokenization`/`TestFailsClosed` cases prove the same code path
-structurally, with no secret involved, and can be re-run by anyone at any
-time (`pytest tests/test_gateway.py -v`). A human wanting to re-confirm the
-live-content claim specifically would need to re-run this exact live check
-themselves (5 minutes: start the gateway, spawn `claude -p` with
-`ANTHROPIC_BASE_URL` set, inspect `.veil/vault.db` with the key still in
-scope) rather than trust this write-up alone — noted here explicitly so
-that gap is visible, not silently assumed away.
+**Notable incidental finding, not a bug in this project's code:** the first
+two attempts at this check were run with `cwd` set to this repository, and
+the spawned `claude -p` process — itself loading this repo's own
+`CLAUDE.md` as project context — refused both times: once citing the
+system-level rule against using the operator's own account email for an
+unrelated purpose, once citing this project's own "no raw PII may reach an
+external API" doctrine as a reason it personally would not echo a
+PII-shaped value back, even framed as a synthetic test. Both refusals are
+the model behaving exactly as its instructions intend; they are not a
+gateway defect. Re-running the identical prompt with `cwd` outside the
+repository (so the probe process does not load this project's own
+CLAUDE.md as its own operating instructions) produced the clean result
+above. Noted here because it is a real, reproducible interaction between
+this project testing itself with the same tool it is a policy-file for —
+worth remembering for any future live check of this kind.
 
 ## Independent review findings and what was done about each
 
@@ -129,96 +156,116 @@ run against this diff (fresh context, read-only, no edits by either).
 
 **Fixed:**
 
-- **Blocking (code-reviewer):** a mid-stream upstream failure (e.g. the
-  real API dropping the connection after the gateway had already relayed a
-  status line and some response chunks to its client) triggered a *second*
-  `send_response(502, ...)` on the same connection, splicing a fresh status
-  line into an already-in-flight chunked body and corrupting the framing.
-  Fixed in `server.py`'s `_handle`: a `response_started` flag now gates
-  whether a failure may still call `_write_error` (only before any bytes of
-  the response have gone out); past that point the handler just stops and
-  lets the connection close. Covered by two new regression tests in
-  `tests/test_gateway.py::TestMidStreamUpstreamFailure`, one asserting the
-  literal raw wire bytes never contain a second `HTTP/1.1` status line, one
-  asserting the gateway keeps serving subsequent requests afterward.
-- **Should-fix (code-reviewer):** `core/vault.py::Vault._next_seq` is a
-  read-then-insert with no transaction spanning both statements; under
-  `ThreadingHTTPServer`'s real one-thread-per-request concurrency (the
-  first adapter in this codebase to actually exercise concurrent access to
-  one session), two simultaneous requests minting a token for the same
-  entity type could race and collide. This already failed closed (caught
-  by the generic exception handler, 500, no data leak) but was an
-  availability bug, not just a theoretical one. Fixed **without touching
-  `core/vault.py`** (out of this mission's scope): added a
-  process-local `threading.Lock` in `server.py` serializing
-  `_tokenize_body`'s vault access, eliminating the race at the one place
-  it can actually occur (this gateway process) instead of changing shared
-  core code.
-- **goal-verifier:** this `handoff.md` did not exist for this mission
-  before this review pass — the mission's own acceptance criteria (AC6)
-  and merge policy require it. Written now, with the actual spike evidence
-  above rather than a restated claim.
+- **Should-fix (code-reviewer):** `input_json_delta`'s `partial_json` field
+  is a raw fragment of a *separate* JSON document that the client
+  concatenates across deltas and re-parses — not display text. Plain-text
+  substitution there is only safe if the resolved value never contains a
+  `"` or `\`; true for every entity type this codebase mints today
+  (EMAIL/DNI/NIE/IBAN/PHONE/CARD/IP) but not guaranteed once a future
+  free-text entity type lands, and this delta type was never actually
+  observed live to validate the assumption against in the first place.
+  **Removed from `_TEXT_BEARING_DELTA_FIELDS`** rather than shipped with an
+  untested, structurally-fragile substitution — tool-call-argument
+  rewriting is deferred to a future mission, documented in the constant's
+  own comment in `server.py`.
+- **Should-fix (code-reviewer):** `TokenNotFoundError` and
+  `VaultIntegrityError` were collapsed into the same silent placeholder
+  with zero visibility. `VaultIntegrityError` specifically means a row's
+  AEAD authentication failed — CLAUDE.md's vault doctrine treats that as
+  evidence of tampering or corruption, not routine "token not found."
+  `_resolve_or_placeholder` (`core/tokenizer.py`) now logs a stderr line
+  (token id only, never plaintext or ciphertext) distinguishing this case,
+  and a new test
+  (`TestIncrementalDetokenizer::test_integrity_failure_gets_placeholder_and_is_logged_distinctly`)
+  reuses `test_vault.py`'s own ciphertext-swap technique to prove it fires.
+- **Should-fix (code-reviewer):** `_SseResponseRewriter.rewrite` assumed a
+  parsed `data:` payload was always a JSON object; a non-dict top-level
+  value (list/string/number/bool) would raise `AttributeError`. Not a
+  security issue (the outer exception handler already degrades this to a
+  truncated-not-corrupted stream, matching mission-7's own accepted
+  precedent), but inconsistent with `_rewrite_delta`'s own defensive
+  `isinstance` checks. Added an `isinstance(obj, dict)` guard for
+  consistency.
+- **Nit (code-reviewer):** `_flush_block`'s `self._delta_kinds.pop(index,
+  "text_delta")` carried an unreachable default (the two dicts are always
+  updated in lockstep). Removed the dead default and added a comment
+  stating the invariant instead.
+- **goal-verifier (blocking):** this `handoff.md` did not exist for this
+  mission when the verifier ran — the mission's own acceptance criteria
+  (AC1, AC7) and merge policy require it, and the project has already
+  recorded this exact failure mode as a lesson from a prior mission (spike
+  evidence narrated in chat but never written to `handoff.md`). Written now
+  with the actual spike transcript above, not a restated claim.
 
 **Deferred (documented, not fixed, with reasoning):**
 
-- **Should-fix (code-reviewer):** exceptions outside the two explicit
-  `try`/`except` blocks in the original code (e.g. a malformed
-  non-numeric `Content-Length`, or a `BrokenPipeError` from a client
-  disconnecting mid-write) could fall through to `socketserver`'s default
-  `handle_error`, dumping a traceback to stderr via an unaudited path. The
-  blocking-bug fix's restructure incidentally widened the outer exception
-  handling to cover this (the whole request-handling body up to and
-  including the response-relay loop is now inside one `try`/`except
-  Exception`), but `_write_error` itself is not separately guarded against
-  raising on an already-broken socket. No exception message in this file
-  ever interpolates header/body content today, so no concrete leak was
-  found — tracked as a residual risk, not a re-opened blocker.
-- **Should-fix (code-reviewer):** the gateway's own listening socket has no
-  authentication — any local process reaching `127.0.0.1:<port>` can mint
-  tokens into the one shared per-process vault, and since
-  `tokenize()`/`TokenFormatOverflowError` correctly refuses a 5th-digit
-  token, ~10,000 distinct values of one entity type in a session
-  permanently fails every later request containing that entity type (fails
-  closed, but a real availability cliff with no documented mitigation).
-  Accepted as a known limitation for this mission's target user (a single
-  developer running one local gateway process for their own Claude Code
-  session) — not fixed here.
-- **Nit (code-reviewer):** `_HOP_BY_HOP` omits `TE`/`Trailer`/
-  `Proxy-Authenticate`/`Proxy-Authorization`. Claude Code never sends these
-  to this proxy in practice; left as-is, noted for a future reviewer.
-- **goal-verifier:** flagged that `TestResponseIsRelayedUntouched` only
-  exercises a `Content-Length`-framed fake-upstream response, not one the
-  fake upstream itself sends as real chunked/streamed framing (only the
-  gateway's own re-chunking *to the client* is exercised, via the
-  large-body test). The code path (`httpx`'s `.stream()`/`iter_bytes()`) is
-  framing-agnostic on the upstream side, so risk is judged low, but this is
-  a real gap against the validation table's literal wording and is not
-  closed here.
+- **Should-fix (code-reviewer):** `_relay_buffered_response` fully buffers
+  a non-streaming response into memory via `upstream.read()` before writing
+  anything, where mission-7's original relay streamed with bounded memory
+  and progressive time-to-first-byte. Accepted as a trade-off: detokenizing
+  requires the whole JSON value up front, and this path only serves
+  non-`text/event-stream` Anthropic API replies, which are small in this
+  tool's actual usage (a single developer's local gateway, not a
+  high-throughput production proxy). Documented inline in
+  `_relay_buffered_response`'s own comment rather than fixed, per the
+  reviewer's own suggested alternative.
+- **goal-verifier note (not a defect):** flagged that `.harness/bin/verify`'s
+  `contract` gate does not itself check `handoff.md`'s content, only
+  `mission.md`'s structure — correct observation, not something this
+  mission's scope covers changing.
 
-## Non-goals kept out of scope (unchanged from the mission)
+## Validation
 
-- No response-side tokenize/detokenize call exists anywhere — confirmed by
-  the independent reviewer via `grep` on `server.py`: every `tokenize`/
-  `Vault(` reference lives in the request path (`_tokenize_body` and its
-  one call site); the response-relay block contains none. A token the
-  model echoes back (e.g. `PII_EMAIL_0001`) appears literally on screen.
-- `adapters/hooks/` vs. gateway coverage overlap/redundancy: still an open
-  question, not decided here.
-- Multi-process/multi-window vault correlation in gateway mode: still one
-  session per running process, documented in `server.py`'s module
-  docstring.
+- `.harness/bin/verify`: **PASS**, exit `0` — contract, lint, typecheck,
+  test, eval, build all green (run after every fix above, not just once at
+  the start).
+- `pytest`: full suite green, including 12 new/changed tests in
+  `tests/test_gateway.py::TestResponseSideDetokenization` (buffered JSON
+  with a previously-minted token, buffered JSON with an unminted token,
+  streaming resolution of a whole token, streaming resolution of a token
+  **deliberately split across two separate delta events** — the core
+  chunk-boundary-safety claim, verified end to end through the real
+  gateway, not just the unit-level algorithm — unresolved-token placeholder
+  with a raw-socket check that chunked framing stays valid (exactly one
+  `HTTP/1.1` status line, ends `0\r\n\r\n`, no raw token bytes anywhere on
+  the wire), and no-token responses unaffected) and 12 new tests in
+  `tests/test_tokenizer.py` (`TestIncrementalDetokenizer`,
+  `TestDetokenizeLenient`: every split offset of a real token exhaustively,
+  a 3-way split, a one-character-at-a-time split, an unresolved-token
+  placeholder, the integrity-failure case above, end-of-stream flush of
+  text that never became a token, ordinary long uppercase text not
+  buffered indefinitely, two tokens in one stream, independent instances
+  not sharing buffered state).
+- The one pre-existing mission-7 test that asserted the *literal opposite*
+  of this mission's goal (`test_response_body_is_not_rewritten_even_if_it_looks_like_a_token`)
+  was replaced, not silently deleted — its class was renamed
+  `TestResponseWithNoRecognizedTokenStructure` and now documents exactly
+  which content still passes through untouched (non-JSON, or JSON with no
+  `PII_` substring). Every other mission-7 gateway test
+  (`TestRequestTokenization`, `TestMidStreamUpstreamFailure`,
+  `TestFailsClosed`) passes unmodified.
 
-## Human verification still needed before merge
+## Residual risks / known gaps
 
-1. Read this handoff and the diff (`git diff` — touches only
-   `veil_pii_middleware/adapters/gateway/`, `pyproject.toml`,
-   `tests/test_gateway.py`, `.harness/*`).
-2. `.harness/bin/verify` — currently green (contract, lint, typecheck, test,
-   eval, build — 6/6). Re-run it yourself.
-3. If you want to independently re-confirm the live-content claim above
-   (recommended, since that specific evidence is not re-decryptable after
-   the fact): `VEIL_VAULT_KEY=$(python3 -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())") .venv/Scripts/python -m veil_pii_middleware.adapters.gateway.server 8788` in one terminal, then in another
-   `ANTHROPIC_BASE_URL=http://127.0.0.1:8788 claude -p "test email
-   someone@example.com, just reply OK"`, then inspect `.veil/vault.db` with
-   the same key while it's still in scope.
-4. No commit/push/merge has been made by this session, per policy.
+- `input_json_delta`/tool-call-argument rewriting is deferred (see above) —
+  a token echoed inside a tool call's arguments will still appear literally
+  on screen. Not a security gap (no PII crosses to the external API either
+  way; this is purely a display gap on the response leg, same class as the
+  already-known `MessageDisplay`/`/reveal` gap BRIEF item 14 anticipates),
+  but worth listing as a known limitation for whoever picks up item 14.
+- The manual live check's exact ciphertext (the `jane.doe@example.com`
+  token minted in that run) is not independently re-decryptable after the
+  fact — the process-local `VEIL_VAULT_KEY` was ephemeral by design, same
+  documented limitation mission-7's handoff already flagged for its own
+  live check. The mechanism itself is proven by the automated test suite,
+  which anyone can re-run at any time without any secret.
+- One `Vault` session per gateway process (mission-7's accepted limitation)
+  is unchanged and now also governs response-side resolution: a token
+  minted by one gateway process instance cannot be resolved by a different
+  instance, or after a restart. This mission's placeholder design means
+  that specific failure mode now degrades gracefully (a placeholder, not a
+  crash or a leak) rather than being untested territory.
+
+## Status
+
+implemented — awaiting human review for merge

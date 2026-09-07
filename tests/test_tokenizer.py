@@ -14,9 +14,12 @@ from pathlib import Path
 import pytest
 from veil_pii_middleware.core.detector import EntityType
 from veil_pii_middleware.core.tokenizer import (
+    UNRESOLVED_TOKEN_PLACEHOLDER,
+    IncrementalDetokenizer,
     JSONValue,
     TokenFormatOverflowError,
     detokenize,
+    detokenize_lenient,
     tokenize,
 )
 from veil_pii_middleware.core.vault import TokenNotFoundError, Vault
@@ -212,6 +215,191 @@ class TestTokenFormatOverflow:
 
         with pytest.raises(TokenFormatOverflowError):
             tokenize(f"contact {VALID_EMAIL}", vault)
+
+
+class TestIncrementalDetokenizer:
+    """Chunk-boundary-safe response-side detokenization (mission-8).
+
+    ``feed()`` is called once per incoming text chunk; ``flush()`` once at
+    end of stream. Every scenario is checked against the token produced by
+    the token minted for ``VALID_EMAIL`` above: ``PII_EMAIL_0001``.
+    """
+
+    def _token_for(self, vault: Vault) -> str:
+        token = vault.get_or_create_token(VALID_EMAIL, EntityType.EMAIL)
+        assert token == "PII_EMAIL_0001"
+        return token
+
+    def test_whole_token_in_one_call_resolves_immediately(self, vault: Vault) -> None:
+        token = self._token_for(vault)
+        d = IncrementalDetokenizer(vault)
+
+        out = d.feed(f"the email is {token}, thanks")
+        assert out == f"the email is {VALID_EMAIL}, thanks"
+        assert d.flush() == ""
+
+    def test_split_at_every_offset_matches_unsplit_result(self, tmp_path: Path) -> None:
+        text_template = "contact {token} today"
+        expected = f"contact {VALID_EMAIL} today"
+
+        for split_at in range(1, len(text_template.format(token="PII_EMAIL_0001"))):
+            with Vault(tmp_path / f"v{split_at}.db", "s", master_key=_TEST_KEY) as v:
+                token = v.get_or_create_token(VALID_EMAIL, EntityType.EMAIL)
+                text = text_template.format(token=token)
+                d = IncrementalDetokenizer(v)
+
+                first, second = text[:split_at], text[split_at:]
+                out = d.feed(first) + d.feed(second) + d.flush()
+                assert out == expected, f"split at {split_at} failed: {out!r}"
+
+    def test_split_across_three_calls(self, vault: Vault) -> None:
+        token = self._token_for(vault)
+        text = f"contact {token} today"
+        third = len(text) // 3
+        d = IncrementalDetokenizer(vault)
+
+        out = (
+            d.feed(text[:third])
+            + d.feed(text[third : 2 * third])
+            + d.feed(text[2 * third :])
+            + d.flush()
+        )
+        assert out == f"contact {VALID_EMAIL} today"
+
+    def test_split_one_character_at_a_time(self, vault: Vault) -> None:
+        token = self._token_for(vault)
+        text = f"contact {token} today"
+        d = IncrementalDetokenizer(vault)
+
+        out = "".join(d.feed(ch) for ch in text) + d.flush()
+        assert out == f"contact {VALID_EMAIL} today"
+
+    def test_ordinary_long_uppercase_text_is_not_buffered_indefinitely(self, vault: Vault) -> None:
+        d = IncrementalDetokenizer(vault)
+        chunk = "THIS IS ALL CAPS " * 50
+
+        out = d.feed(chunk)
+
+        # A run of plain uppercase text with no "PII_" anchor never matches
+        # any alternative of the pending-tail pattern, so it must all flush
+        # immediately rather than accumulate in the internal buffer -- if
+        # anything were still held back, flush() would return it here.
+        assert out == chunk
+        assert d.flush() == ""
+
+    def test_unresolved_token_gets_placeholder_not_raised(self, vault: Vault) -> None:
+        d = IncrementalDetokenizer(vault)
+
+        out = d.feed("see PII_EMAIL_9999 here")
+
+        assert out == f"see {UNRESOLVED_TOKEN_PLACEHOLDER} here"
+
+    def test_integrity_failure_gets_placeholder_and_is_logged_distinctly(
+        self, vault: Vault, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        # Same class of tampering as test_vault.py's
+        # TestAadIntegrity::test_swapped_ciphertext_between_rows_fails_authentication,
+        # but checked here to confirm the response-side placeholder path
+        # specifically distinguishes this from a routine unresolved token.
+        token_a = vault.get_or_create_token(VALID_EMAIL, EntityType.EMAIL)
+        token_b = vault.get_or_create_token(VALID_DNI, EntityType.DNI)
+        row_a = vault._conn.execute(
+            "SELECT ciphertext, nonce FROM mappings WHERE token = ?", (token_a,)
+        ).fetchone()
+        vault._conn.execute(
+            "UPDATE mappings SET ciphertext = ?, nonce = ? WHERE token = ?",
+            (row_a[0], row_a[1], token_b),
+        )
+        vault._conn.commit()
+
+        d = IncrementalDetokenizer(vault)
+        out = d.feed(f"see {token_b} here")
+
+        assert out == f"see {UNRESOLVED_TOKEN_PLACEHOLDER} here"
+        _, err = capfd.readouterr()
+        assert "integrity" in err.lower()
+        assert token_b in err
+        assert VALID_EMAIL not in err
+        assert VALID_DNI not in err
+
+    def test_unresolved_token_placeholder_survives_a_split(self, vault: Vault) -> None:
+        text = "see PII_EMAIL_9999 here"
+        d = IncrementalDetokenizer(vault)
+
+        out = d.feed(text[:10]) + d.feed(text[10:]) + d.flush()
+
+        assert out == f"see {UNRESOLVED_TOKEN_PLACEHOLDER} here"
+
+    def test_end_of_stream_flush_of_a_near_miss_is_plain_text_not_placeholder(
+        self, vault: Vault
+    ) -> None:
+        d = IncrementalDetokenizer(vault)
+
+        out = d.feed("contact PII_EM")
+        tail = d.flush()
+
+        assert out == "contact "
+        assert tail == "PII_EM"
+        assert UNRESOLVED_TOKEN_PLACEHOLDER not in tail
+
+    def test_flush_of_incomplete_digit_run_is_plain_text(self, vault: Vault) -> None:
+        # Only two of the four digits ever arrive -- never a real token.
+        d = IncrementalDetokenizer(vault)
+
+        out = d.feed("contact PII_EMAIL_00")
+        tail = d.flush()
+
+        assert out == "contact "
+        assert tail == "PII_EMAIL_00"
+
+    def test_two_tokens_in_one_stream_each_resolve(self, vault: Vault) -> None:
+        email_token = self._token_for(vault)
+        dni_token = vault.get_or_create_token(VALID_DNI, EntityType.DNI)
+        text = f"{email_token} and {dni_token}"
+        d = IncrementalDetokenizer(vault)
+
+        mid = len(text) // 2
+        out = d.feed(text[:mid]) + d.feed(text[mid:]) + d.flush()
+
+        assert out == f"{VALID_EMAIL} and {VALID_DNI}"
+
+    def test_independent_instances_do_not_share_buffered_state(self, vault: Vault) -> None:
+        token = self._token_for(vault)
+        first_half = token[:6]
+
+        block_a = IncrementalDetokenizer(vault)
+        block_b = IncrementalDetokenizer(vault)
+
+        # Block B never receives the second half -- a token must not span
+        # two independent content blocks (Tooling Assessment).
+        out_a = block_a.feed(first_half)
+        out_b = block_b.feed("unrelated text, no token here")
+
+        assert out_a == ""
+        assert out_b == "unrelated text, no token here"
+        assert block_a.flush() == first_half
+
+
+class TestDetokenizeLenient:
+    def test_known_token_resolves_like_detokenize(self, vault: Vault) -> None:
+        tokenized = tokenize(VALID_EMAIL, vault)
+        assert detokenize_lenient(tokenized, vault) == VALID_EMAIL
+
+    def test_unknown_token_gets_placeholder_instead_of_raising(self, vault: Vault) -> None:
+        assert detokenize_lenient("see PII_EMAIL_9999 here", vault) == (
+            f"see {UNRESOLVED_TOKEN_PLACEHOLDER} here"
+        )
+
+    def test_nested_structure_does_not_abort_on_a_bad_token(self, vault: Vault) -> None:
+        good = tokenize(VALID_EMAIL, vault)
+        payload: JSONValue = {"good": good, "bad": "PII_EMAIL_9999", "plain": 42}
+
+        result = detokenize_lenient(payload, vault)
+
+        assert isinstance(result, dict)
+        assert result["good"] == VALID_EMAIL
+        assert result["bad"] == UNRESOLVED_TOKEN_PLACEHOLDER
+        assert result["plain"] == 42
 
 
 class TestOffsetCorrectnessUnderMultipleSpans:
