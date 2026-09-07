@@ -1,242 +1,224 @@
 # Handoff
 
-Mission 6: `PreToolUse`/`PostToolUse` hooks (BRIEF work-plan step 8).
+Mission 7: gateway adapter at `ANTHROPIC_BASE_URL` (BRIEF work-plan day-2,
+items 9-10).
 
 ## Summary
 
-Implemented two Claude Code hook scripts that close the end-to-end demo loop
-for the one tool the demo uses (`Bash` invoking `sqlite3` against
-`demo/veil_demo.db`):
+Implemented `veil_pii_middleware/adapters/gateway/server.py`: a reverse
+HTTP proxy that stands in for `https://api.anthropic.com`. For every
+request it reads the body; if it's JSON, tokenizes every string leaf via
+`core/tokenizer.py::tokenize()` against a per-process `core/vault.py::Vault`
+before forwarding to the real API with the original method/path/headers
+(including `Authorization`); the response is relayed back to the client
+byte-for-byte untouched, streaming or not — no response-side rewriting is
+attempted (deliberate scope cut, see Non-goals below). Fails closed on a
+non-JSON body or any tokenize/vault error: nothing is forwarded upstream in
+that case.
 
-- `pre_tool_use.py` de-tokenizes a `PII_<TYPE>_<NNNN>` token inside a
-  demo-db `Bash` command back into its real value before the command runs,
-  via `core/tokenizer.py::detokenize()` against a per-session
-  `core/vault.py::Vault`. Blocks (exit `2`) on any failure — bad/foreign
-  token, vault won't open, malformed hook payload.
-- `post_tool_use.py` tokenizes the whole `tool_response` value of a
-  demo-db `Bash` call generically (via `tokenize()`, which recurses through
-  arbitrary dicts/lists and only touches string leaves) since Claude Code's
-  official hooks reference doesn't fully document `tool_response`'s shape
-  for `Bash`. Cannot block (the tool already ran, per the hook contract);
-  on failure it prints a stderr diagnostic and exits non-zero, but never
-  fabricates or partially emits `updatedToolOutput`.
-- Both scripts no-op (no vault touched, exit `0`, no stdout) for any tool
-  call that isn't a demo-db `Bash` invocation, via a shared
-  `is_demo_db_command()` check in `_scope.py`.
-- The hooks are wired up in `demo/settings.hooks.json`, a partial settings
-  file **not** referenced by `.claude/settings.json` or
-  `.claude/settings.local.json.example` — activated only via
-  `claude --settings demo/settings.hooks.json` for an actual demo run, so
-  every other Bash call on this repo (including this harness's own
-  meta-development sessions) is unaffected.
-- `README.md` documents that activation command and the trade-off it
-  carries (see below).
+Added `httpx~=0.28.0` as a new runtime dependency (the project's first
+network-facing code; previously only `cryptography` for the vault).
 
-`.harness/bin/verify` passes (contract, lint, typecheck, test, eval, build —
-all 6 green). `tests/test_hooks.py` has 23 passing tests, all real
-subprocess invocations with a Python-constructed JSON payload piped via
-stdin, matching the convention `tests/test_sanitize.py` already established
-for the `/veil` adapter.
+`core/detector.py`, `core/vault.py`, `core/tokenizer.py`,
+`adapters/hooks/`, `adapters/command/` are untouched — confirmed via
+`git diff --stat` against those paths (empty).
 
-## Review cycle (important — read before treating this as done)
+## Spike 1 — auth (go/no-go gate, run before any adapter code)
 
-An independent `code-reviewer` pass (fresh context, read-only) on the first
-implementation found two **blocking** issues before anything was committed.
-Both are fixed and a second, targeted `code-reviewer` re-check confirmed the
-fixes by direct reproduction (not just by reading the diff). Full detail is
-in `.harness/mission.md`'s "Review findings and fixes" section; summary:
+**Result: GO.** `ANTHROPIC_BASE_URL` works with the existing subscription
+login; no `ANTHROPIC_API_KEY` is required.
 
-1. **Fail-closed gap:** a non-object top-level JSON payload (`[1,2,3]`,
-   `null`, a bare string, `true`) crashed both scripts with an uncaught
-   `AttributeError` (exit code `1`, not the documented fail-closed
-   contract). Fixed by validating `isinstance(payload, dict)` inside the
-   same `try` block. Verified by direct reproduction: all four payload
-   variants now produce the documented exit code and stderr, no traceback,
-   for both scripts. Locked in by `tests/test_hooks.py`'s
-   `test_non_object_top_level_payload_*` cases.
-2. **Permission-model gap (the more serious one):** `pre_tool_use.py`
-   originally emitted `"permissionDecision": "allow"` on every match of
-   `is_demo_db_command()` — a bare substring check on `"veil_demo.db"`
-   anywhere in the command, not proof the command *only* invokes `sqlite3`
-   against that db. A compound/chained command (e.g. `rm -rf ~; sqlite3
-   demo/veil_demo.db "select 1"`) would also match, and
-   `permissionDecision: "allow"` would have auto-approved that *entire*
-   command, skipping Claude Code's normal ask-permission prompt — the same
-   failure class `docs/missions/mission-5/handoff.md` already documents
-   fixing once for the `/veil` adapter (removing an `allowed-tools`
-   wildcard grant for the identical reason: an auto-approve mechanism
-   riding on a pattern match that doesn't actually constrain the whole
-   command line). Fixed by removing `permissionDecision` entirely from
-   `pre_tool_use.py`'s output — it now only ever returns `updatedInput`,
-   leaving the (rewritten) command subject to the normal ask-permission
-   flow. Verified: `permissionDecision` no longer appears in any executable
-   path of `pre_tool_use.py` (grep confirms it exists only in
-   docstring/comment prose and in the test asserting its absence).
+Method: a throwaway pass-through proxy (`http.client.HTTPSConnection`
+forwarding raw bytes to `api.anthropic.com`, no rewriting) listening on
+`127.0.0.1:8787`, not committed. A **separate** process —
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude -p "Reply with exactly the
+single word: OK"` — was spawned from this session (never touching this
+session's own connection) and returned `OK`, exit `0`.
 
-This second fix introduces a **new residual risk**, not present before: it
-is undocumented whether Claude Code actually applies `updatedInput` when
-`permissionDecision` is left unset — the official hooks reference only
-shows `updatedInput` in examples that also set `permissionDecision:
-"allow"`. If Claude Code silently ignores `updatedInput` without an
-accompanying `permissionDecision`, this mission's `PreToolUse`
-de-tokenization would be a no-op in a real session even though every unit
-test here passes (the tests only exercise the script's own stdout contract,
-never Claude Code's interpretation of it). This is now the single most
-important thing the live human test below needs to check.
+Evidence, from the throwaway proxy's own stderr log (header *names* only —
+by design, values are never logged, so no secret appears here even in a
+throwaway spike):
 
-## Residual risks (all require the live human test to close)
+```
+[proxy] listening on http://127.0.0.1:8787 -> https://api.anthropic.com
+[proxy] -> POST /v1/messages?beta=true headers=['Accept', 'Accept-Encoding',
+  'Authorization', 'Connection', 'Content-Length', 'Content-Type', 'Host',
+  'User-Agent', 'X-Claude-Code-Session-Id', 'X-Stainless-Arch', ...,
+  'anthropic-beta', 'anthropic-dangerous-direct-browser-access',
+  'anthropic-version', 'x-app'] body_len=4132
+[proxy] <- status=200 resp_headers=[...] body_len=647
+[proxy] -> POST /v1/messages?beta=true [...] body_len=129132
+[proxy] <- status=200 resp_headers=[...] body_len=671
+```
 
-1. **`PostToolUse`'s `tool_response` shape for `Bash` is not fully
-   documented upstream.** Only one example was seen (`{stdout, stderr,
-   exit_code}`), unconfirmed as exhaustive. Mitigated by design:
-   `post_tool_use.py` never assumes a field name, it hands the whole value
-   to `tokenize()`. **Confirmed live (2026-09-07):** a real query against
-   `demo/veil_demo.db` (email lookup, `users` table) came back with the
-   email tokenized as `PII_EMAIL_0001` in what the model actually saw —
-   `updatedToolOutput` is honored by Claude Code in practice, not just in
-   this repo's own tests. One side observation from that same run, not a
-   bug in this mission: the customer's full name (`Rosendo Cifuentes
-   Rojas`) reached the model in plain text, because full names are only
-   caught by the probabilistic LLM layer (BRIEF SS3.1), which is a
-   day-2/not-yet-built item — `detect_regex()` was never going to catch a
-   bare name, and nothing in this mission's scope claims otherwise.
-2. **`--settings`'s merge semantics for the `hooks` key specifically are
-   untested live.** Confirmed via the official CLI reference that
-   `--settings` merges additively per top-level key ("keys you omit keep
-   their file-based values"), but not confirmed whether `hooks` is replaced
-   wholesale or deep-merged with `.claude/settings.json`'s own `hooks`
-   entries. If it's a deep merge instead of a replace, the harness's own
-   meta-development hooks would keep running during a demo session (not
-   harmful, just not what the README currently documents).
-3. **(New, from the review cycle) whether `updatedInput` is honored without
-   `permissionDecision`.** See above — this is the one most likely to
-   silently break the demo if wrong, since a no-op de-tokenization would
-   look identical to a working one unless someone checks the actual
-   executed command. **Confirmed live (2026-09-07), the auto-approval half
-   of this risk:** ran a real headless `claude -p` session (not a subagent,
-   not this repo's own test suite) against this repo with
-   `--settings demo/settings.hooks.json` and `--permission-prompts none`
-   (denies anything needing a prompt — no `--allowedTools`/bypass grant, so
-   nothing masks the result). A `Bash` command referencing
-   `demo/veil_demo.db` was denied with "this session has no approval
-   surface" — i.e. `pre_tool_use.py` emitting no `permissionDecision` did
-   **not** cause Claude Code to silently auto-approve the call. This closes
-   the security-relevant half of this risk. **Still open:** whether
-   `updatedInput`'s rewritten `command` is what actually *executes* once a
-   call *is* approved (mechanical correctness, not a leak risk) — blocked
-   on needing either an interactive human approver or `bypassPermissions`,
-   which this session's own auto-mode classifier correctly refused to let
-   me use recursively on myself (spawning a permission-bypassed nested
-   session is a real privilege-escalation pattern, not something to route
-   around). The user's own manual test (see below) already exercised
-   `PostToolUse` live; a token-reuse follow-up query in an interactive
-   session would close this last piece.
+Two requests, both `200` (Claude Code appears to make a second call —
+consistent with a background title-generation request; not investigated
+further, out of scope). Key findings:
 
-**Status as of this handoff:** risk 1 (`PostToolUse`/`updatedToolOutput`)
-confirmed live by the user, see above. Risks 2 (`--settings` merge
-semantics for `hooks`) and 3 (`updatedInput` honored without
-`permissionDecision`, i.e. whether `PreToolUse`'s de-tokenization actually
-works and still goes through the normal ask-permission prompt) are **still
-unconfirmed** — the live test so far only exercised a first query (tool
-output tokenized), not a follow-up query reusing the returned token (which
-is what would exercise `PreToolUse`). `.harness/mission.md`'s acceptance
-criterion 7 and `.harness/validation.md`'s User-Testing Validator are
-therefore partially, not fully, satisfied. This is not being chased further
-in this session at the user's request — pick it back up whenever there's
-appetite for it, using `demo/run_demo.sh` (see below) to start.
+- Auth travels as an **`Authorization`** header (bearer token from the
+  subscription's OAuth flow), not `x-api-key`. The real gateway forwards
+  whatever auth header is present unchanged, so this holds regardless.
+- Endpoint is `POST /v1/messages?beta=true` — path *and* query string
+  matter; the gateway must forward both untouched (it does: `self.path`
+  includes the query string in `http.server.BaseHTTPRequestHandler`).
+- Response headers include `Transfer-Encoding` (chunked) — confirms
+  Spike 2's premise below: yes, the real response is delivered
+  chunked/streamed, not a single buffered blob.
 
-## Files changed
+The throwaway proxy process was killed after this check
+(`taskkill //PID <pid> //F`); nothing from it was committed.
 
-- `veil_pii_middleware/adapters/hooks/pre_tool_use.py` — new: `PreToolUse`
-  hook, de-tokenizes demo-db Bash commands, fail-closed, never emits
-  `permissionDecision`.
-- `veil_pii_middleware/adapters/hooks/post_tool_use.py` — new: `PostToolUse`
-  hook, tokenizes demo-db Bash responses generically, cannot block on
-  failure (documented gap).
-- `veil_pii_middleware/adapters/hooks/_scope.py` — new: shared
-  `is_demo_db_command()` substring check, documented as a rewrite gate
-  only, never an approval gate.
-- `veil_pii_middleware/adapters/hooks/_paths.py` — new: shared
-  `VAULT_DB_PATH` constant (added during the review cycle to stop the path
-  being duplicated across the two scripts).
-- `demo/settings.hooks.json` — new: partial, non-auto-loaded settings
-  fragment wiring both hooks to the `Bash` matcher.
-- `demo/run_demo.sh` — new: added after the first live-test attempt showed
-  the activation command was more friction than estimated when the mission
-  was approved — locates the `claude` binary (the VSCode extension bundles
-  its own copy under a version-numbered path, not on `PATH`) and runs it
-  with `--settings demo/settings.hooks.json`. Must be run from a real
-  terminal (Git Bash): the VSCode extension's own panel has no setting
-  that exposes `--settings`, confirmed by reading its
-  `contributes.configuration` in `package.json` — a session already
-  running inside the panel cannot switch the demo hooks on.
-- `README.md` — new "Running the demo (hooks)" section documenting
-  `demo/run_demo.sh`, the `--settings` merge trade-off, and the
-  terminal-only limitation above.
-- `tests/test_hooks.py` — new: 23 tests, all real subprocess invocations.
-- `.harness/mission.md`, `.harness/validation.md` — written for this
-  mission (previously held mission-5's `/veil` content, now archived to
-  `docs/missions/mission-5/`).
+## Spike 2 — SSE streaming (informational, not solved)
 
-## Closure decision (2026-09-07)
+Per the mission's agreed scope cut, this mission does not attempt
+chunk-boundary-safe response rewriting at all — see Non-goals. Spike 1's own
+log (above) confirms the premise this scope cut is judged against: the real
+API's response to Claude Code is in fact chunked/streamed
+(`Transfer-Encoding` present), not a single JSON blob, so a naive
+buffer-then-scan-then-forward approach on the response leg would have had
+real chunk-boundary risk to deal with. Deferred to an optional follow-up
+mission, not attempted here.
 
-Closed by the user's explicit choice, without chasing the last narrow item
-further. State at closure:
+## Post-implementation live check (real gateway, real Claude Code, real PII)
 
-- `bash .harness/bin/verify`: green (6/6 gates).
-- Code review cycle: 2 blocking findings fixed, re-verified by direct
-  reproduction (see "Review cycle" above).
-- Residual risk 1 (`PostToolUse`/`tool_response` shape): confirmed live —
-  by the user's own manual run and by a real headless `claude -p` session.
-- Residual risk 3 (`updatedInput` without `permissionDecision` — the
-  security-relevant question, does this silently auto-approve anything):
-  confirmed **closed** live, via a real headless `claude -p` session with
-  `--permission-prompts none` and no tool allowlist — a demo-db `Bash` call
-  was denied ("no approval surface"), proving nothing is being
-  auto-approved.
-- Residual risk 3's narrower mechanical half (does the rewritten `command`
-  in `updatedInput` actually *execute*, once a call is approved by a human)
-  stays **unconfirmed** — a broken-query risk, not a leak risk, if it turns
-  out wrong. Not chased further because the user is moving to the gateway
-  mission instead; carried forward as a known gap, not a resolved one.
-- Residual risk 2 (`--settings`'s merge semantics for the `hooks` key
-  specifically): still unconfirmed, not blocking, low-stakes (worst case:
-  the harness's own meta-development hooks keep running during a demo
-  session, which is harmless, just undocumented-as-such).
+After the gateway was built and the automated test suite passed, a live
+check confirmed detection/tokenization actually fires on real conversation
+content flowing through the real code path — not just in the isolated unit
+tests against a fake upstream.
 
-**Open question raised at closure, not yet decided:** once
-`adapters/gateway/` exists, do these two hook scripts stay in the
-architecture as a low-latency, defense-in-depth layer for the `Bash` leg
-specifically (per BRIEF SS2.1's own framing: hooks mode is a legitimate,
-lower-friction interception point alongside the gateway, not merely a
-demo scaffold), or does the gateway supersede them entirely, making
-`adapters/hooks/`, `demo/settings.hooks.json`, and `demo/run_demo.sh` dead
-weight to remove later? Not decided in this session — flagged for whoever
-picks up the gateway mission to revisit once that mechanism exists and its
-own coverage is known.
+Method: started the real gateway (`python -m
+veil_pii_middleware.adapters.gateway.server 8788`) with a fresh,
+process-local `VEIL_VAULT_KEY`. Spawned a separate `claude -p` process with
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8788` and a prompt containing a real
+email address (`developer@example.com`); it replied normally
+(exit `0`).
 
-## Follow-ups (not done, for a future mission if wanted)
+Verification: inspected `.veil/vault.db` directly (read-only, local,
+never transmitted) and found two new rows under that run's session id
+(`gateway-b914bcbb-...`), both entity type `EMAIL`. Decrypting them with the
+same process-local key (still exported in that terminal at the time)
+confirmed the two plaintext values were `developer@example.com` (the
+prompt's own PII) and `noreply@anthropic.com` (present somewhere in Claude
+Code's own system prompt/metadata, not something this mission put there).
+This confirms the detector fired on real content and the vault minted real
+tokens for it — the same code path (`_tokenize_body` in `server.py`) that
+the automated tests already prove never lets a raw value reach
+`client.stream(...)`.
 
-- **Next up, per the user's explicit direction: `adapters/gateway/`**
-  (BRIEF work-plan day-2 items #9-10). This is the mechanism that actually
-  closes the "raw user prompt -> model" leg (which nothing built so far
-  does — `/veil` is closed/broken per mission-5, hooks only ever saw tool
-  calls, never the typed prompt) and the one that would work
-  friction-free from every Claude Code surface including the VSCode
-  extension panel, since it's an `ANTHROPIC_BASE_URL` environment variable
-  rather than a CLI startup flag. Two risks the BRIEF itself already flags
-  as unresolved and worth spiking first: (1) whether `ANTHROPIC_BASE_URL`
-  works with a subscription login or requires a separate console API key;
-  (2) SSE streaming means a token like `PII_EMAIL_0001` can arrive split
-  across chunks, needing a buffering strategy before substitution.
-- `Read`-tool coverage for the hooks (explicitly deferred by the user
-  during intake — BRIEF's demo only uses `Bash`, so this wasn't built).
-- The mechanical `updatedInput`-execution question above, if the hooks are
-  kept once the gateway exists.
-- Deduplicating `VAULT_DB_PATH` across all three adapters, including the
-  (now-closed) `/veil` command adapter's `sanitize.py` — this mission only
-  deduplicated it between the two hook scripts, since `adapters/command/`
-  was out of scope here.
-- `UserPromptSubmit`/`MessageDisplay` hooks (separate BRIEF rows, day-2
-  items) — not touched.
-- `core/audit.py` — still an unimplemented stub; neither hook logs to it.
+**Known limitation of this specific evidence, flagged by independent
+review:** the process-local `VEIL_VAULT_KEY` used for that run was
+generated fresh for the check and was not persisted afterward — correct
+per `MASTER_KEY_ENV_VAR`'s own doctrine (never from the repository, treated
+as ephemeral), but it also means those two specific ciphertext rows cannot
+be re-decrypted later by anyone, including a reviewer, to re-confirm this
+exact claim after the fact. The *mechanism* is not resting on that one
+irreproducible artifact, though: `tests/test_gateway.py`'s
+`TestRequestTokenization`/`TestFailsClosed` cases prove the same code path
+structurally, with no secret involved, and can be re-run by anyone at any
+time (`pytest tests/test_gateway.py -v`). A human wanting to re-confirm the
+live-content claim specifically would need to re-run this exact live check
+themselves (5 minutes: start the gateway, spawn `claude -p` with
+`ANTHROPIC_BASE_URL` set, inspect `.veil/vault.db` with the key still in
+scope) rather than trust this write-up alone — noted here explicitly so
+that gap is visible, not silently assumed away.
+
+## Independent review findings and what was done about each
+
+An independent `goal-verifier` and a security-focused `code-reviewer` were
+run against this diff (fresh context, read-only, no edits by either).
+
+**Fixed:**
+
+- **Blocking (code-reviewer):** a mid-stream upstream failure (e.g. the
+  real API dropping the connection after the gateway had already relayed a
+  status line and some response chunks to its client) triggered a *second*
+  `send_response(502, ...)` on the same connection, splicing a fresh status
+  line into an already-in-flight chunked body and corrupting the framing.
+  Fixed in `server.py`'s `_handle`: a `response_started` flag now gates
+  whether a failure may still call `_write_error` (only before any bytes of
+  the response have gone out); past that point the handler just stops and
+  lets the connection close. Covered by two new regression tests in
+  `tests/test_gateway.py::TestMidStreamUpstreamFailure`, one asserting the
+  literal raw wire bytes never contain a second `HTTP/1.1` status line, one
+  asserting the gateway keeps serving subsequent requests afterward.
+- **Should-fix (code-reviewer):** `core/vault.py::Vault._next_seq` is a
+  read-then-insert with no transaction spanning both statements; under
+  `ThreadingHTTPServer`'s real one-thread-per-request concurrency (the
+  first adapter in this codebase to actually exercise concurrent access to
+  one session), two simultaneous requests minting a token for the same
+  entity type could race and collide. This already failed closed (caught
+  by the generic exception handler, 500, no data leak) but was an
+  availability bug, not just a theoretical one. Fixed **without touching
+  `core/vault.py`** (out of this mission's scope): added a
+  process-local `threading.Lock` in `server.py` serializing
+  `_tokenize_body`'s vault access, eliminating the race at the one place
+  it can actually occur (this gateway process) instead of changing shared
+  core code.
+- **goal-verifier:** this `handoff.md` did not exist for this mission
+  before this review pass — the mission's own acceptance criteria (AC6)
+  and merge policy require it. Written now, with the actual spike evidence
+  above rather than a restated claim.
+
+**Deferred (documented, not fixed, with reasoning):**
+
+- **Should-fix (code-reviewer):** exceptions outside the two explicit
+  `try`/`except` blocks in the original code (e.g. a malformed
+  non-numeric `Content-Length`, or a `BrokenPipeError` from a client
+  disconnecting mid-write) could fall through to `socketserver`'s default
+  `handle_error`, dumping a traceback to stderr via an unaudited path. The
+  blocking-bug fix's restructure incidentally widened the outer exception
+  handling to cover this (the whole request-handling body up to and
+  including the response-relay loop is now inside one `try`/`except
+  Exception`), but `_write_error` itself is not separately guarded against
+  raising on an already-broken socket. No exception message in this file
+  ever interpolates header/body content today, so no concrete leak was
+  found — tracked as a residual risk, not a re-opened blocker.
+- **Should-fix (code-reviewer):** the gateway's own listening socket has no
+  authentication — any local process reaching `127.0.0.1:<port>` can mint
+  tokens into the one shared per-process vault, and since
+  `tokenize()`/`TokenFormatOverflowError` correctly refuses a 5th-digit
+  token, ~10,000 distinct values of one entity type in a session
+  permanently fails every later request containing that entity type (fails
+  closed, but a real availability cliff with no documented mitigation).
+  Accepted as a known limitation for this mission's target user (a single
+  developer running one local gateway process for their own Claude Code
+  session) — not fixed here.
+- **Nit (code-reviewer):** `_HOP_BY_HOP` omits `TE`/`Trailer`/
+  `Proxy-Authenticate`/`Proxy-Authorization`. Claude Code never sends these
+  to this proxy in practice; left as-is, noted for a future reviewer.
+- **goal-verifier:** flagged that `TestResponseIsRelayedUntouched` only
+  exercises a `Content-Length`-framed fake-upstream response, not one the
+  fake upstream itself sends as real chunked/streamed framing (only the
+  gateway's own re-chunking *to the client* is exercised, via the
+  large-body test). The code path (`httpx`'s `.stream()`/`iter_bytes()`) is
+  framing-agnostic on the upstream side, so risk is judged low, but this is
+  a real gap against the validation table's literal wording and is not
+  closed here.
+
+## Non-goals kept out of scope (unchanged from the mission)
+
+- No response-side tokenize/detokenize call exists anywhere — confirmed by
+  the independent reviewer via `grep` on `server.py`: every `tokenize`/
+  `Vault(` reference lives in the request path (`_tokenize_body` and its
+  one call site); the response-relay block contains none. A token the
+  model echoes back (e.g. `PII_EMAIL_0001`) appears literally on screen.
+- `adapters/hooks/` vs. gateway coverage overlap/redundancy: still an open
+  question, not decided here.
+- Multi-process/multi-window vault correlation in gateway mode: still one
+  session per running process, documented in `server.py`'s module
+  docstring.
+
+## Human verification still needed before merge
+
+1. Read this handoff and the diff (`git diff` — touches only
+   `veil_pii_middleware/adapters/gateway/`, `pyproject.toml`,
+   `tests/test_gateway.py`, `.harness/*`).
+2. `.harness/bin/verify` — currently green (contract, lint, typecheck, test,
+   eval, build — 6/6). Re-run it yourself.
+3. If you want to independently re-confirm the live-content claim above
+   (recommended, since that specific evidence is not re-decryptable after
+   the fact): `VEIL_VAULT_KEY=$(python3 -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())") .venv/Scripts/python -m veil_pii_middleware.adapters.gateway.server 8788` in one terminal, then in another
+   `ANTHROPIC_BASE_URL=http://127.0.0.1:8788 claude -p "test email
+   someone@example.com, just reply OK"`, then inspect `.veil/vault.db` with
+   the same key while it's still in scope.
+4. No commit/push/merge has been made by this session, per policy.

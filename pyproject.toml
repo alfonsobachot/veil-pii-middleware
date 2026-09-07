@@ -15,6 +15,12 @@ dependencies = [
   # 50.x is the latest major as of writing, chosen over an older line since
   # this dependency is being added fresh with no prior-version constraint.
   "cryptography~=50.0",
+  # Forwarding client for the gateway adapter (adapters/gateway/): mature
+  # streaming support for relaying the model's response back untouched,
+  # chosen over stdlib http.client's manual chunk handling. Pinned to one
+  # minor line (0.28.x) for the same reason as cryptography: reviewed, not
+  # casually bumped -- this is on the request path to the real Anthropic API.
+  "httpx~=0.28.0",
 ]
 
 [project.optional-dependencies]

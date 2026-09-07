@@ -16,6 +16,17 @@ Exit codes:
 - `1` = fail
 - `2` = unconfigured
 
+## Live Spikes (before any adapter code is written)
+
+These are not automatable checks — they exercise the user's real Claude Code
+account and a real external endpoint. Run and record evidence before Stage 6
+implementation begins; a failure on spike 1 stops the mission (go/no-go).
+
+| Spike | Method | Required result to proceed |
+|---|---|---|
+| 1. Auth | Start a throwaway local pass-through proxy (plain TCP/HTTP relay to `https://api.anthropic.com`, no rewriting). Spawn a **separate** process — `ANTHROPIC_BASE_URL=http://127.0.0.1:<port> claude -p "<short probe prompt>"` — and capture its stdout/exit code and the proxy's own log of what it saw. | The spawned process returns a real model response using the existing subscription login — no `ANTHROPIC_API_KEY` set, no auth-failure output. Record the exact evidence (proxy log line(s) showing the request/response passed through, and the spawned process's output) in `handoff.md`. If it fails, record exactly what error Claude Code surfaces and stop — do not build the gateway on a broken precondition. |
+| 2. SSE (scoped out, not solved) | N/A — this mission does not attempt response rewriting. Confirm instead, from spike 1's own proxy log, whether the response Claude Code receives was in fact SSE (`text/event-stream`, chunked) or a single JSON blob, so `handoff.md` accurately states what the "relay untouched" non-goal is relaying. | Observation recorded either way; no pass/fail — informational only, feeds the future streaming-buffer mission. |
+
 ## Executable Checks
 
 | Check | Command | Required Result |
@@ -24,84 +35,60 @@ Exit codes:
 | Lint | `.venv/Scripts/ruff check . && .venv/Scripts/ruff format --check .` | exit `0` |
 | Typecheck | `.venv/Scripts/mypy` | exit `0`, strict, no new `type: ignore`, no implicit `Any` |
 | Unit tests | `.venv/Scripts/pytest` | exit `0` |
-| Build | `.venv/Scripts/python -m build --no-isolation` | exit `0` (no new dependency introduced) |
+| Build | `.venv/Scripts/python -m build --no-isolation` | exit `0` with `httpx` present in `pyproject.toml` dependencies |
 | Detector recall/decoys (unchanged) | `python -m veil_pii_middleware.demo.eval --min-recall 1.0 --max-false-positives 0` | exit `0`, unmodified — this mission does not touch `detector.py` |
-| `PreToolUse` de-tokenizes a known token | pytest: subprocess run of `pre_tool_use.py`, stdin = JSON with `tool_name="Bash"`, `tool_input.command` referencing `veil_demo.db` and containing a real minted token, `session_id` matching a vault pre-seeded with that token → stdout JSON's `hookSpecificOutput.updatedInput.command` contains the real value, not the token; exit `0` | exit `0` |
-| `PreToolUse` blocks on an unresolvable token | pytest: same shape, token unknown to the vault (or `VEIL_VAULT_KEY` unset) → exit `2`, empty stdout | exit `0` |
-| `PreToolUse` passes through non-demo-db / non-Bash calls | pytest: (a) `tool_name="Bash"` with a command not referencing `veil_demo.db`, (b) `tool_name` something else entirely → both: exit `0`, empty stdout, no vault ever opened (assert no `.veil/vault.db` file is created in a fresh `tmp_path` cwd) | exit `0` |
-| `PostToolUse` tokenizes a demo-db response, generic shape | pytest: subprocess run of `post_tool_use.py`, stdin = JSON with `tool_name="Bash"`, a demo-db `tool_input.command`, and `tool_response` as a **nested** JSON value (dict containing a list containing PII strings, not a flat `{stdout: ...}`) → stdout JSON's `hookSpecificOutput.updatedToolOutput` has every PII string replaced by a token at the same nested position, non-string/structure untouched; exit `0` | exit `0` |
-| `PostToolUse` passes through non-demo-db / non-Bash calls | pytest: same shape as the `PreToolUse` passthrough check, applied to `post_tool_use.py` | exit `0` |
-| `PostToolUse` fails closed on vault error without fabricating output | pytest: `VEIL_VAULT_KEY` unset on a demo-db call → non-zero exit, stdout contains no `updatedToolOutput` key (either empty stdout or non-JSON stderr-only failure) | exit `0` |
-| Neither script imports shell-execution primitives | pytest or static check: `pre_tool_use.py`/`post_tool_use.py` source contains no `subprocess`, `os.system`, `os.popen`, or `shell=True` | exit `0` |
-| `is_demo_db_command` is shared, not duplicated | grep/assert: both scripts import `is_demo_db_command` from `adapters/hooks/_scope`, no independent re-implementation of the check | exit `0` |
-| `demo/settings.hooks.json` is not wired into committed settings | test: `.claude/settings.json` and `.claude/settings.local.json.example` do not reference `demo/settings.hooks.json` or contain a `Bash`-matched `PreToolUse`/`PostToolUse` entry pointing at `pre_tool_use.py`/`post_tool_use.py` | exit `0` |
-| `.gitignore` covers the vault | grep/assert: `.gitignore` still contains a `.veil/` (or equivalent) entry | exit `0` |
-| Non-object top-level payload fails closed (added after code review) | pytest, parametrized over `[1,2,3]`/`null`/a bare string/`true` as the whole stdin payload: `pre_tool_use.py` exits `2` with empty stdout; `post_tool_use.py` exits non-zero with empty stdout; neither produces an unhandled traceback | exit `0` |
-| `pre_tool_use.py` never emits `permissionDecision` (added after code review) | pytest: on the known-token success path, assert `"permissionDecision" not in out["hookSpecificOutput"]`; grep: `permissionDecision` appears in `pre_tool_use.py` only inside its docstring, never in the `output` dict literal or any executable branch | exit `0` |
+| Gateway tokenizes a PII value before it leaves the process | pytest: build a fake upstream (local `http.server` or `httpx` mock/`respx`-style handler standing in for `api.anthropic.com`) that records the raw bytes of every request it receives; send a request through the real gateway with a manifest email in the body; assert (a) the fake upstream's recorded body contains a `PII_EMAIL_NNNN` token and not the raw email, (b) it also does not contain the master key or any other plaintext secret | exit `0` |
+| Response is relayed byte-for-byte unmodified | pytest: fake upstream returns a fixed body (including one that looks like a `PII_`-shaped token to make sure the gateway isn't scanning/rewriting responses at all); assert the client receives those exact bytes, untouched, for both a `Content-Length` response and a chunked/streamed one | exit `0` |
+| Fail-closed: detector/vault/tokenizer failure blocks forwarding | pytest: force a `tokenize()`/`Vault` failure (e.g. `VEIL_VAULT_KEY` unset, or a monkeypatched raise) on a request containing PII; assert the fake upstream receives **no** request at all (not a request with unmodified raw PII, not a request with a partial rewrite) and the client gets an error response | exit `0` |
+| Fail-closed: malformed/non-JSON request body | pytest: send a request whose body isn't valid JSON (or isn't the expected Anthropic Messages shape); assert the gateway does not forward it as opaque raw bytes with a shrug — either it fails closed (no forward) or it forwards byte-identical non-JSON content only if that's an explicit, documented decision (see Scrutiny Validator) | exit `0` |
+| Headers forwarded, never logged | pytest/static: assert `x-api-key`/`authorization` header values are present unchanged in what reaches the fake upstream, and grep the gateway source for any logging/print statement that could include a header value | exit `0` |
+| One `Vault` session per gateway process | pytest: two sequential requests through the same running gateway instance containing the same email produce the same token; a second, independently-started gateway instance (fresh process/session id) does not necessarily reuse it — assert same-process stability, not cross-process | exit `0` |
+| `adapters/hooks/` and `adapters/command/` untouched | grep/diff: no changes outside `adapters/gateway/`, `pyproject.toml`, `tests/`, harness mission files, `README.md` | exit `0` |
 
 ## Scrutiny Validator
 
-- Confirm the diff touches only `veil_pii_middleware/adapters/hooks/`,
-  `demo/settings.hooks.json`, `README.md`, `tests/test_hooks.py`, and the
-  harness mission files — `detector.py`, `vault.py`, `tokenizer.py`,
-  `audit.py`, `adapters/command/`, `adapters/gateway/`, and `frontend/` stay
-  untouched.
-- Confirm both hook scripts read their JSON payload from `sys.stdin` only —
-  no argv parsing of tool input/output content.
-- Confirm `PreToolUse`'s fail-closed path never writes a JSON
-  `permissionDecision` alongside exit `2` that could be misread as a mixed
-  signal — exit `2` alone, stderr only.
-- Confirm `PreToolUse` never emits `permissionDecision` on the *success*
-  path either (see "Review findings and fixes" in `mission.md`): pairing
-  `permissionDecision: "allow"` with `is_demo_db_command()`'s bare substring
-  check would auto-approve an entire chained/injected command, not just
-  rewrite it. Only `updatedInput` may appear in `pre_tool_use.py`'s output.
-- Confirm both scripts validate the top-level JSON payload is an object
-  (`isinstance(payload, dict)`) inside the same `try` block that catches
-  `json.loads` failures — a non-object payload (list/`null`/scalar) must
-  not raise an uncaught exception past the fail-closed handler.
-- Confirm `PostToolUse`'s failure path never emits a stdout JSON claiming
-  `updatedToolOutput` succeeded when it didn't — no partial/fabricated
-  output on the error path.
-- Confirm no plaintext PII value or the master key ever appears in a stderr
-  message, exception string, or log, on either script's failure path.
-- Confirm `updatedInput` in the success path is a full copy of the original
-  `tool_input` with only `command` replaced — not a partial object that
-  drops `description`/`timeout`/`run_in_background`.
-- Confirm `is_demo_db_command()`'s check is a simple, documented substring
-  check (`veil_demo.db`) with no attempt at a broader/smarter classifier —
-  matches the project's own "don't over-engineer a demo-scoped check"
-  framing.
-- Confirm `demo/settings.hooks.json` is valid JSON containing only a
-  `hooks` key (no accidental full settings object that would clobber
-  unrelated keys if merged via `--settings`).
-- Confirm the README addition documents the `--settings` invocation and its
-  "replaces, not merges, this session's `hooks` key" trade-off plainly.
-- Confirm the mission's three explicitly-flagged residual risks
-  (`PostToolUse`'s undocumented `Bash` `tool_response` shape; `--settings`'s
-  untested-live merge semantics for the `hooks` key; whether Claude Code
-  actually applies `updatedInput` when `permissionDecision` is left unset)
-  are written up in `handoff.md`, not glossed over or implicitly claimed as
-  resolved.
+- Confirm the diff touches only `veil_pii_middleware/adapters/gateway/`,
+  `pyproject.toml`, `tests/`, `README.md`, and the harness mission files —
+  `detector.py`, `vault.py`, `tokenizer.py`, `audit.py`, `adapters/hooks/`,
+  `adapters/command/`, and `frontend/` stay untouched.
+- Confirm the gateway never re-implements detection/substitution logic
+  inline — every tokenization call goes through
+  `core/tokenizer.py::tokenize()` against a real `core/vault.py::Vault`.
+- Confirm the response path contains no tokenization/detokenization call at
+  all — this mission's whole scope reduction depends on the response leg
+  being a pure relay, not a partial or best-effort rewrite that could split
+  a token across a chunk boundary and corrupt it.
+- Confirm auth headers (`x-api-key`, `authorization`, cookies if any) are
+  forwarded unmodified and never appear in a log/print/exception message.
+- Confirm the fail-closed paths (vault error, detector error, malformed
+  body) never forward a request upstream with raw PII still in it — a
+  network error contacting the real API on the *client's* side is
+  acceptable; a request reaching `api.anthropic.com` with unrewritten PII is
+  not, under any failure mode.
+- Confirm the one-session-per-process design (fixed `session_id` generated
+  at gateway startup) is documented as a scope limitation in code comments
+  and in `handoff.md`, not silently assumed.
+- Confirm the throwaway auth-spike proxy script (if kept) is clearly
+  separated from and not imported by the real gateway adapter — it existed
+  to answer a question, not to become part of the shipped code path.
+- Confirm no secret (master key, `x-api-key` value, any token from the live
+  spike) was written into `.harness/handoff.md`, `.harness/memory/`, or any
+  committed file.
+- Confirm `httpx` is pinned to one major line in `pyproject.toml`, matching
+  how `cryptography` was pinned, with a comment explaining why.
 
 ## User-Testing Validator
 
-- Run `tests/test_hooks.py` directly and read the output — not just the
-  exit code — confirming each test's stdin JSON is Python-constructed and
-  piped as data, never spliced into a shell command string.
-- **Manually run the actual demo in a real Claude Code session** with
-  `claude --settings demo/settings.hooks.json` active: issue a prompt that
-  causes the model to run a `sqlite3` query against `demo/veil_demo.db`
-  containing real PII, confirm by eye that (a) `PostToolUse` produces a
-  tokenized result the model actually reasons over (check the transcript,
-  not just the hook's own stdout), and (b) a follow-up query built around
-  one of those tokens gets de-tokenized by `PreToolUse` and returns the
-  correct real row **even though `pre_tool_use.py` emits no
-  `permissionDecision`** — confirm Claude Code still applies `updatedInput`
-  and still shows the normal ask-permission prompt for the rewritten
-  command (this is the residual risk the code-review fix introduced: the
-  official docs never show `updatedInput` without an accompanying
-  `permissionDecision`). This is the check nothing in this repo's test
-  suite or any subagent can perform — record the result (or its absence, if
-  not run) in `handoff.md`, per this mission's own charge not to assume
-  hooks behave as documented just because `/veil` did not.
+- **Live auth spike (must be run and recorded, not skipped):** see the Live
+  Spikes table above. `handoff.md` must state plainly, in one place, whether
+  `ANTHROPIC_BASE_URL` worked with the subscription login with no API key —
+  this is the single fact a human needs to decide whether the gateway
+  approach is viable at all.
+- Manually point a real, interactive `claude` session at the finished
+  gateway (`ANTHROPIC_BASE_URL` set for that one invocation only, never the
+  user's persistent shell profile) and send a prompt containing a real
+  manifest PII value; confirm by eye by inspecting the gateway's own log
+  and, if feasible, a packet/proxy capture between the gateway and the real
+  API, that no raw PII value crosses that second hop. Record whether this
+  step was actually performed or not — do not claim it happened if it did
+  not.
