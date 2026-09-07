@@ -101,8 +101,13 @@ false negative except number 5, which is the interesting exception.
 6. **Phone grouping was hard-coded to 3-3-3**, so `91 234 56 78` — simply how
    a Madrid landline is printed — was invisible. Now any grouping of nine
    digits is accepted and `valid_spanish_phone` decides.
-7. **Dotted national IDs were missed.** `12.345.678-Z` is an everyday way to
-   write a DNI; the validator accepted it, but the pattern never proposed it.
+7. **Dotted national IDs were briefly supported, then removed.** Added on the
+   same reasoning as 5 — a check digit filters what a loose pattern
+   over-claims — and reverted on the owner's call: the dotted form is rare,
+   the cost is not zero (3.6% false positives on a dotted eight-digit number
+   followed by an isolated letter, though none on realistic billing text), and
+   the guaranteed floor is partial by construction anyway, since names already
+   depend on the LLM layer. No pattern now accepts the dot.
 
 The country prefix was also hard-coded to `+34`/`0034`; international numbers
 are now recognised generically, so `+44 20 7946 0958` is detected.
@@ -198,10 +203,9 @@ Judgement calls worth a human eye, in priority order:
    precision on 12-digit reference codes. Deliberate, and reversible in one line.
 2. **Zero-padded octets accepted** as IPv4, which RFC 3986 treats as ambiguous
    with octal.
-3. **The separator policy**: dots accepted for DNI and NIE, refused for phone
-   and card. The rule is "a pattern may be loose only where a check digit
-   filters it", which is worth agreeing with explicitly, since it is the reason
-   `912.345.678` is a figure and `12.345.678-Z` is a national ID.
+3. **The separator policy**: no pattern accepts the dot, because in Spanish it
+   is the thousands separator. Spaces and hyphens only. A dotted national ID
+   is therefore a deliberate gap, left to the LLM layer alongside names.
 4. **The two `.claude/hooks/*.sh` edits** — security controls, changed outside
    the original scope with approval. Worth reading the diff directly.
 

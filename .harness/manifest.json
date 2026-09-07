@@ -89,7 +89,7 @@
     ".harness/docs/operating-model.md": "471a7593bb38e908f2d09756ca169818e7b5ebddef77dd25c670da0bca487fcb",
     ".harness/docs/upgrade.md": "dea6388120cf841aaa374b9ccf58aefde8771263924bff391e7aad88c787e2a3",
     ".harness/docs/worktrees.md": "e841a53857095a41ae11d52168a5b3a1eb4109814d97d4dc211ce06237a48e78",
-    ".harness/handoff.md": "151f4c6ff79f62a7b086c433381647e05f029e1aad06357791d263fb8ac1c132",
+    ".harness/handoff.md": "d4834492ad7fbfe43676bee98b5901d0f293cd67ebd29ea55f90ad99654f5948",
     ".harness/internal/check-mission-contract": "1deaf28d3cb8a88e338d6f128488d28132b7b1e4cf5fc342aaa9e7c24aac8b0d",
     ".harness/internal/check-skill.py": "0913b676cfbc24cf69f8a2ffe6b1145b6afbf163fe64d5c16e63b68e5875c4d0",
     ".harness/internal/check-task-contract.py": "b82c50df3592b4d421a73c5f37d107d9e1b93910f1fce43084f5030a7fec906f",

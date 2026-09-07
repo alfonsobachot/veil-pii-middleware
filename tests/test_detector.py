@@ -244,17 +244,38 @@ def test_dot_separated_card_is_not_claimed() -> None:
 @pytest.mark.parametrize(
     ("text", "expected", "entity"),
     [
-        ("DNI 12.345.678-Z", "12.345.678-Z", EntityType.DNI),
         ("DNI 12345678-Z", "12345678-Z", EntityType.DNI),
+        ("DNI 12345678 Z", "12345678 Z", EntityType.DNI),
         ("DNI 12345678Z", "12345678Z", EntityType.DNI),
-        ("NIE X1.234.567-L", "X1.234.567-L", EntityType.NIE),
         ("NIE X1234567L", "X1234567L", EntityType.NIE),
+        ("NIE X-1234567-L", "X-1234567-L", EntityType.NIE),
     ],
 )
-def test_national_id_is_found_dotted_or_not(text: str, expected: str, entity: EntityType) -> None:
-    """Dots are safe here precisely because the control letter filters them."""
+def test_national_id_is_found_with_spaces_or_hyphens(
+    text: str, expected: str, entity: EntityType
+) -> None:
     spans = [s for s in detect_regex(text) if s.entity_type is entity]
     assert [s.text for s in spans] == [expected]
+
+
+@pytest.mark.parametrize("text", ["DNI 12.345.678-Z", "NIE X1.234.567-L"])
+def test_dotted_national_id_is_left_to_the_llm_layer(text: str) -> None:
+    """A deliberate gap, not an oversight.
+
+    No pattern accepts the dot, because in Spanish it is the thousands
+    separator. The dotted form is rare enough that the looser pattern is not
+    worth it, so it falls to the probabilistic layer — the same place a
+    person's name already lives. The floor this module guarantees is partial
+    by construction.
+    """
+    rejected = {EntityType.DNI, EntityType.NIE}
+    assert [s for s in detect_regex(text) if s.entity_type in rejected] == []
+
+
+def test_validators_agree_with_the_patterns_about_dots() -> None:
+    """A direct caller must not disagree with what the detector will accept."""
+    assert valid_dni("12345678-Z") is True
+    assert valid_dni("12.345.678-Z") is False
 
 
 def test_dotted_address_is_not_claimed_as_a_card() -> None:

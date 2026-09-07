@@ -164,12 +164,11 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         name = faker.company()
         national_id = faker.nie() if customer_id % 5 == 0 else faker.nif()
         entity = EntityType.NIE if customer_id % 5 == 0 else EntityType.DNI
-        # Some records carry the dotted form, `12.345.678-Z`, which is an
-        # everyday way to write it and which the layer used to miss entirely.
+        # Some records carry the hyphenated form. The dotted `12.345.678-Z` is
+        # deliberately absent: no pattern claims it, so seeding it would only
+        # manufacture a miss.
         if entity is EntityType.DNI and customer_id % 3 == 1 and len(national_id) == 9:
-            national_id = (
-                f"{national_id[:2]}.{national_id[2:5]}.{national_id[5:8]}-{national_id[8]}"
-            )
+            national_id = f"{national_id[:8]}-{national_id[8]}"
         cursor.execute(
             "INSERT INTO customers VALUES (?, ?, ?, ?)",
             (customer_id, name, national_id, faker.city()),

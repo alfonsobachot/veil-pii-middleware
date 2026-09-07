@@ -14,18 +14,17 @@ run is an order number as often as a phone, and a sixteen-digit run is a
 reference code as often as a card. Validating the control digit is what keeps
 precision usable without lowering recall.
 
-Separator policy, decided from Spanish notation rather than from convenience.
-The dot is the thousands separator in Spanish, so any pattern that accepts it
-as a digit separator lays claim to every nine-digit figure it meets. Patterns
-that carry a check digit can afford that, because the control character
-discards what the pattern over-claims: ``12.345.678-Z`` is a DNI, and the
-letter proves it. Phone cannot -- it has no check digit, so nothing would
-stand between ``912.345.678 euros`` and a token. Card is excluded too: Luhn
-only discards nine candidates in ten, and cards are not written with dots in
-practice, so allowing them would buy no recall.
+Separator policy: no pattern accepts the dot as a digit separator. In Spanish
+the dot is the thousands separator, so a pattern that takes it lays claim to
+every figure it meets -- ``912.345.678 euros`` was being read as a phone, and
+a phone carries no check digit to catch it. National IDs and cards are not
+written with dots often enough to be worth a looser pattern either, so a
+dotted DNI is left to the LLM layer, which is already where a person's name
+lives. The floor this module guarantees is partial by construction; that is
+the trade, not an oversight.
 
-That also settles four-group dotted numbers such as ``91.234.56.78``: with
-the dot gone from the phone pattern, they are addresses, unambiguously.
+That also settles four-group dotted numbers such as ``91.234.56.78``: they
+are addresses, unambiguously.
 """
 
 from __future__ import annotations
@@ -115,15 +114,14 @@ class Span:
 
 _DNI_LETTERS: Final = "TRWAGMYFPDXBNJZSQVHLCKE"
 _NIE_PREFIX: Final = {"X": "0", "Y": "1", "Z": "2"}
-# Validators strip dots as well as spaces and hyphens, because a value that
-# reaches them may legitimately carry any of the three -- `12.345.678-Z`. Which
-# entities are allowed to *propose* a dotted candidate is decided by the
-# patterns further down, not here; see the separator policy in the docstring.
-_SEPARATORS: Final = re.compile(r"[\s\-.]")
+# Spaces and hyphens only. The dot is deliberately absent so a direct caller
+# cannot disagree with the detector: no pattern proposes a dotted candidate,
+# so no validator should accept one. See the separator policy in the docstring.
+_SEPARATORS: Final = re.compile(r"[\s\-]")
 
 
 def _compact(value: str) -> str:
-    """Drop the spaces, hyphens and dots humans sprinkle through a value."""
+    """Drop the spaces and hyphens humans sprinkle through a value."""
     return _SEPARATORS.sub("", value)
 
 
@@ -238,15 +236,8 @@ _EMAIL = re.compile(
     r"(?<![A-Za-z0-9._%+\-])(?P<value>[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*"
     r"\.[A-Za-z]{2,})"
 )
-# Dots are allowed here: `12.345.678-Z` is an everyday way to write a DNI, and
-# the control letter is what keeps the looser pattern honest.
-_DNI = re.compile(
-    r"(?<![0-9A-Za-z])(?P<value>[0-9](?:[ \-.]?[0-9]){7}[ \-.]?[A-Za-z])(?![0-9A-Za-z])"
-)
-_NIE = re.compile(
-    r"(?<![0-9A-Za-z])(?P<value>[XYZxyz][ \-.]?[0-9](?:[ \-.]?[0-9]){6}[ \-.]?[A-Za-z])"
-    r"(?![0-9A-Za-z])"
-)
+_DNI = re.compile(r"(?<![0-9A-Za-z])(?P<value>[0-9]{8}[ \-]?[A-Za-z])(?![0-9A-Za-z])")
+_NIE = re.compile(r"(?<![0-9A-Za-z])(?P<value>[XYZxyz][ \-]?[0-9]{7}[ \-]?[A-Za-z])(?![0-9A-Za-z])")
 _IBAN = re.compile(
     r"(?<![0-9A-Za-z])(?P<value>[A-Za-z]{2}[0-9]{2}(?:[ \-]?[0-9A-Za-z]{4}){3,7})(?![0-9A-Za-z])"
 )
