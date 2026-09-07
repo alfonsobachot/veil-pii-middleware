@@ -33,16 +33,31 @@ cd "$ROOT"
 # <PLACEHOLDER> to skip it. Add or remove lines freely.
 # ============================================================================
 # Tools live in the project virtualenv, not on PATH. Resolve the bin directory
-# once so the same gate rows work on Windows (Scripts) and POSIX (bin).
+# and the executable suffix once, so the same gate rows work on Windows
+# (Scripts/*.exe) and POSIX (bin/*). Git Bash appends `.exe` for you and a
+# POSIX bash does not, so naming it explicitly is what stops the gate from
+# depending on which shell happens to run it.
 VENV_BIN=".venv/Scripts"
-[ -d "$VENV_BIN" ] || VENV_BIN=".venv/bin"
+EXE=".exe"
+if [ ! -d "$VENV_BIN" ]; then
+  VENV_BIN=".venv/bin"
+  EXE=""
+fi
+if [ ! -x "$VENV_BIN/python$EXE" ]; then
+  echo "No virtualenv at $VENV_BIN — run the Install command in CLAUDE.md first." >&2
+  exit 2
+fi
 
 GATES=(
-  "contract|.harness/internal/check-mission-contract"
-  "lint|$VENV_BIN/ruff check . && $VENV_BIN/ruff format --check ."
-  "typecheck|$VENV_BIN/mypy"
-  "test|$VENV_BIN/pytest"
-  "build|$VENV_BIN/python -m build --no-isolation"
+  "contract|bash .harness/internal/check-mission-contract"
+  "lint|$VENV_BIN/ruff$EXE check . && $VENV_BIN/ruff$EXE format --check ."
+  "typecheck|$VENV_BIN/mypy$EXE"
+  "test|$VENV_BIN/pytest$EXE"
+  # Regenerates the corpus before scoring it: the database is git-ignored, so
+  # the gate cannot assume one is lying around. The threshold lives here on
+  # purpose — lowering it is a visible change to the gate, not a quiet default.
+  "eval|$VENV_BIN/python$EXE -m veil_pii_middleware.demo.seed >/dev/null && $VENV_BIN/python$EXE -m veil_pii_middleware.demo.eval --min-recall 1.0"
+  "build|$VENV_BIN/python$EXE -m build --no-isolation"
 )
 
 # The `contract` row checks the mission's routing paperwork

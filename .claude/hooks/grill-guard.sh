@@ -53,6 +53,11 @@ MISSION="$ROOT/.harness/mission.md"
 
 case "$file" in
   .harness/*|*/.harness/*) exit 0 ;;
+  # Windows: the host normalizes file_path to backslashes, so the
+  # forward-slash patterns above never match there. Without this line the
+  # exemption is dead on that platform and the guard deadlocks — the agent
+  # cannot fill the grill it is being blocked for not having filled.
+  '.harness\'*|*'\.harness\'*) exit 0 ;;
 esac
 
 sid="$(extract '.session_id' 'import sys,json;print(json.load(sys.stdin).get("session_id","") or "")' || true)"

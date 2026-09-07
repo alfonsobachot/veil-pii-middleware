@@ -50,7 +50,12 @@ tests/        pytest suite
 | Typecheck | `.venv/Scripts/mypy` (strict; `files` and settings live in `pyproject.toml`) |
 | Test | `.venv/Scripts/pytest` |
 | Build | `.venv/Scripts/python -m build --no-isolation` (writes `dist/`, git-ignored) |
-| Harness verification | `.harness/bin/verify` |
+| Harness verification | `.harness/bin/verify` (run it from Git Bash — see below) |
+
+The harness scripts carry CRLF line endings from the installer, so a POSIX
+bash (WSL) cannot parse them. Run `.harness/bin/verify` and the hooks from Git
+Bash. The gate names its executables with an explicit `.exe` so it no longer
+depends on the shell resolving that for you.
 
 ## Harness Contract
 

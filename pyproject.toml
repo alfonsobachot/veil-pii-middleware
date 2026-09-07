@@ -19,6 +19,10 @@ dev = [
   # with --no-isolation, keeping it fast and offline.
   "build>=1.2",
   "hatchling>=1.25",
+  # Corpus generation only, never on the data path. Pinned to one minor line:
+  # the manifest is reproducible per Faker version as well as per seed, so a
+  # wider range lets the ground truth drift and turns the recall gate flaky.
+  "faker~=40.38",
 ]
 
 [tool.hatch.build.targets.wheel]

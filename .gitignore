@@ -25,6 +25,10 @@ vault/
 *.vault
 *.vault.db
 
+# Generated demo corpus: regenerated deterministically by demo/seed.py, and
+# full of synthetic identifiers that have no business in the history
+demo/manifest.json
+
 # Databases, including the generated demo database
 *.db
 *.db-journal

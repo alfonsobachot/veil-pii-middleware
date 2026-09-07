@@ -53,6 +53,11 @@ MISSION="$ROOT/.harness/mission.md"
 # The agent must be able to write its own paperwork.
 case "$file" in
   .harness/*|*/.harness/*) exit 0 ;;
+  # Windows: the host normalizes file_path to backslashes, so the
+  # forward-slash patterns above never match there. The guarded set below
+  # is basename/suffix-based, so this only restores the intended exemption
+  # for harness paperwork; implementation files stay guarded.
+  '.harness\'*|*'\.harness\'*) exit 0 ;;
 esac
 
 # Guarded implementation surface (override with MISSION_GUARD_PATHS).
