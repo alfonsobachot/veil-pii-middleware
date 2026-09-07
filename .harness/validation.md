@@ -22,51 +22,55 @@ Exit codes:
 |---|---|---|
 | Harness gate | `.harness/bin/verify` | exit `0` |
 | Lint | `.venv/Scripts/ruff check . && .venv/Scripts/ruff format --check .` | exit `0` |
-| Typecheck | `.venv/Scripts/mypy` | exit `0`, strict, no new `type: ignore`, no implicit `Any` on rows/bytes/ciphertext |
+| Typecheck | `.venv/Scripts/mypy` | exit `0`, strict, no new `type: ignore`, no implicit `Any` on spans, offsets, or structure values |
 | Unit tests | `.venv/Scripts/pytest` | exit `0` |
-| Build | `.venv/Scripts/python -m build --no-isolation` | exit `0` (confirms `cryptography` resolves as a real, installable dependency) |
-| Detector recall/decoys (unchanged) | `eval` GATES row: seed, then `python -m veil_pii_middleware.demo.eval --min-recall 1.0 --max-false-positives 0` | exit `0`, unmodified from mission-2 |
-| Round-trip crypto | pytest: encrypt a value via `get_or_create_token`, `resolve()` returns the exact original value | exit `0` |
-| HMAC normalization consistency | pytest, parametrized per `EntityType`: two differently-formatted-but-equivalent values (case/whitespace) produce the same `lookup_hmac` and the same token | exit `0` |
-| Cross-type non-collision | pytest: the same raw string used as two different `EntityType`s never shares a token or a `lookup_hmac` row | exit `0` |
-| Nonce uniqueness | pytest: two `get_or_create_token` calls for two different values produce two different nonces and two different ciphertexts, even under a fixed key | exit `0` |
-| Fail-closed on bad key | pytest, parametrized: `VEIL_VAULT_KEY` unset, empty, not valid base64, and valid base64 but not 32 bytes — each raises before any DB write, no partial file created | exit `0` |
-| No plaintext at rest | pytest: after inserting a fixture value, read the raw SQLite file bytes and assert the plaintext fixture value does not appear | exit `0` |
-| TTL purge | pytest, injectable clock: a mapping older than `ttl_seconds` is deleted by `purge_expired()`, one that is newer is kept, return value equals the count deleted | exit `0` |
-| Monotonic non-reuse after purge | pytest: purge a mapping, insert a new value of the same `entity_type` in the same session, assert its `NNNN` is strictly greater than the purged one's, never reused | exit `0` |
-| Session isolation | pytest: `resolve()` on a token that exists only in a different `session_id` raises rather than returning cross-session data | exit `0` |
+| Build | `.venv/Scripts/python -m build --no-isolation` | exit `0` (no new dependency introduced this mission, so this should be unaffected) |
+| Detector recall/decoys (unchanged) | `eval` GATES row: seed, then `python -m veil_pii_middleware.demo.eval --min-recall 1.0 --max-false-positives 0` | exit `0`, unmodified — this mission does not touch `detector.py` |
+| Single-value substitution | pytest: `tokenize("contact alice@example.com", vault)` replaces only the email span with `PII_EMAIL_NNNN`, surrounding text unchanged | exit `0` |
+| Multi-type substitution in one text | pytest: a text containing an email, a DNI, and a phone in one `tokenize()` call yields three distinct, correctly-typed tokens; text between/around them is untouched | exit `0` |
+| Exact round-trip | pytest: `detokenize(tokenize(text, vault), vault) == text` for several representative texts (single entity, multiple entities, no entities, entity at string start/end) | exit `0` |
+| Nested structures | pytest: a `dict` with nested `list`s and sub-`dict`s — string leaves tokenized/detokenized, keys untouched, container types (`dict`/`list`) and non-string scalars (`int`, `float`, `bool`, `None`) preserved exactly | exit `0` |
+| Repeated value → same token, end-to-end | pytest: the same PII value appearing twice in one text (or in two leaves of one structure), tokenized via one `tokenize()` call, produces the identical token both times | exit `0` |
+| Unknown/foreign-session token in detokenize | pytest: `detokenize()` on a token absent from the vault (or minted under a different `session_id`) raises (`TokenNotFoundError` propagated from `vault.py`, not swallowed, not left as literal text) | exit `0` |
+| No plaintext in exception surface | pytest: for the unknown-token case above, assert the fixture's real PII value (if any was used to construct the scenario) does not appear in `str(exc)` | exit `0` |
+| Offset correctness under multiple spans | pytest: a text with 3+ spans of varying length in arbitrary order — assert every non-PII character survives at its expected relative position after tokenize (guards the right-to-left replacement order) | exit `0` |
+| Token sequence overflow fails closed | pytest: force a session's per-entity-type counter to 10000 (past the fixed four-digit width `Vault.get_or_create_token` zero-pads but does not cap), then `tokenize()` a value of that entity type — assert `TokenFormatOverflowError` is raised before any ambiguous token is written into output, rather than `detokenize` later mis-resolving a truncated prefix to a different token's value | exit `0` |
 
 ## Scrutiny Validator
 
-- Confirm the diff touches only `veil_pii_middleware/core/vault.py`,
-  `pyproject.toml`, `tests/test_vault.py`, and the harness mission files —
-  `detector.py`, `tokenizer.py`, `audit.py`, adapters and frontend stay
-  untouched.
+- Confirm the diff touches only `veil_pii_middleware/core/tokenizer.py`,
+  `tests/test_tokenizer.py`, and the harness mission files — `detector.py`,
+  `vault.py`, `audit.py`, adapters, and `frontend/` stay untouched.
+- Confirm span replacement is genuinely right-to-left (by start offset,
+  descending) — a left-to-right or unordered replacement would corrupt every
+  offset after the first substitution once token length differs from the
+  original span's length.
+- Confirm `tokenize()` does not assume `detect_regex()` is the only span
+  source: it must call `merge_spans()` on the span list it builds, not skip
+  straight from `detect_regex()`'s already-merged output to substitution,
+  since the whole point of routing through `merge_spans()` is that a future
+  LLM-layer span list gets unioned through the same call without
+  `tokenize()` needing to change.
 - Confirm no plaintext value is ever passed to a `str`/log/exception message
-  that could reach stdout, a log file, or `.harness` memory — check every
-  `raise` and any debug-adjacent code path.
-- Confirm the master key is read only from `VEIL_VAULT_KEY` and never
-  hardcoded, defaulted to a constant, or written to disk anywhere (including
-  test fixtures — tests should set the env var to a locally generated key,
-  never commit a literal key).
-- Confirm nonces are generated with `os.urandom` (or an equivalent CSPRNG)
-  per call, never derived, reused, or zero-filled.
-- Confirm the unique index is genuinely `(session_id, lookup_hmac)` — a
-  missing `session_id` component would let two sessions' identical values
-  collide on the same row.
-- Confirm `mypy --strict` passes with no new `# type: ignore` introduced to
-  paper over `sqlite3`'s loosely-typed row access.
-- Confirm the `counters` table addition is documented in the mission/handoff
-  as an explicit, justified deviation from BRIEF's literal `mappings`-only
-  schema, not silent scope creep.
+  that could reach stdout, a log file, or `.harness` memory.
+- Confirm `detokenize()`'s token-recognition regex does not silently accept
+  a substring that merely looks token-shaped but was never issued — it must
+  reach `vault.resolve()` and let that call's `TokenNotFoundError` decide,
+  not pattern-match its way to a false accept.
+- Confirm nested traversal does not mutate the input in place when the
+  input is a `dict`/`list` (return a new structure), since a caller passing
+  a live object (e.g. a parsed JSON payload it still holds a reference to)
+  must not see it silently rewritten out from under it.
+- Confirm `mypy --strict` passes with no new `# type: ignore`, and that the
+  `JSONValue` recursive type alias is used consistently rather than `Any`
+  creeping in at the recursion boundary.
 
 ## User-Testing Validator
 
-- Run `tests/test_vault.py` directly and read the output — not just the exit
-  code — to confirm the assertions actually exercise ciphertext bytes and
-  HMAC values rather than only checking token strings.
-- Manually inspect a test-generated vault DB file (e.g. via `sqlite3` CLI or
-  a short throwaway script) to visually confirm no fixture plaintext value
-  is readable in the `ciphertext` or `lookup_hmac` columns.
-- Confirm `pip install -e ".[dev]"` succeeds cleanly with the new
-  `cryptography` dependency in this repo's `.venv` on Windows.
+- Run `tests/test_tokenizer.py` directly and read the output — not just the
+  exit code — to confirm assertions check actual substituted text/token
+  values and exact structural equality, not just "no exception raised."
+- Manually run `tokenize()`/`detokenize()` on one ad hoc multi-entity,
+  nested-dict example (throwaway script or REPL) and eyeball the token
+  format and round-trip result once, as a sanity check the automated tests
+  might miss (e.g. an off-by-one visible only by reading the string).
