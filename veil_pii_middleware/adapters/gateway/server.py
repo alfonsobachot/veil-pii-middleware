@@ -38,18 +38,28 @@ request body that is not valid JSON, or a tokenization/vault failure, aborts
 the request with an error response of the gateway's own rather than
 forwarding the original bytes upstream unscanned.
 
-One ``Vault`` session per running gateway process: ``session_id`` is
-generated once at startup and reused by every request this process handles.
-Unlike ``PreToolUse``/``PostToolUse`` (a real per-Claude-Code-session id on
-every hook invocation) or ``/veil`` (a ``CLAUDE_SESSION_ID`` env var), a
-gateway process is a standalone long-running server with no per-request
-session identity supplied by the caller -- there is no JSON envelope to read
-one from, only a raw HTTP request against the Anthropic Messages API shape.
-Treating "one running gateway instance" as "one session" is the simplest
-correct choice for the target user (a single developer running one gateway
-process); it means two concurrent gateway processes, or a restart mid
-conversation, do not share a token vocabulary. That is an accepted scope
-limitation, not a bug to fix here.
+Keyed per request by the real Claude Code ``session_id``, read from the
+``X-Claude-Code-Session-Id`` request header (confirmed present on every
+outbound Claude Code request by mission-7's live spike) -- the same id
+``PreToolUse``/``PostToolUse`` already use from their own hook payload's
+``session_id``. This is what lets a token minted by the gateway resolve
+under a hook, and vice versa (mission-9/BRIEF item 10c): before this, the
+gateway minted its own ``gateway-<uuid>`` once per process, unresolvable by
+either hook. Each request already opens its own ``Vault(...)`` (see
+``_tokenize_body``, ``_relay_sse_response``, ``_relay_buffered_response``),
+so keying by a per-request header value needed no change to ``Vault``'s
+lifetime -- only to which ``session_id`` string those existing calls pass
+in.
+
+If the header is missing, empty, or whitespace-only -- unconfirmed whether
+every ``ANTHROPIC_BASE_URL``-speaking client sends it, not just Claude Code
+-- the gateway falls back to a UUID generated once at process startup
+(``_new_session_id()``), logging a stderr warning. This is not the
+fail-closed doctrine that governs the outbound tokenization leg below: no
+raw PII is at stake either way, only cross-adapter correlation for that one
+request. Two concurrent gateway processes still do not share a token
+vocabulary with each other in the no-header/fallback case; that remains an
+accepted scope limitation.
 """
 
 from __future__ import annotations
@@ -73,7 +83,7 @@ from veil_pii_middleware.core.tokenizer import (
 )
 from veil_pii_middleware.core.vault import Vault
 
-__all__ = ["make_handler", "main"]
+__all__ = ["SESSION_ID_HEADER", "make_handler", "main"]
 
 #: Same fixed, git-ignored vault location every adapter uses.
 VAULT_DB_PATH = Path(".veil") / "vault.db"
@@ -104,6 +114,34 @@ _HOP_BY_HOP = {
 
 def _new_session_id() -> str:
     return f"gateway-{uuid.uuid4()}"
+
+
+#: Real Claude Code session id, sent on every outbound request (mission-7's
+#: live spike). Reading it lets the gateway key its ``Vault`` calls the same
+#: way ``PreToolUse``/``PostToolUse`` already key theirs from the hook
+#: payload's ``session_id`` -- see the module docstring.
+SESSION_ID_HEADER = "X-Claude-Code-Session-Id"
+
+
+def _resolve_session_id(handler: BaseHTTPRequestHandler, fallback_session_id: str) -> str:
+    """Return the session id to use for this request's ``Vault`` calls.
+
+    Prefers ``SESSION_ID_HEADER`` if present and non-empty after stripping
+    whitespace; otherwise falls back to ``fallback_session_id`` (the
+    per-process UUID) and logs a stderr warning. Matches the hooks adapters'
+    own ``session_id`` validation (non-empty ``str``, no further format
+    check) -- this mission does not invent a stricter schema.
+    """
+    header_value = handler.headers.get(SESSION_ID_HEADER)
+    if header_value is not None and header_value.strip():
+        return header_value.strip()
+    print(
+        f"veil gateway: missing or empty {SESSION_ID_HEADER} header, falling back to"
+        f" {fallback_session_id} -- this request's tokens will not be resolvable by"
+        " PreToolUse/PostToolUse",
+        file=sys.stderr,
+    )
+    return fallback_session_id
 
 
 # core/vault.py's SQLite-backed counter is read-then-insert with no
@@ -329,9 +367,15 @@ def _relay_buffered_response(
 
 
 def make_handler(
-    session_id: str, client: httpx.Client, upstream_base: str
+    fallback_session_id: str, client: httpx.Client, upstream_base: str
 ) -> type[BaseHTTPRequestHandler]:
-    """Build a request handler bound to one session id, HTTP client, and upstream base URL."""
+    """Build a request handler bound to a fallback session id, HTTP client, and upstream base URL.
+
+    ``fallback_session_id`` is used only when a request has no usable
+    ``SESSION_ID_HEADER`` -- every request that does carry one is keyed by
+    that header's value instead, resolved fresh per request by
+    ``_resolve_session_id``.
+    """
 
     class GatewayHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -347,6 +391,7 @@ def make_handler(
             # and let the connection close, leaving a truncated body rather
             # than a corrupted one.
             response_started = False
+            session_id = _resolve_session_id(self, fallback_session_id)
             try:
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 raw_body = self.rfile.read(length) if length else b""
@@ -425,13 +470,15 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     port = int(argv[0]) if argv else _DEFAULT_PORT
     upstream = os.environ.get(UPSTREAM_ENV_VAR, _DEFAULT_UPSTREAM)
-    session_id = _new_session_id()
+    fallback_session_id = _new_session_id()
 
     client = httpx.Client(timeout=httpx.Timeout(300.0))
-    handler_cls = make_handler(session_id, client, upstream)
+    handler_cls = make_handler(fallback_session_id, client, upstream)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
     print(
-        f"veil gateway: listening on http://127.0.0.1:{port} -> {upstream} (session {session_id})",
+        f"veil gateway: listening on http://127.0.0.1:{port} -> {upstream}"
+        f" (fallback session {fallback_session_id}, used only when a request has no"
+        f" {SESSION_ID_HEADER} header)",
         file=sys.stderr,
     )
     try:

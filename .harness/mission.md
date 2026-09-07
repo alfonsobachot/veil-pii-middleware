@@ -2,214 +2,183 @@
 
 ## Objective
 
-Implement response-side (model -> client) rewriting for the gateway
-(`veil_pii_middleware/adapters/gateway/server.py`, BRIEF work-plan day-2 item
-10b, `docs/private/BRIEF.md` §8 and the SSE row of §6). Mission-7 built the
-gateway tokenizing only the outbound request leg and relaying the response
-byte-for-byte untouched, as an explicit, documented scope cut — this mission
-closes that gap so a token the model echoes back (e.g. `PII_EMAIL_0001`)
-resolves to its real value on screen instead of appearing literally.
+Reconcile the `session_id` used to key the gateway's `Vault`
+(`veil_pii_middleware/adapters/gateway/server.py::_new_session_id()`) with
+the real Claude Code `session_id` the hooks adapters already use
+(`adapters/hooks/pre_tool_use.py`, `adapters/hooks/post_tool_use.py`, both
+reading `payload["session_id"]`). Today the gateway mints its own
+`gateway-<uuid>` once per process; a token minted by one mechanism cannot be
+resolved by the other. `docs/private/BRIEF.md` §6 (risk row added
+2026-09-07) and §8 item 10c record this as the top-priority day-2 item: it
+breaks the project's own central scenario (BRIEF §1) — gateway and hooks
+both active on the same session, now the documented normal mode of use, not
+an edge case (§2.1 correction, 2026-09-07) — the first time both adapters
+handle the same conversation.
 
-Before designing the buffer, this mission must live-verify — not assume —
-the actual shape of Anthropic's streaming response: which `content_block_delta`
-event types carry incremental text, and whether a token's text can be split
-between two distinct SSE events at the JSON-decoded content level (not just
-between raw HTTP chunks). Mission-7's own spike already confirmed the
-response is `Transfer-Encoding: chunked` (BRIEF §6), but only inspected
-header names, never the body content — so the event-shape question is still
-open and gates the buffer's design, the same way the auth question gated
-mission-7's gateway code. This project has already been burned three times by
-an unverified design assumption (`/veil`'s `$ARGUMENTS` behavior, the hooks
-permission model, and near-miss on mission-7's own streaming shape) — confirm
-live before building.
-
-**Architecture decision (resolved, not open):** the buffering logic — what is
-safe to flush now vs. what must be retained because it could be the prefix of
-a still-arriving token — is detection/substitution logic, not transport, per
-CLAUDE.md's "adapters never re-implement detection or substitution; they only
-wire `core/` into a transport." It lives as a new incremental-detokenize
-function in `core/tokenizer.py` (returning something like
-`(safe_text_to_emit, retained_tail)`), reusing `core/vault.py::Vault.resolve()`
-for the actual token -> value lookup. `adapters/gateway/server.py` only calls
-that new function, the same way it already calls `tokenize()` on the request
-leg. Unlike mission-7 (where touching `core/tokenizer.py` was out of scope
-because nothing needed it), modifying `core/tokenizer.py` is explicitly in
-scope here — CLAUDE.md's "Review and risk" convention still applies, so this
-change requires human approval before merge regardless of execution lane.
+Fix: read the `X-Claude-Code-Session-Id` request header (confirmed present
+on real Claude Code traffic by mission-7's live spike — header *name* only,
+values are never logged; see Evidence below for what mission-8 did and did
+not separately confirm) and key that request's `Vault` by it, instead of the
+fixed per-process UUID.
 
 ## Routing
 
 Execution lane: agent-with-checkpoint
-Human review trigger: before-code, before-external-write, before-merge
+Human review trigger: before-code, before-merge
 Delegation mechanism: main-session
 Validation plan: .harness/validation.md
-
-Note: `before-external-write` covers the live SSE-shape spike specifically
-(sends a real prompt through a throwaway pass-through proxy using a separate
-`claude -p` process against the user's real subscription, same pattern as
-mission-7 spike 1) — approval of the mission as a whole does not by itself
-authorize running that spike; see the Validation Contract's Live Spike table.
 
 ## Intake Grill
 
 | Question | Answer / Evidence |
 |---|---|
-| A token in the model's response can fail to resolve mid-stream (e.g. the gateway process restarted and lost the in-memory/db-backed mapping, or the vault DB was reset). `Vault.resolve()` raises in that case. `send_response`/status line is already on the wire by then (mission-7's own comment in `server.py` explains why a second status line would corrupt chunked framing), so the response cannot be aborted with a clean HTTP error the way the request leg does. What should happen to that fragment? | Substitute a visible placeholder (e.g. `[unresolved token]`) in place of the unresolved token and keep streaming the rest of the response normally. Chosen over truncating the stream (simpler, reuses an existing precedent, but leaves the user staring at a silently cut-off answer) and over leaving the literal `PII_<TYPE>_<NNNN>` token in place (status quo before this mission; reintroduces exactly the defect this mission exists to close, in the one case it can't otherwise fix). This is new behavior distinct from the request-leg's fail-closed rule: a resolve failure here leaks no PII either way, so the choice is a UX/legibility tradeoff, not a security one — CLAUDE.md's fail-closed doctrine (`core/detector.py`/vault/tokenizer failures must block the request, never forward raw PII) is about the *outbound* leg and is unmodified by this decision. |
-| Anthropic's streaming response can carry incremental text in more than one delta shape — `text_delta` (visible reply text), `input_json_delta` (tool-call arguments), `thinking_delta` (extended reasoning) — confirmed by what the live spike actually observes. Should the incremental detokenizer apply to all of them, or only to visible reply text? | All string-bearing delta types the spike confirms exist. A token could just as easily be echoed inside a tool-call argument as in the reply text; narrowing to `text_delta` only would leave a token visibly unresolved in any other delta shape, which is the same defect this mission exists to close, just relocated rather than fixed. The exact set of delta types handled is whatever the live spike's evidence shows Anthropic actually sends — not guessed in advance. |
-| What test coverage does the split-token buffer need, given `tests/test_gateway.py`'s existing style (real gateway against a fake local upstream)? | Both: unit tests for the new incremental function in `core/tokenizer.py` (splitting a known token span at every possible offset, confirming the same resolved output either way) AND at least one gateway-level integration test with a fake SSE upstream that deliberately splits a token across two separate `content_block_delta` events, confirming `server.py` actually wires the new function into the real chunked-response framing correctly — not just that the algorithm is correct in isolation. |
+| What should happen if the header is missing/empty/malformed on a request (universality across every `ANTHROPIC_BASE_URL`-speaking client, not just Claude Code, is unconfirmed)? | Fall back to the existing per-process UUID (`_new_session_id()`, generated once at gateway startup, unchanged mechanism) and log a stderr warning. Not a fail-closed case: CLAUDE.md's fail-closed doctrine guards detection/tokenization capability (a request that can't be scanned must not be forwarded raw) — this header only selects which vault a token is correlated under; its absence loses cross-adapter correlation for that request, not the "no raw PII to an external API" guarantee, which the outbound `tokenize()` call still provides unconditionally either way. Blocking here would break today's working gateway-only usage (no hooks in play) for any client that doesn't send this exact header, a population this project has not verified. |
+| Can the header's value change across requests within one gateway process's lifetime (e.g. Claude Code varies it within one conversation)? Unconfirmed by either prior spike's evidence. | Does not need a live spike to resolve, and does not gate the design: `server.py`'s three request-time call sites (`_tokenize_body`, the SSE response path, `_relay_buffered_response`) already open a fresh `Vault` per request rather than holding one open for the process's lifetime (verified by reading current `_handle()` — each opens its own `with Vault(...)`). Reconciliation is therefore just "read the header once per request and pass that value to the `Vault(...)` calls this request already makes" — no change to `Vault`'s lifetime management, so the header varying or not varying between requests is handled correctly either way without needing to confirm which. The throwaway live spike was explicitly declined for this reason (see Non-goals). |
+| How should `tests/test_gateway.py`'s fixture change, given it builds the handler with `gateway_server._new_session_id()` directly and no test request sends the header today? | The fixture gets a fixed, hook-shaped test session id distinct from the `gateway-<uuid>` format (e.g. `hooks-<uuid>`, making it unambiguous in assertions which id space a token was minted under); a small test-local request helper attaches the header by default so every existing test becomes representative of real Claude Code traffic (which always sends this header, per mission-7's spike) without individually editing each assertion. One dedicated new test omits the header explicitly to keep the fallback-to-per-process-UUID path covered. |
+| Should the suite prove real cross-adapter reconciliation, not just that the gateway reads the header? | Yes: a new test opens a second `Vault(VAULT_DB_PATH, <the header's session id>)` directly — the same call shape `pre_tool_use.py` makes from a hook payload's `session_id` — and resolves a token the gateway minted under that id via the header. This is the actual proof the fix works, without invoking hooks code (out of scope). |
 
-Evidence gathered before asking: `veil_pii_middleware/adapters/gateway/server.py`
-(`_handle`, mission-7) currently relays the upstream response with
-`upstream.iter_bytes()` untouched and re-chunks it manually; its own comment
-block explains why `send_response` can only fire once per request and why a
-failure after `response_started = True` must stop writing rather than call
-`_write_error` again — this constraint carries forward unchanged and bounds
-what "fail on resolve" can mean here. `core/tokenizer.py::detokenize()` and
-`_TOKEN_PATTERN` (`PII_[A-Z]+_\d{4}`, anchored to exactly four digits) are
-unchanged and already tested (`tests/test_tokenizer.py`); the new incremental
-function reuses that same pattern rather than inventing a new token format.
-`docs/private/BRIEF.md` §6's SSE row and §8 item 10b are the design of
-record for this mission; mission-7's `handoff.md` confirmed
-`Transfer-Encoding: chunked` on the real API's response but never inspected
-body content, which is exactly the gap this mission's spike closes.
+Evidence gathered before asking: mission-7's live spike (`docs/missions/mission-7/handoff.md`,
+Spike 1) captured real outbound header *names* from a live Claude Code
+request and confirmed `X-Claude-Code-Session-Id` is present — values were
+never logged, so its *stability across requests* was never checked, then or
+since. Contrary to `docs/private/BRIEF.md`'s §6 risk-row phrasing ("confirmed
+in both mission-7's and mission-8's live spikes"), mission-8's own handoff
+(`docs/missions/mission-8/handoff.md`) does not independently mention this
+header at all — its spike focused on response-body/SSE shape, not request
+headers. This mission's design (previous answer) does not depend on closing
+that gap, so it is noted here as a documentation correction, not chased with
+a new spike. `adapters/hooks/pre_tool_use.py`/`post_tool_use.py` both already
+validate `session_id` as "a non-empty `str`, else block/warn" with no
+further format constraint — this mission's header validation matches that
+existing precedent rather than inventing a stricter schema.
 
 ## Scope
 
-- `core/tokenizer.py`: a new incremental-detokenize function that, given
-  previously-retained pending text plus a new chunk of text, returns the
-  portion now safe to emit (fully resolved, no PII tokens left) and the
-  portion still to retain (a possible token prefix — computed against the
-  existing `PII_[A-Z]+_\d{4}` shape, not a new token format). Reuses
-  `Vault.resolve()`; on an unresolved token, substitutes the agreed visible
-  placeholder rather than raising past this function, matching the Intake
-  Grill decision above (a resolve failure here is a display concern, not a
-  security one, so it does not propagate as a hard failure the way a
-  request-leg tokenize/vault error does).
-- A throwaway (not committed) live spike, run before any buffer code is
-  written, that captures the actual decoded body/SSE event shape of a real
-  streaming Anthropic response — reusing mission-7's separate-process
-  pattern (`ANTHROPIC_BASE_URL=... claude -p "..."` against a local
-  pass-through proxy) but this time logging body content (event types,
-  `content_block_delta` shapes), not just header names.
-- `veil_pii_middleware/adapters/gateway/server.py`: wire the new incremental
-  function into the response-relay path in `_handle`, replacing the current
-  untouched `upstream.iter_bytes()` relay for streaming responses whose
-  content carries the delta shapes confirmed by the spike. Non-streaming
-  (buffered) JSON responses get the equivalent one-shot treatment via
-  `core/tokenizer.py::detokenize()`, already existing and unmodified.
-- Tests: `tests/test_tokenizer.py` unit tests for the new incremental
-  function (every split offset of a known token span; the resolve-failure
-  placeholder path); `tests/test_gateway.py` integration test(s) with a fake
-  SSE upstream deliberately splitting a token across chunks, plus a test for
-  a token that never resolves.
-- `.harness/handoff.md` documents the live spike's actual finding (event
-  shape, whether/where splits occur) and the resulting buffer design.
+- `veil_pii_middleware/adapters/gateway/server.py`: read the
+  `X-Claude-Code-Session-Id` request header once per request in `_handle()`;
+  use it (if present and non-empty after stripping whitespace) as the
+  `session_id` passed to every `Vault(...)` call this request already makes
+  (`_tokenize_body`, the SSE response path, `_relay_buffered_response`);
+  otherwise fall back to the existing per-process UUID from
+  `_new_session_id()` and log a stderr warning (no PII, no secret — matching
+  existing stderr-safety precedent). `make_handler`'s `session_id` parameter
+  becomes explicitly the *fallback* default, documented as such. `main()`'s
+  startup log line is reworded so it no longer implies one fixed session
+  governs every request.
+- `tests/test_gateway.py`: fixture carries a fixed, hook-shaped test session
+  id and a request helper that attaches the header by default; a new test
+  covering the header-missing fallback path; a new test proving real
+  cross-adapter reconciliation by directly resolving a gateway-minted token
+  through a second `Vault` opened with the header's session id (mimicking
+  `pre_tool_use.py`'s own call shape).
 
 ## Non-goals
 
-- Deciding whether this replaces or complements `MessageDisplay`/`/reveal`
-  (BRIEF item 14) — open question, left for a future review.
-- Any change to the outbound request-side tokenization path (`tokenize()`,
-  the request-body handling in `_handle`) — mission-7's behavior there is
-  correct and unmodified.
-- Persisting buffered/retained text across separate HTTP connections or
-  requests — the incremental buffer's lifetime is exactly one streaming
-  response.
-- Handling non-Anthropic-shaped response bodies beyond whatever
-  pass-through/fail-closed behavior mission-7 already established for
-  non-JSON request bodies (unchanged; this mission only touches the response
-  leg).
-- Local LLM detector layer, `eval.py`, audit log, frontend (BRIEF items
-  11-13).
-- Multi-session/multi-window vault correlation in gateway mode (mission-7's
-  accepted limitation, unchanged).
+- Any change to `core/vault.py` or `core/tokenizer.py` — this is purely a
+  "which `session_id` string gets passed in" fix at the adapter layer; the
+  vault/tokenizer contract is unmodified.
+- Any change to `adapters/hooks/pre_tool_use.py`/`post_tool_use.py` — they
+  already do the correct thing (use the real session id from their own
+  payload); this mission makes the gateway match them, not the reverse.
+- A live spike to confirm whether the header's value is stable or varies
+  within one Claude Code process/conversation — declined; the design
+  (per-request `Vault` opens, unchanged) is correct regardless of the
+  answer, so nothing gates on it (Intake Grill, Q2).
+- Local LLM detector layer, `input_json_delta`/tool-call-argument rewriting,
+  and `MessageDisplay`/`/reveal` — all already out of scope per prior
+  missions' decisions, not reopened here.
+- Format/schema validation of the header value beyond "non-empty after
+  stripping whitespace" — matches existing `session_id` validation
+  precedent in the hooks adapters; no new validation invented.
+- Multi-process/concurrent-gateway vault correlation — mission-7's accepted
+  limitation, unchanged.
 
 ## Acceptance criteria
 
-1. Live-verified (not assumed): the spike's actual captured evidence states
-   which `content_block_delta` event/delta types carry incremental text in a
-   real streaming response, and whether a token's text was observed (or
-   deliberately reproduced) split across two such events.
-2. A token minted on the request leg and echoed back by the model in a
-   streaming response resolves to its real value in what the client
-   receives, including when the token's text is split across two separate
-   upstream chunks/events.
-3. A token that fails to resolve mid-stream is replaced with the agreed
-   visible placeholder; the stream continues and its chunked framing is
-   never corrupted (no second status line, no malformed chunk boundary).
-4. The response reaching the client for content with no tokens in it is
-   unaffected — same bytes as mission-7's existing untouched relay, module
-   the one-token-buffer-worth of latency inherent to any streaming rewrite.
-5. `core/tokenizer.py`'s existing request-side `tokenize()`/`detokenize()`
-   behavior and its existing tests are unaffected.
-6. `.harness/bin/verify` exits 0.
-7. `.harness/handoff.md` states the spike's finding and the resulting design
-   plainly enough that a human can decide, without re-running anything,
-   whether the response-side rewrite is correct.
+1. A token minted by the gateway for a request carrying
+   `X-Claude-Code-Session-Id: <sid>` is resolvable by directly opening
+   `Vault(VAULT_DB_PATH, "<sid>")` — the same shape `pre_tool_use.py` uses —
+   proving real cross-adapter reconciliation, not just that the header is
+   read.
+2. A request with the header missing, empty, or whitespace-only still
+   completes successfully (falls back to the existing per-process UUID
+   behavior, unchanged from mission-7/8) and emits a stderr warning
+   containing no PII or secret.
+3. Every pre-existing `tests/test_gateway.py` test still passes with the
+   fixture's new default header attached (i.e. this mission does not change
+   request/response tokenization behavior for traffic that already carried
+   no session-id concerns).
+4. `core/vault.py` and `core/tokenizer.py` are unmodified (confirmed by
+   `git diff --stat`).
+5. `.harness/bin/verify` exits 0.
+6. `.harness/handoff.md` documents the fix, the corrected evidence record
+   for BRIEF §6's citation gap, and the reconciliation test's result plainly
+   enough that a human can decide, without re-running anything, whether the
+   fix is correct.
 
 ## Risk
 
-Risk class: high
+Risk class: medium
 
-Rationale: modifies `core/tokenizer.py`, the designated high-risk surface
-per CLAUDE.md's "Review and risk" convention (a missed span is a leak, an
-unstable token silently breaks correlation — here, a buffering bug could
-either leak a raw token to the screen, which is a display defect but not a
-security one since the token itself is not PII, or worse, mis-resolve a
-token to the wrong value if buffering logic is sloppy about session/entity
-binding). Also runs a live spike sending a real prompt through the user's
-authenticated Claude Code session/subscription (same class of action as
-mission-7 spike 1), and touches the same network-facing response-relay code
-mission-7 flagged as easy to corrupt (framing/chunked-encoding bugs).
+Rationale: does not touch `core/vault.py` or `core/tokenizer.py` (the
+designated high-risk surface per CLAUDE.md's "Review and risk" convention),
+but changes which `session_id` a gateway request's `Vault` calls are keyed
+by — a mistake here would either silently break correlation (a token minted
+under the wrong id resolves as "not found," a display defect, not a PII
+leak, same class of failure mission-8 already made non-fatal via the
+placeholder path) or, in the worst case, key a vault operation using an
+untrusted value in an unintended way. The header is client-supplied
+(HTTP-level, not merely local-process state) governing vault keying for the
+first time in this project — the same trust boundary the hooks adapters
+already accept for `payload["session_id"]` from Claude Code itself (a local
+process on the developer's own machine, not a hostile network peer), so this
+is treated as consistent with existing precedent, not a new attack surface,
+but is called out explicitly since it is a new instance of that pattern.
 
 ## Merge policy
 
-No commit, push, or merge without explicit human review of the diff, the
-live spike's captured evidence, and `.harness/handoff.md`. This mission does
-not merge itself.
+No commit, push, or merge without explicit human review of the diff and
+`.harness/handoff.md`. This mission does not merge itself.
 
 ## Tooling And Approach Assessment
 
-1. **What project type is this?** An extension of an existing network-facing
-   component (mission-7's gateway) to parse and rewrite streamed response
-   content in place, rather than pure pass-through — a materially different
-   risk than mission-7's request-only tokenization, because now the gateway
-   must reconstruct meaning across chunk boundaries instead of just
-   forwarding bytes.
-2. **What methods, tooling, or approaches does that imply?** A live spike
-   first (same throwaway separate-process pattern as mission-7), this time
-   logging body content; a streaming-safe algorithm in `core/tokenizer.py`
-   for "longest safe-to-flush prefix vs. retained possible-token-tail" against
-   the existing `PII_[A-Z]+_\d{4}` pattern (an unbounded `[A-Z]+` run means
-   the "is this still a possible token prefix" check must handle an
-   arbitrarily long trailing all-caps run, not just a fixed lookahead
-   window); reuse of `httpx`'s existing SSE/chunk iteration already present
-   in `server.py`, no new dependency.
-3. **What risks or missing decisions does it reveal?** (a) SSE framing is
-   line-oriented (`data: {...}\n\n`) and each `data:` line is a complete JSON
-   event by construction — so a split can only happen at the
-   reassembled-text level across multiple complete events, never mid-JSON or
-   mid-UTF-8-byte; the spike must confirm this holds for the real API before
-   the buffer is built against decoded text rather than raw bytes. (b) An
-   unbounded uppercase run (e.g. a long all-caps sentence in the reply) looks
-   like an indefinitely-growing possible-token-prefix under a naive
-   check — the algorithm needs a bound (e.g. stop treating a run as a
-   candidate once it's longer than any real entity-type name could be) or it
-   will buffer unboundedly on ordinary text. (c) Each `content_block_index`
-   is logically independent (a token cannot span two different content
-   blocks), so the buffer must be keyed per block, not global to the whole
-   response.
-4. **What should be added to validation?** The live spike's captured
-   evidence (event types actually observed) as committed-to-handoff proof,
-   not a claim; a unit test sweeping every split offset of a real token
-   span; an integration test proving the gateway's chunked framing survives
-   a split-token rewrite; a test for the resolve-failure placeholder path; a
-   test that ordinary long all-caps text does not get buffered
-   indefinitely/dropped.
-5. **What is explicitly not needed now?** Any change to request-side
-   tokenization; MessageDisplay/`/reveal` design; the local LLM detector,
-   eval, audit log, or frontend; TLS/cert work (mission-7 already answered
-   this); multi-session vault correlation.
+1. **What project type is this?** A correctness fix reconciling an
+   identity-keying mismatch between two already-implemented adapters
+   (gateway vs. hooks) in an existing network-facing component — not new
+   feature surface, and (per the Intake Grill) no live spike gates the
+   design this time, unlike missions 7 and 8.
+2. **What methods, tooling, or approaches does that imply?** Read an
+   inbound HTTP header per request via the already-available
+   `self.headers` on `BaseHTTPRequestHandler` (no new dependency); thread a
+   per-request `session_id` value through the three call sites in
+   `_handle()` that already open a `Vault` per request (no lifetime change
+   needed); extend the existing httpx-based integration test harness in
+   `tests/test_gateway.py` with a direct second `Vault` open to prove real
+   hook-shaped resolution, without invoking any hooks code.
+3. **What risks or missing decisions does it reveal?** (a) the gateway now
+   lets an inbound HTTP header select which vault "session" a token is
+   minted under — the same trust boundary the hooks adapters already accept
+   for their own payload's `session_id`, not a new attack surface, but the
+   first time an HTTP header (rather than local hook-invocation state)
+   plays that role, worth stating explicitly. (b) "malformed" is scoped
+   narrowly — missing, or empty/whitespace-only after stripping — matching
+   the hooks adapters' own existing `session_id` validation, not a new
+   schema. (c) `main()`'s startup log line currently reads
+   `(session {session_id})`, implying one fixed session per process; must
+   be reworded to state it is only the fallback value now.
+4. **What should be added to validation?** A test proving cross-adapter
+   reconciliation by directly resolving a gateway-minted token through a
+   second `Vault` opened with the header's session id; a test for the
+   header-missing fallback path, including its stderr warning containing no
+   PII/secret (matching the existing `test_no_secret_or_pii_appears_in_gateway_stderr`
+   pattern); confirmation every pre-existing test still passes with the
+   fixture's new default header attached; `git diff --stat` confirming
+   `core/vault.py`/`core/tokenizer.py` are untouched.
+5. **What is explicitly not needed now?** Any change to `core/vault.py` or
+   `core/tokenizer.py`; any change to the hooks adapters; a live spike (the
+   design does not depend on confirming header stability); header
+   format/schema validation beyond non-empty; multi-process/concurrent
+   gateway vault correlation (mission-7's accepted limitation, unchanged).
 
 ## Status
 
