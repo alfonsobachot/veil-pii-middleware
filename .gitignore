@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Internal working docs, not for publication
+docs/private/
+
+# Secrets and local state
+.env
+.env.*
+
+# Vault: encrypted token <-> value mappings, never committed
+vault/
+*.vault
+*.vault.db
+
+# Databases, including the generated demo database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Audit logs
+*.jsonl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
