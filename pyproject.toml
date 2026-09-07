@@ -8,7 +8,14 @@ version = "0.1.0"
 description = "PII sanitization middleware for Claude Code, built around a tokenization / de-tokenization cycle."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  # AES-GCM for the vault's ciphertext-at-rest. Pinned to one major line:
+  # this is the project's first runtime dependency and it holds the master
+  # key's cipher primitive, so an unreviewed major bump is not acceptable.
+  # 50.x is the latest major as of writing, chosen over an older line since
+  # this dependency is being added fresh with no prior-version constraint.
+  "cryptography~=50.0",
+]
 
 [project.optional-dependencies]
 dev = [

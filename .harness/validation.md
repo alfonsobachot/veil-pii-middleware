@@ -22,61 +22,51 @@ Exit codes:
 |---|---|---|
 | Harness gate | `.harness/bin/verify` | exit `0` |
 | Lint | `.venv/Scripts/ruff check . && .venv/Scripts/ruff format --check .` | exit `0` |
-| Typecheck | `.venv/Scripts/mypy` | exit `0`, strict, no new `type: ignore` |
+| Typecheck | `.venv/Scripts/mypy` | exit `0`, strict, no new `type: ignore`, no implicit `Any` on rows/bytes/ciphertext |
 | Unit tests | `.venv/Scripts/pytest` | exit `0` |
-| Build | `.venv/Scripts/python -m build --no-isolation` | exit `0` |
-| Detector recall (unchanged) | `eval` GATES row: seed, then `python -m veil_pii_middleware.demo.eval --min-recall 1.0 --max-false-positives 0` | exit `0`; recall `1.00` on all structured types, `0` decoy hits |
-| Decoys absent from the manifest | pytest: no `(table, column, row_id, offset)` in `decoys.json` also appears in `manifest.json`; `decoy_samples` never appears as a manifest table | exit `0` |
-| Zero decoy hits under normal operation | pytest: `evaluate_decoys()` returns `[]` against the unmodified detector | exit `0` |
-| Decoy determinism | seed twice, compare `demo/decoys.json` | identical SHA-256 (or byte-identical file contents) |
-| Sabotage flips the gate | pytest, parametrized over `valid_dni`, `valid_card`, `valid_iban`: monkeypatch the matching `_PATTERNS` entry to always accept, assert `evaluate_decoys()` returns a hit for that entity type and `DecoyReport.exceeds(0)` is `True` | exit `0` (the test itself passes by observing the gate *would* fail) |
-| Concrete listing, not just a count | `eval.py`'s printed report names table/column/row id/value/reason for every decoy hit | manual read during the User-Testing Validator pass |
+| Build | `.venv/Scripts/python -m build --no-isolation` | exit `0` (confirms `cryptography` resolves as a real, installable dependency) |
+| Detector recall/decoys (unchanged) | `eval` GATES row: seed, then `python -m veil_pii_middleware.demo.eval --min-recall 1.0 --max-false-positives 0` | exit `0`, unmodified from mission-2 |
+| Round-trip crypto | pytest: encrypt a value via `get_or_create_token`, `resolve()` returns the exact original value | exit `0` |
+| HMAC normalization consistency | pytest, parametrized per `EntityType`: two differently-formatted-but-equivalent values (case/whitespace) produce the same `lookup_hmac` and the same token | exit `0` |
+| Cross-type non-collision | pytest: the same raw string used as two different `EntityType`s never shares a token or a `lookup_hmac` row | exit `0` |
+| Nonce uniqueness | pytest: two `get_or_create_token` calls for two different values produce two different nonces and two different ciphertexts, even under a fixed key | exit `0` |
+| Fail-closed on bad key | pytest, parametrized: `VEIL_VAULT_KEY` unset, empty, not valid base64, and valid base64 but not 32 bytes — each raises before any DB write, no partial file created | exit `0` |
+| No plaintext at rest | pytest: after inserting a fixture value, read the raw SQLite file bytes and assert the plaintext fixture value does not appear | exit `0` |
+| TTL purge | pytest, injectable clock: a mapping older than `ttl_seconds` is deleted by `purge_expired()`, one that is newer is kept, return value equals the count deleted | exit `0` |
+| Monotonic non-reuse after purge | pytest: purge a mapping, insert a new value of the same `entity_type` in the same session, assert its `NNNN` is strictly greater than the purged one's, never reused | exit `0` |
+| Session isolation | pytest: `resolve()` on a token that exists only in a different `session_id` raises rather than returning cross-session data | exit `0` |
 
 ## Scrutiny Validator
 
-- Check the diff against the objective and non-goals — confirm
-  `core/detector.py` is untouched.
-- Confirm `demo/decoys.json` and `manifest.json` are disjoint on every
-  identifying field, not merely "different files."
-- Confirm the three check-digit decoys (DNI, card, IBAN) are asserted invalid
-  at generation time in `seed.py` — a decoy that accidentally validates would
-  silently defeat the whole mechanism.
-- Confirm the sabotage test patches `_PATTERNS` (a value swap, observed
-  through the public `detect_regex()` entry point) rather than editing
-  `detector.py` or monkeypatching in a way that has no real effect (e.g.
-  rebinding `detector.valid_dni` alone, which `_PATTERNS` would not see,
-  since it holds direct references to the original function objects captured
-  at import time).
-- Confirm the new `eval` gate row change is additive: `--min-recall 1.0` is
-  still present and unchanged, `--max-false-positives 0` is new alongside it.
-- Confirm the five pre-existing gate rows are unmodified.
-- Confirm no fixture or generated value contains real personal data.
-- Confirm the false-positive threshold is visible in the gate command itself
-  (not a silent default that could be dropped unnoticed).
+- Confirm the diff touches only `veil_pii_middleware/core/vault.py`,
+  `pyproject.toml`, `tests/test_vault.py`, and the harness mission files —
+  `detector.py`, `tokenizer.py`, `audit.py`, adapters and frontend stay
+  untouched.
+- Confirm no plaintext value is ever passed to a `str`/log/exception message
+  that could reach stdout, a log file, or `.harness` memory — check every
+  `raise` and any debug-adjacent code path.
+- Confirm the master key is read only from `VEIL_VAULT_KEY` and never
+  hardcoded, defaulted to a constant, or written to disk anywhere (including
+  test fixtures — tests should set the env var to a locally generated key,
+  never commit a literal key).
+- Confirm nonces are generated with `os.urandom` (or an equivalent CSPRNG)
+  per call, never derived, reused, or zero-filled.
+- Confirm the unique index is genuinely `(session_id, lookup_hmac)` — a
+  missing `session_id` component would let two sessions' identical values
+  collide on the same row.
+- Confirm `mypy --strict` passes with no new `# type: ignore` introduced to
+  paper over `sqlite3`'s loosely-typed row access.
+- Confirm the `counters` table addition is documented in the mission/handoff
+  as an explicit, justified deviation from BRIEF's literal `mappings`-only
+  schema, not silent scope creep.
 
 ## User-Testing Validator
 
-- Run the seed, open `demo/decoys.json`, and confirm each entry reads as a
-  plausible negative control: a DNI-shaped value with a letter that doesn't
-  match its digits, a Luhn-failing card number, a mod-97-failing IBAN, a
-  Spanish thousands figure, a version string, a zero-padded account number.
-- Run `python -m veil_pii_middleware.demo.eval` and confirm the report shows
-  a decoy section reading zero hits under the current, unmodified detector.
-- Manually reproduce the sabotage: temporarily make a copy of
-  `core/detector.py`, change `valid_dni`'s first line to `return True`, rerun
-  `eval.py --max-false-positives 0`, confirm it now exits non-zero and prints
-  the specific DNI decoy that leaked through — then restore the file.
-- Confirm `demo/decoys.json` stays untracked by git, same as `manifest.json`
-  and the generated database.
-
-## Stop Conditions
-
-Stop and ask for human input if the gate exits `2`, if a decoy accidentally
-passes its own check digit (defeating the mechanism before it starts), or if
-closing the blind spot appears to require touching `core/detector.py` itself.
-
-Mission-specific stop condition: if a generated decoy cannot be made to fail
-its check digit deterministically under the fixed seed after a reasonable
-number of attempts, stop and report it — do not ship a decoy that might
-validate by chance, and do not loosen the zero-tolerance threshold to paper
-over it.
+- Run `tests/test_vault.py` directly and read the output — not just the exit
+  code — to confirm the assertions actually exercise ciphertext bytes and
+  HMAC values rather than only checking token strings.
+- Manually inspect a test-generated vault DB file (e.g. via `sqlite3` CLI or
+  a short throwaway script) to visually confirm no fixture plaintext value
+  is readable in the `ciphertext` or `lookup_hmac` columns.
+- Confirm `pip install -e ".[dev]"` succeeds cleanly with the new
+  `cryptography` dependency in this repo's `.venv` on Windows.
