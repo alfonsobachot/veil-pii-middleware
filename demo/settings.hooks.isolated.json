@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "//": "Same PreToolUse/PostToolUse hooks as demo/settings.hooks.json, but usable from a working directory OUTSIDE this repo -- see scripts/ask.sh's --demo-db mode. Why this exists: Claude Code walks up parent directories looking for CLAUDE.md (confirmed live -- it loads even when the session starts in demo/, a subdirectory of this repo), so the only way to keep this repo's own CLAUDE.md (which describes this very PII-blocking design) out of a demo-db test session's context is to run it from a directory with no repo ancestry at all. That in turn means the hook commands below cannot rely on a relative cwd to find the vault or the venv -- they `cd` into $VEIL_REPO_ROOT (set by the launching script) first. Relative paths inside pre_tool_use.py/post_tool_use.py themselves (core/hooks/_paths.py's VAULT_DB_PATH) are unchanged; only the shell command wrapping them changes.",
+
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3*)",
+      "Bash(python -c*)",
+      "Bash(python3 -c*)"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$VEIL_REPO_ROOT\" && p=.venv/Scripts/python.exe; [ -x \"$p\" ] || p=.venv/bin/python; \"$p\" veil_pii_middleware/adapters/hooks/pre_tool_use.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$VEIL_REPO_ROOT\" && p=.venv/Scripts/python.exe; [ -x \"$p\" ] || p=.venv/bin/python; \"$p\" veil_pii_middleware/adapters/hooks/post_tool_use.py"
+          }
+        ]
+      }
+    ]
+  }
+}

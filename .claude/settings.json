@@ -19,8 +19,6 @@
       "Edit(./src/**)",
       "Edit(./tests/**)",
       "Edit(./docs/**)",
-      "Write(./src/**)",
-      "Write(./tests/**)",
 
       "Bash(git status)",
       "Bash(git diff:*)",
