@@ -1,170 +1,365 @@
 # Handoff
 
-Mission 9: gateway/hooks `session_id` reconciliation (BRIEF work-plan day-2
-item 10c; §6 risk row added 2026-09-07).
-
 ## Summary
 
-Before this mission, the gateway
-(`veil_pii_middleware/adapters/gateway/server.py`) minted its own
-`gateway-<uuid>` once at process startup and used it, unconditionally, as
-the `session_id` for every request's `Vault` calls -- regardless of caller.
-The hooks adapters (`adapters/hooks/pre_tool_use.py`/`post_tool_use.py`,
-untouched by this mission) key their own `Vault` calls by the real Claude
-Code `session_id` from their hook payload. A token minted by one was never
-resolvable by the other, breaking the project's central scenario (BRIEF §1)
-the moment both are active on the same conversation.
+Implemented the probabilistic (LLM) detection layer in
+`veil_pii_middleware/core/detector.py` (BRIEF §3.1, work-plan item 11): an
+`LLMClient` speaking the OpenAI-compatible `/v1/chat/completions` schema
+(never any Ollama-native-only API), a `detect_llm()` function that validates
+and offsets the model's response into the source text, a content-block
+cache keyed by `sha256(client_identity | text)`, and a `detect()` union
+entry point that fails closed to the regex layer on any LLM-side failure.
+Wired into `veil_pii_middleware/core/tokenizer.py`'s `_tokenize_text()` (gated
+by whether `VEIL_LLM_BASE_URL`/`VEIL_LLM_MODEL` are set) and into
+`veil_pii_middleware/demo/eval.py` as `--mode regex|llm|union`.
 
-Fix: `server.py` now reads the `X-Claude-Code-Session-Id` request header
-once per request (`_resolve_session_id`, new) and threads that value into
-every `Vault(...)` call the request already makes (`_tokenize_body`, the
-SSE response path, `_relay_buffered_response`) -- no change to `Vault`'s
-per-request-open lifetime was needed, since all three call sites already
-opened a fresh `Vault` per request before this mission. A missing, empty,
-or whitespace-only header falls back to the pre-existing per-process UUID
-(`_new_session_id()`, unchanged) with a stderr warning containing the
-header name and the fallback id, never PII or the header's own content.
+Two new `EntityType` members: `PERSON`, `ADDRESS`. `STRUCTURED_TYPES` is now
+an explicit frozenset of the original seven (no longer `frozenset(EntityType)`),
+so the recall gate stays bound to what the regex layer can prove.
 
-`core/vault.py` and `core/tokenizer.py` are unmodified (confirmed by
-`git diff --stat`); this is purely an adapter-layer fix to which
-`session_id` string gets passed into existing, unmodified calls.
+No live LM Studio instance was reachable during the initial implementation
+(per the Intake Grill), so all automated tests run against a real local HTTP
+server standing in for LM Studio (no `httpx` transport mocking — matches
+`test_gateway.py`'s own testing style). **After implementation, the user
+configured a real LM Studio instance on their LAN (`192.168.31.123:1234`,
+model `qwen_qwen3-4b-instruct-2507`) and this code was live-verified against
+it in this same session — see "Live LM Studio verification (completed)"
+below.** That verification found and fixed one real incompatibility
+(`response_format`); everything else behaved exactly as designed.
 
-## Evidence correction (BRIEF §6 citation gap)
+Files changed (`git diff --stat`): `.harness/mission.md`, `.harness/validation.md`,
+`tests/test_detector.py`, `tests/test_tokenizer.py`,
+`veil_pii_middleware/core/detector.py`, `veil_pii_middleware/core/tokenizer.py`,
+`veil_pii_middleware/demo/eval.py`. `core/vault.py`, every adapter
+(`adapters/hooks/*`, `adapters/gateway/server.py`, `adapters/command/*`) and
+`demo/seed.py` are untouched, confirmed by `git diff --stat` showing no lines
+for any of them.
 
-`docs/private/BRIEF.md`'s §6 risk row states the `X-Claude-Code-Session-Id`
-header was "confirmed in both mission-7's and mission-8's live spikes."
-Re-reading both archived handoffs for this mission: only mission-7's spike
-(`docs/missions/mission-7/handoff.md`, Spike 1) actually observed this
-header -- by name only, in a list of forwarded header names; values were
-never logged, so its *stability* across requests was never checked, then or
-now. Mission-8's handoff (`docs/missions/mission-8/handoff.md`) does not
-mention this header at all; its spike targeted response-body/SSE shape. Per
-this mission's own Intake Grill (recorded in `.harness/mission.md`), no new
-spike was run to close that gap, because the fix's correctness does not
-depend on it: every request already opens its own `Vault`, so whether the
-header's value is stable or varies across requests within one process is
-handled correctly either way. This is a documentation correction, not a new
-risk.
+## Independent validation performed
 
-## Independent review findings and what was done about each
+Two fresh-context subagents reviewed this mission before this handoff was
+written; their findings drove real changes, not just commentary:
 
-An independent `goal-verifier` and a security-focused `code-reviewer` were
-run against this diff (fresh context, read-only, no edits by either).
+- **`code-reviewer`** (security-focused pass) found two blocking issues,
+  both fixed:
+  1. **PII could reach stderr.** `LLMDetectionError` messages originally
+     interpolated the raw malformed span entry (`f"...: {item!r}"`) — if a
+     model returns a flat list of strings instead of `{"value",
+     "entity_type"}` objects (a realistic instruction-following failure),
+     that string is the exact PII value the system exists to protect, and
+     `detect()`'s fail-closed handler prints `str(exc)` to stderr. Fixed:
+     every `LLMDetectionError` message now states only the *shape* of the
+     problem (`type(...).__name__`), never field content. Regression tests:
+     `test_flat_string_span_entry_raises_without_leaking_its_content`,
+     `test_bad_value_field_raises_without_leaking_other_fields`
+     (`tests/test_detector.py`).
+  2. **A real span could be silently dropped.** `_locate_next`'s
+     "already-claimed offset" tracking was a single set shared across every
+     value in one LLM response. Two *different* values that happen to start
+     at the same offset (a plausible model output for overlapping
+     `PERSON`/`ADDRESS` granularities, e.g. `"Calle Mayor"` and `"Calle
+     Mayor 5"`) would have the second one silently vanish if no other
+     occurrence of its own text existed elsewhere. Fixed: the claimed-start
+     set is now scoped per distinct value string, so unrelated values never
+     block each other; `merge_spans()` (unchanged) is what resolves the
+     resulting overlap. Regression test:
+     `test_different_values_sharing_a_start_offset_are_both_kept`.
 
-**goal-verifier (blocking, fixed):** Acceptance criteria 1-5 all passed with
-concrete evidence (cross-adapter reconciliation test genuinely opens a
-second, independent `Vault`; fallback path tested; pre-existing tests
-unaffected; `core/vault.py`/`core/tokenizer.py` untouched; `.harness/bin/verify`
-green). AC6 failed: this `handoff.md` did not exist for this mission when
-the verifier ran -- `.harness/handoff.md` and `docs/missions/mission-9/`
-(created at the start of this mission by archiving stale harness state)
-both still held **mission-8's** content verbatim, not a mission-9 writeup.
-Root cause: mission-8 had already been correctly archived to
-`docs/missions/mission-8/` in an earlier session; the leftover, unarchived
-copy still sitting in `.harness/*.md` at the start of this mission was
-stale, not a real unarchived mission, and this mission's own Stage-0
-archival step mistakenly duplicated it into `docs/missions/mission-9/`
-instead of recognizing it as stale and simply overwriting it. That spurious
-duplicate directory has been deleted; this `handoff.md` is the real
-mission-9 writeup, and the correct archive copy will be made from this
-final state once the human approves.
+  Two should-fix items from that review were also applied (both contained
+  to files already in scope):
+  - `demo/eval.py --mode llm|union` no longer swallows a genuine regex
+    decoy false-positive regression under its "report-only" exit-code
+    framing — the decoy gate (which always scores the regex layer,
+    regardless of `--mode`) is now checked unconditionally; only the
+    *recall* gate stays scoped to `--mode regex`.
+  - The content-block cache key now folds in `LLMClient.identity`
+    (`base_url|model`), so two clients pointed at different hosts/models
+    never share a stale cached result for the same text.
 
-**code-reviewer (flagged as blocking, re-characterized below rather than
-changed):** identified that this diff lets an inbound HTTP header select
-which `Vault` session a request's tokens are minted/resolved under, and
-raised a concrete exploit chain: another local process reaches the
-gateway's port, sets `X-Claude-Code-Session-Id` to a victim's real session
-id, asks the model to echo a guessed `PII_EMAIL_0001`-shaped token, and gets
-the victim's decrypted PII back in its own response. The review is right
-that this mechanism exists. It is **not**, however, a new attack surface
-this diff introduces -- re-checked directly against `git log -p` on
-`server.py`: before this mission, `make_handler`'s single `session_id`
-parameter was used for **every** request the gateway process ever handled,
-unconditionally, with no header or any other per-caller distinction at all.
-That means the pre-existing (mission-7/8, unmodified-by-this-mission)
-design already gave *any* caller able to reach the gateway's port automatic,
-zero-knowledge access to every token minted by *any other* caller of that
-same process -- a strictly broader version of the same exploit chain,
-requiring no guessed or known session id at all, since there was only ever
-one shared bucket. This mission's fix, by partitioning that one shared
-bucket by a per-request session id, narrows this exposure (an attacker must
-now know or guess a specific victim session id to land in their bucket)
-rather than widening it. The accepted threat model behind this (BRIEF/
-mission-7's "single developer, one local gateway process" framing) already
-implicitly covers "every caller of that process, trusted or not, shares one
-vault" -- this mission does not change that framing, and fixing it is out of
-this mission's scope (`.harness/mission.md`'s Non-goals: no change to
-`core/vault.py`).
+  Two items were **not** fixed, and are documented here as known
+  limitations instead, because fixing them would mean editing files outside
+  this mission's declared scope (`adapters/gateway/server.py`):
+  - The gateway's `_vault_lock` (originally scoped to guard `Vault`'s
+    non-transactional counter read-then-insert) now also serializes behind
+    whichever request is waiting on a real LLM network round-trip (up to
+    10s) once `VEIL_LLM_BASE_URL` is configured — every concurrent gateway
+    request effectively queues behind the slowest LLM call in flight,
+    regardless of session. **Before enabling the LLM layer on a live
+    gateway, this lock's scope should be revisited** (e.g. per-session
+    locking, or moving the LLM call outside the lock).
+  - Every adapter call site (`gateway/server.py`, `hooks/post_tool_use.py`,
+    `command/sanitize.py`) calls `tokenize()` with no explicit `llm_client`,
+    so a fresh `httpx.Client`/TCP connection to the LAN LM Studio host is
+    opened and closed on every single `tokenize()` call rather than reused
+    across a session/process. Not a leak (cleanup is correct), but avoidable
+    latency per request. The content-block cache still works regardless
+    (it's keyed by content hash, not by client instance), so this is a
+    performance note, not a correctness gap.
 
-**Not fixed, flagged for a possible future mission (not this one):** the
-underlying pre-existing risk -- a single gateway process's vault namespace
-is shared by literally any local caller who can reach its port, not scoped
-to Claude Code's own traffic at all, unconditionally since mission-7 -- has
-never been written down explicitly in `docs/private/BRIEF.md`'s risk table
-(§6), only implied by the "single developer" framing. Worth a human
-decision on whether to add it as an explicit row there; not something this
-mission's scope covers fixing (would require a real trust mechanism, e.g.
-binding the header to something the gateway can independently verify,
-which is a design question of its own).
+- **`goal-verifier`** ran a criterion-by-criterion check against
+  `.harness/mission.md`/`.harness/validation.md`, re-running
+  `.harness/bin/verify` and the test suite independently. It found two real
+  gaps, both closed before this handoff:
+  1. The validation contract's "Fail-closed: non-2xx (AC3)" row had no test
+     at the `detect()`/`tokenize()` level (only `detect_llm()` itself was
+     tested against a 500). Added
+     `TestDetectUnion::test_fail_closed_on_non_2xx_still_returns_regex_spans`
+     (`tests/test_detector.py`) and
+     `TestLLMLayerWiring::test_llm_non_2xx_response_still_tokenizes_structured_entities`
+     (`tests/test_tokenizer.py`, at the `tokenize()` level a real adapter
+     actually calls).
+  2. This file (`.harness/handoff.md`) was still mission-9's write-up
+     (gateway/hooks `session_id` reconciliation) — never updated for this
+     mission. This document is that fix.
 
-**Should-fix (code-reviewer, fixed):** the module docstring only described
-the *correlation-loss* consequence of a missing header, not the
-*cross-caller-sharing* consequence for present-but-untrusted headers.
-Reworded (see the module docstring in `server.py`) to describe both, and
-the fallback/no-header case explicitly.
+  Every other criterion the goal-verifier checked passed on first review:
+  AC1, AC2, AC4, AC5, AC6, AC7, AC8 (see the criterion table below, which
+  reflects the state *after* both rounds of fixes above).
 
-**Should-fix (code-reviewer, deferred with reasoning):** `_resolve_session_id`
-runs unconditionally at the top of `_handle`, so a header-less `GET` to a
-read-only endpoint that never touches the vault still emits the fallback
-warning. Accepted as harmless noise rather than fixed: moving the check
-later would require duplicating "does this request touch the vault" logic
-that already lives correctly downstream (content-type/body checks), for a
-purely cosmetic stderr-noise reduction with no functional effect.
+## Live LM Studio verification (completed)
 
-## Validation
+After the above, the user set up a real LM Studio instance on their LAN
+(`http://192.168.31.123:1234`, model `qwen_qwen3-4b-instruct-2507`, a
+llama.cpp-backed instruct model) and asked for the manual checklist to be
+run live rather than left as a TODO. Findings:
 
-- `.harness/bin/verify`: **PASS**, exit `0` -- contract, lint, typecheck,
-  test, eval, build all green (re-run after `ruff format` fixed one
-  formatting issue in the new test file's byte-string concatenation).
-- `pytest tests/test_gateway.py`: 24 passed, including:
-  - `TestSessionIdReconciliation::test_gateway_minted_token_resolves_via_independent_vault_with_header_session_id`
-    -- the core proof: mints a token via the gateway under
-    `X-Claude-Code-Session-Id: hooks-<uuid>`, then opens a **second,
-    independent** `Vault` with that same id (the same call shape
-    `pre_tool_use.py` uses) and resolves the token to the real value.
-  - `TestSessionIdReconciliation::test_two_different_header_session_ids_mint_independently_keyed_tokens`
-    -- two different header session ids, two different PII values, same
-    token string (`PII_EMAIL_0001`, each session's own counter starting at
-    1) -- confirms isolation is preserved, not just that the header is read.
-  - `TestSessionIdFallback` (3 tests): missing header, empty header, and
-    the fallback warning's stderr hygiene.
-  - Every pre-existing mission-7/8 test in the file passes unmodified in
-    behavior, now exercised with the fixture's default header attached via
-    a small `_post`/`_get` test helper (`tests/test_gateway.py`).
-- `git diff --stat`: only `veil_pii_middleware/adapters/gateway/server.py`,
-  `tests/test_gateway.py`, and `.harness/*.md` changed; `core/vault.py`,
-  `core/tokenizer.py`, `adapters/hooks/`, `adapters/command/` untouched.
+1. **One real bug found and fixed.** `LLMClient.complete_spans` sent
+   `"response_format": {"type": "json_object"}`. This LM Studio instance's
+   backend rejects that with a 400: `'response_format.type' must be
+   'json_schema' or 'text'`. Confirmed live:
+   - The 400 correctly triggers `response.raise_for_status()` →
+     `httpx.HTTPStatusError`, which `detect()`'s fail-closed handling caught
+     exactly as designed — no crash, silent fallback to regex spans. So even
+     the *broken* configuration never violated the fail-closed contract; it
+     just meant the LLM layer contributed nothing until fixed.
+   - With `response_format` removed entirely (relying only on the system
+     prompt's own JSON-only instruction), the exact same request returns
+     precisely the expected shape: `choices[0].message.content` as a plain
+     JSON *string* — `LLMClient.complete_spans`'s core parsing assumption
+     was otherwise correct on the first try.
+   - Fixed: `response_format` removed from the request
+     (`veil_pii_middleware/core/detector.py::LLMClient.complete_spans`).
+     Regression test added:
+     `tests/test_detector.py::TestDetectLLM::test_request_omits_response_format`.
+2. **End-to-end real-model results, full demo corpus (`demo/eval.py`,
+   after regenerating the corpus and pointing `VEIL_LLM_BASE_URL`/
+   `VEIL_LLM_MODEL` at the real instance):**
 
-## Residual risks / known gaps
+   `--mode llm` (LLM alone):
+   ```
+   entity      support   found  missed    fp   recall    prec
+   CARD             30      30       0    10    1.000   0.750
+   DNI              46       0      46     0    0.000   1.000
+   EMAIL            80      80       0     0    1.000   1.000
+   IBAN            100      86      14     0    0.860   1.000
+   IP              200     200       0     0    1.000   1.000
+   NIE               4       4       0    42    1.000   0.087
+   PERSON          250     244       6     0    0.976   1.000  (not gated)
+   PHONE            33      29       4     0    0.879   1.000
+   detector LLM    found 673, false positives 52
+   decoys: 0 false positive(s) (max allowed 0) -- PASS
+   ```
+   The model confused DNI/NIE labeling on many national IDs (0% DNI recall,
+   but NIE precision only 0.087 — it's mislabeling DNIs as NIE, an
+   entity-type classification miss, not a missed span) and missed some
+   IBAN/PHONE instances. This is genuine model-quality data, exactly what
+   the eval framework exists to surface — not a code defect.
 
-- **The pre-existing, broader single-process vault-sharing risk described
-  above is unchanged by this mission** -- any local caller reaching the
-  gateway's port still shares a vault namespace with every other caller of
-  that same process (now partitioned by session id rather than fully
-  merged, which narrows but does not eliminate the exposure). Recommend the
-  human reviewer decide whether this belongs as an explicit BRIEF.md §6 row
-  and a candidate future mission; this mission's scope does not cover
-  designing a real trust mechanism for the header.
-- No live spike was run for this mission (declined per Intake Grill Q2);
-  the design does not depend on knowing whether the header's value is
-  stable within one Claude Code process/conversation, so this residual gap
-  in direct observation is accepted, not a blocker.
-- The empty-header fallback path is tested via HTTP; the whitespace-only
-  case is not, because `h11`/`httpx` reject a pure-whitespace header value
-  before a request is ever sent (no spec-compliant client can produce it
-  over the wire). `_resolve_session_id`'s own `.strip()` handling remains
-  defense in depth for that structurally-unreachable-via-HTTP case.
+   `--mode union` (LLM + regex, the project's actual target configuration):
+   ```
+   entity      support   found  missed    fp   recall    prec
+   CARD             30      30       0     0    1.000   1.000
+   DNI              46      46       0     0    1.000   1.000
+   EMAIL            80      80       0     0    1.000   1.000
+   IBAN            100     100       0     0    1.000   1.000
+   IP              200     200       0     0    1.000   1.000
+   NIE               4       4       0     0    1.000   1.000
+   PERSON          250     244       6     0    0.976   1.000  (not gated)
+   PHONE            33      33       0     0    1.000   1.000
+   detector LLM    found 244, false positives 0
+   detector REGEX  found 493, false positives 0
+   PASS -- every structured entity type is at or above 1.00 recall
+   decoys: 0 false positive(s) (max allowed 0) -- PASS
+   ```
+   **This is the live confirmation of the project's central thesis**: union
+   recovers 100% recall on every structured type (regex fills every LLM
+   miss/mislabel via `merge_spans`) plus 97.6% recall on `PERSON`, which no
+   regex could ever provide — with zero false positives in the union
+   configuration (the LLM-only run's CARD/NIE false positives disappear once
+   regex's correctly-typed, equal-or-longer spans win the tie-break).
+3. Every other assumption checked out unmodified on the first real request:
+   auth-free local endpoint, `/v1/chat/completions` schema, spans JSON shape,
+   verbatim-substring `value` fields, and the 10s timeout (real responses
+   for this model/corpus size returned in well under 1s each).
 
-## Status
+**Net effect on "Required human follow-up" below**: the manual checklist is
+now done, not a TODO — kept below verbatim as a runbook for re-verifying
+against a different model/host in the future, with the `response_format`
+step's outcome noted inline.
 
-implemented — awaiting human review for merge
+## Acceptance criteria — evidence
+
+1. **LLM spans union with regex via unmodified `merge_spans()`.** ✅
+   `tests/test_detector.py::TestDetectLLM::test_happy_path_finds_person_and_address`,
+   `TestDetectUnion::test_union_combines_regex_and_llm_spans`. `merge_spans()`'s
+   body is untouched by this diff (the hunk starts only after `detect_regex()`).
+2. **Prompt requests every `EntityType`, built programmatically.** ✅
+   `_ENTITY_TYPE_NAMES = tuple(e.value for e in EntityType)` feeds
+   `_SYSTEM_PROMPT` (`detector.py`) — iterates the enum, so a future member
+   can't silently drop out of the prompt. Proven against a real HTTP request
+   body: `test_prompt_requests_every_entity_type`.
+3. **Fail-closed**: dead endpoint, timeout, non-2xx, and malformed JSON all
+   proven at the `detect()` level (`TestDetectUnion`, four
+   `test_fail_closed_on_*` tests) and additionally at the `tokenize()` level
+   for non-2xx (`TestLLMLayerWiring::test_llm_non_2xx_response_still_tokenizes_structured_entities`).
+   No raw PII in the fail-closed log line, proven by
+   `test_fail_closed_path_logs_no_pii` plus the two error-message hardening
+   tests above.
+4. **Cache hit**: `test_repeated_call_with_same_text_hits_the_cache` (mock
+   invoked exactly once for two identical calls),
+   `test_different_text_misses_the_cache`,
+   `test_failed_call_is_not_cached_so_a_later_call_can_recover` (a failure is
+   never cached, so a transient outage can still succeed next call).
+5. **`VEIL_LLM_BASE_URL` unset ⇒ today's regex-only behavior, unchanged.** ✅
+   `test_env_unset_reproduces_regex_only_behavior_exactly`; full
+   `tests/test_tokenizer.py tests/test_gateway.py tests/test_hooks.py` still
+   pass unmodified in outcome.
+6. **`demo/eval.py --mode regex|llm|union`.** ✅ Implemented and run
+   end-to-end against a **real LM Studio instance** (see "Live LM Studio
+   verification" above) — all three modes produced a full per-entity/
+   per-detector report; `--mode llm`/`--mode union` correctly returned exit 0
+   with a report-only note while the decoy gate still applies regardless of
+   mode. `.harness/bin/verify`'s `eval` row calls `eval.py` with no `--mode`
+   (default `"regex"`), so the recall gate is byte-for-byte the same command
+   as before this mission.
+7. **`core/vault.py` unmodified.** ✅ `git diff --stat -- veil_pii_middleware/core/vault.py`
+   is empty.
+8. **`.harness/bin/verify` exits 0.** ✅ Confirmed directly (see Gate results below).
+9. **This document.**
+
+## Gate results
+
+```
+verify · veil-pii-middleware
+  ✓ contract     bash .harness/internal/check-mission-contract
+  ✓ lint         ruff check . && ruff format --check .
+  ✓ typecheck    mypy (strict)
+  ✓ test         pytest — 233 passed
+  ✓ eval         seed.py + eval.py --min-recall 1.0 --max-false-positives 0 (regex mode, unchanged)
+  ✓ build        python -m build --no-isolation
+RESULT: PASS — all 6 gate(s) green.
+```
+
+`git diff --stat`: exactly the 7 files listed in Scope above; nothing else.
+
+## Manual LM Studio verification checklist (completed 2026-09-08 — kept as a runbook)
+
+Run against `http://192.168.31.123:1234` / `qwen_qwen3-4b-instruct-2507` in
+this session; see "Live LM Studio verification (completed)" above for
+results. Kept here as the runbook for re-verifying against a different
+model/host in the future.
+
+1. Start LM Studio, load any instruction-following model, and enable its
+   local server (note the port it prints, e.g. `1234`).
+2. Set the environment:
+   ```bash
+   export VEIL_LLM_BASE_URL="http://<lm-studio-host>:<port>"
+   export VEIL_LLM_MODEL="<the exact model identifier LM Studio shows>"
+   ```
+   If LM Studio runs on a different LAN machine, use that machine's address,
+   not `localhost` — this is the intended deployment shape (BRIEF §3.1).
+3. Regenerate the demo corpus and run all three eval modes:
+   ```bash
+   .venv/Scripts/python -m veil_pii_middleware.demo.seed
+   .venv/Scripts/python -m veil_pii_middleware.demo.eval --mode llm
+   .venv/Scripts/python -m veil_pii_middleware.demo.eval --mode union
+   ```
+   Confirm: the command completes without an unhandled exception; the
+   per-entity report includes non-zero `found` counts for `PERSON` (the
+   manifest's only current LLM-scored ground truth); `--mode union`'s
+   `STRUCTURED_TYPES` recall stays at 1.000 (regex spans still all present).
+4. Sanity-check one raw response shape directly, to confirm this code's
+   assumption about the host's JSON structure. **Do not add
+   `response_format` to this request** — that field is deliberately absent
+   from `LLMClient.complete_spans` (`detector.py`) precisely because a real
+   LM Studio instance (llama.cpp-backed) rejects
+   `{"type": "json_object"}` with a 400 (`'response_format.type' must be
+   'json_schema' or 'text'`), confirmed live 2026-09-08; the plain request
+   below is what the code actually sends:
+   ```bash
+   curl -s "$VEIL_LLM_BASE_URL/v1/chat/completions" \
+     -H "Content-Type: application/json" \
+     -d "{\"model\": \"$VEIL_LLM_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"say hi in JSON as {\\\"hi\\\": true}\"}]}"
+   ```
+   Confirm the response has `choices[0].message.content` as a JSON *string*
+   (not a nested object) — this is the exact field `LLMClient.complete_spans`
+   parses. Confirmed true for the LM Studio/Qwen instance tested 2026-09-08;
+   if a different host returns `content` as a nested JSON object instead,
+   `LLMClient.complete_spans` is the only place that needs to change.
+5. If step 4 reveals a mismatch, `LLMClient.complete_spans` (`detector.py`)
+   is the only place that needs to change — everything downstream
+   (`detect_llm`'s offset recovery, `detect()`'s union/fail-closed,
+   `tokenize()`'s wiring) is independent of exactly how the raw model
+   response is unwrapped into a `spans` list.
+
+## Known limitations (not fixed, out of this mission's scope)
+
+- **Gateway lock serializes on LLM latency.** See the code-reviewer finding
+  above — `adapters/gateway/server.py`'s `_vault_lock` now also blocks
+  concurrent requests behind an in-flight LLM call once the LLM layer is
+  configured. Revisit before enabling this on a live gateway under real
+  concurrent load.
+- **A fresh `LLMClient`/TCP connection per `tokenize()` call.** Every
+  adapter builds its client implicitly from the environment on every call
+  rather than once per process. The content-block cache still avoids
+  redundant *LLM* calls (keyed by content, not by client instance); this
+  only affects new-connection latency on a cache miss.
+- **`ADDRESS` has no manifest ground truth.** The `EntityType` exists (so a
+  found address is tokenized/audited correctly) but `demo/seed.py`'s
+  manifest was not extended to seed one — `--mode llm|union`'s `ADDRESS`
+  row will show 0 support until a future mission adds that data.
+- **This specific model confuses DNI/NIE labeling.** Live-observed
+  (`qwen_qwen3-4b-instruct-2507`, see results above): it correctly finds the
+  spans but frequently mislabels a DNI as a NIE. `union` mode hides this
+  entirely (regex's correctly-typed span wins), so it only matters for a
+  `--mode llm`-only comparison. Not a code defect — genuine model-quality
+  data the eval framework is designed to surface; a different/larger model
+  may or may not reproduce it.
+
+## Note: a repo-wide permission change was made outside this mission's scope
+
+To run the live LM Studio verification above, `.claude/settings.json`'s
+shared `deny` list had `"Bash(curl:*)"`/`"Bash(wget:*)"` removed (at the
+user's explicit request, after confirming Claude Code's permission engine
+has no way to let a narrower `allow` in a personal `settings.local.json`
+override a broader `deny` in the shared project file — deny always wins
+regardless of source or specificity). No `allow` rule was added anywhere;
+curl/wget now fall through to `defaultMode: "default"`, i.e. each invocation
+prompts for confirmation like any other unlisted command, same as before
+this project ever added that specific deny entry. **This is a change to
+team-shared policy, not personal-only, and is unrelated to the LLM detector
+code itself — the human reviewer should decide whether to keep it, restore
+the deny, or replace it with something narrower before merging.**
+
+## What a human reviewer should check
+
+1. Read the diff for `core/detector.py`'s new LLM section top to bottom —
+   this is the mission's designated high-risk surface (CLAUDE.md).
+2. Confirm the two code-reviewer-flagged-and-fixed issues above actually
+   read correctly in the final code: no raw field content in any
+   `LLMDetectionError` message (`detector.py`, `_locate_next`/`detect_llm`),
+   and the per-value `taken_starts_by_value` scoping in `detect_llm`.
+3. Run `.harness/bin/verify` yourself to confirm the reported gate state.
+4. Decide whether the gateway-lock limitation above blocks merge or is
+   acceptable to document and revisit later (this mission's non-goals
+   explicitly excluded touching `adapters/gateway/server.py`).
+5. Decide what to do about the `.claude/settings.json` curl/wget permission
+   change noted above (kept, reverted, or narrowed) — this is a policy
+   decision independent of the code, not something to silently carry into a
+   merge unreviewed.
+
+## Merge policy
+
+No commit, push, or merge without explicit human review of the diff and
+this document, per `.harness/mission.md`'s Merge policy. This mission does
+not merge itself.

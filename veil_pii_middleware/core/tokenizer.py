@@ -7,11 +7,17 @@ values on the way back in.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from typing import TypeAlias
 
-from veil_pii_middleware.core.detector import detect_regex, merge_spans
+from veil_pii_middleware.core.detector import (
+    LLM_BASE_URL_ENV_VAR,
+    LLM_MODEL_ENV_VAR,
+    LLMClient,
+    detect,
+)
 from veil_pii_middleware.core.vault import TokenNotFoundError, Vault, VaultIntegrityError
 
 __all__ = [
@@ -55,27 +61,58 @@ class TokenFormatOverflowError(ValueError):
     """
 
 
-def tokenize(value: JSONValue, vault: Vault) -> JSONValue:
-    """Replace every PII span ``detect_regex`` finds in ``value`` with a vault token.
+def _default_llm_client() -> LLMClient | None:
+    """Build an ``LLMClient`` from the environment, or ``None`` if unconfigured.
+
+    Both ``LLM_BASE_URL_ENV_VAR`` and ``LLM_MODEL_ENV_VAR`` must be set and
+    non-empty; otherwise the LLM layer is off, matching today's regex-only
+    behavior exactly -- no partial attempt at a network call with half a
+    configuration. The base URL is never defaulted to a fixed host/port.
+    """
+    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
+    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
+    if not base_url or not model:
+        return None
+    return LLMClient(base_url, model)
+
+
+def tokenize(value: JSONValue, vault: Vault, *, llm_client: LLMClient | None = None) -> JSONValue:
+    """Replace every PII span ``detect()`` finds in ``value`` with a vault token.
 
     Recurses into dicts and lists, tokenizing only string leaves; keys and
     non-string scalars are returned unchanged. Does not mutate ``value``.
+
+    ``llm_client`` is used for the whole call if supplied (recursion does not
+    rebuild it per string leaf); when omitted, one is built once from the
+    environment (``LLM_BASE_URL_ENV_VAR``/``LLM_MODEL_ENV_VAR``) -- ``None``
+    if either is unset, in which case this call is regex-only, identical to
+    before the LLM layer existed. A client built internally here is closed
+    before returning; one supplied by the caller is left open for the caller
+    to manage.
     """
+    client = llm_client if llm_client is not None else _default_llm_client()
+    try:
+        return _tokenize(value, vault, client)
+    finally:
+        if llm_client is None and client is not None:
+            client.close()
+
+
+def _tokenize(value: JSONValue, vault: Vault, llm_client: LLMClient | None) -> JSONValue:
     if isinstance(value, str):
-        return _tokenize_text(value, vault)
+        return _tokenize_text(value, vault, llm_client)
     if isinstance(value, dict):
-        return {key: tokenize(item, vault) for key, item in value.items()}
+        return {key: _tokenize(item, vault, llm_client) for key, item in value.items()}
     if isinstance(value, list):
-        return [tokenize(item, vault) for item in value]
+        return [_tokenize(item, vault, llm_client) for item in value]
     return value
 
 
-def _tokenize_text(text: str, vault: Vault) -> str:
-    # detect_regex() already merges its own candidates, but this still routes
-    # through merge_spans() explicitly: that is where a future LLM-layer span
-    # list unions in, and this function must not assume regex is the only
-    # source of spans.
-    spans = merge_spans(detect_regex(text))
+def _tokenize_text(text: str, vault: Vault, llm_client: LLMClient | None) -> str:
+    # Routes through detect() rather than assuming regex is the only source
+    # of spans -- this is where the LLM layer's spans union in, gated by
+    # whether llm_client is set (see tokenize()'s docstring).
+    spans = detect(text, llm_client=llm_client)
     # Right-to-left by start offset: substituting a token of a different
     # length than the original span must not invalidate the offsets of spans
     # still waiting to be replaced.

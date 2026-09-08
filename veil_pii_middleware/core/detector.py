@@ -1,13 +1,24 @@
 """Hybrid detection: deterministic regex layer unioned with a local LLM layer.
 
 Regex covers email, DNI/NIE, IBAN, Spanish phones, credit cards and IPs with
-mandatory check-digit validation. The local model (via Ollama) covers person
-names, addresses and indirect references, and must return spans as JSON --
-never rewritten text. On overlap the longest span wins; ties go to regex.
+mandatory check-digit validation. The LLM layer, reached over an OpenAI-
+compatible ``/v1/chat/completions`` endpoint (LM Studio, or anything else
+serving that schema), is asked for every entity type this module knows about
+-- not just names -- so recall can be compared per entity type per detector,
+and must return spans as JSON, never rewritten text. On overlap the longest
+span wins; ties go to regex.
 
-This module implements the deterministic layer only. It is the guaranteed
-floor: when the local model is down, returns malformed JSON, or silently skips
-a row, every entity below is still detected.
+The LLM layer is switched on only when a caller supplies a constructed
+``LLMClient`` to ``detect()``; nothing in this module reads the environment
+itself. ``VEIL_LLM_BASE_URL``/``VEIL_LLM_MODEL`` are the environment variables
+callers are expected to read to build one -- the base URL is never hardcoded
+to any host or port, since the model may run on a different, more powerful
+machine on the same LAN rather than on ``localhost``.
+
+Fail-closed floor: ``detect()`` catches any failure from the LLM leg --
+connection refused, timeout, non-2xx, malformed JSON, an unexpected response
+shape -- and falls back to the regex layer's spans alone. Every entity below
+is still detected when the LLM endpoint is down, slow, or misbehaving.
 
 Check-digit validation is mandatory rather than cosmetic. A bare nine-digit
 run is an order number as often as a phone, and a sixteen-digit run is a
@@ -29,17 +40,30 @@ are addresses, unambiguously.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Any, Final
+
+import httpx
 
 __all__ = [
+    "DEFAULT_LLM_TIMEOUT_SECONDS",
+    "LLM_BASE_URL_ENV_VAR",
+    "LLM_MODEL_ENV_VAR",
     "STRUCTURED_TYPES",
     "Detector",
     "EntityType",
+    "LLMClient",
+    "LLMDetectionError",
     "Span",
+    "clear_llm_cache",
+    "detect",
+    "detect_llm",
     "detect_regex",
     "merge_spans",
     "valid_card",
@@ -53,7 +77,14 @@ __all__ = [
 
 
 class EntityType(StrEnum):
-    """Entity kinds the deterministic layer can prove with a check digit."""
+    """Every entity kind either layer can emit.
+
+    ``EMAIL`` through ``IP`` are provable with a check digit by the
+    deterministic layer; ``PERSON`` and ``ADDRESS`` cannot be, and are
+    produced only by the LLM layer. An indirect reference to a person (e.g.
+    "the son of the Acme administrator") is not a separate member -- it is
+    still a ``PERSON`` match, just on the phrase that identifies them.
+    """
 
     EMAIL = "EMAIL"
     DNI = "DNI"
@@ -62,6 +93,8 @@ class EntityType(StrEnum):
     PHONE = "PHONE"
     CARD = "CARD"
     IP = "IP"
+    PERSON = "PERSON"
+    ADDRESS = "ADDRESS"
 
 
 class Detector(StrEnum):
@@ -71,8 +104,22 @@ class Detector(StrEnum):
     LLM = "LLM"
 
 
-#: Every type this layer emits. The recall gate holds these to 100%.
-STRUCTURED_TYPES: Final = frozenset(EntityType)
+#: The seven check-digit-provable types the deterministic layer guarantees.
+#: Deliberately *not* ``frozenset(EntityType)`` -- ``PERSON``/``ADDRESS`` are
+#: real ``EntityType`` members but the regex layer can never produce them, so
+#: the 100% recall gate (bound to this set) must not silently start expecting
+#: it to.
+STRUCTURED_TYPES: Final = frozenset(
+    {
+        EntityType.EMAIL,
+        EntityType.DNI,
+        EntityType.NIE,
+        EntityType.IBAN,
+        EntityType.PHONE,
+        EntityType.CARD,
+        EntityType.IP,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,3 +367,266 @@ def detect_regex(text: str) -> list[Span]:
                 )
             )
     return merge_spans(found)
+
+
+# --------------------------------------------------------------------------
+# LLM layer
+# --------------------------------------------------------------------------
+
+#: Environment variable the base URL of an OpenAI-compatible chat-completions
+#: endpoint is read from by callers building an `LLMClient` -- never a
+#: hardcoded host or port. The model may run on a separate, more powerful
+#: machine on the same LAN (LM Studio's use case for this project), not
+#: necessarily `localhost`.
+LLM_BASE_URL_ENV_VAR: Final = "VEIL_LLM_BASE_URL"
+
+#: Environment variable the model name is read from. LM Studio (unlike
+#: Ollama) has no usable default -- it must match whatever model the host
+#: actually has loaded.
+LLM_MODEL_ENV_VAR: Final = "VEIL_LLM_MODEL"
+
+#: Single attempt, no retry: a debugging session must not stall on every
+#: cache-miss block if the endpoint is genuinely down, but a LAN-local host
+#: under light load should comfortably finish well inside this.
+DEFAULT_LLM_TIMEOUT_SECONDS: Final = 10.0
+
+_ENTITY_TYPE_NAMES: Final = tuple(entity_type.value for entity_type in EntityType)
+
+_SYSTEM_PROMPT: Final = (
+    "You are a PII span detector for a debugging tool. Given a block of "
+    "text, find every instance of these entity types: "
+    + ", ".join(_ENTITY_TYPE_NAMES)
+    + ". Respond with ONLY a JSON object of the exact shape "
+    '{"spans": [{"value": "<exact substring copied from the text>", '
+    '"entity_type": "<one of the listed types>"}, ...]} -- no prose, no '
+    "markdown code fences, no explanation, nothing before or after the JSON. "
+    'If nothing matches, respond with exactly {"spans": []}. Never rewrite, '
+    "paraphrase, translate, summarize, or correct the text -- every `value` "
+    "must be copied character-for-character exactly as it appears in the "
+    "input, so it can be located by an exact substring match. Treat an "
+    "indirect reference that identifies a specific person (for example "
+    '"the son of the Acme administrator") as a PERSON match on the phrase '
+    "that identifies them, not a separate category."
+)
+
+
+class LLMDetectionError(Exception):
+    """Raised when the LLM layer's response cannot be trusted as spans.
+
+    Covers a non-2xx status, a body that is not JSON, or JSON that does not
+    match the expected ``{"spans": [...]}`` shape. Always caught by
+    ``detect()``, which falls back to the regex layer's spans -- this
+    exception should never reach a caller of ``detect()`` itself.
+    """
+
+
+class LLMClient:
+    """Client for an OpenAI-compatible ``/v1/chat/completions`` endpoint.
+
+    Written against the schema both Ollama and LM Studio serve, not any
+    Ollama-native-only API -- this is what makes swapping hosts a config
+    change, not a code change. ``base_url``/``model`` must be supplied by the
+    caller (read from ``LLM_BASE_URL_ENV_VAR``/``LLM_MODEL_ENV_VAR`` at the
+    edges that build one); this class never reads the environment or
+    hardcodes a default host itself.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        *,
+        timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._client = httpx.Client(base_url=self._base_url, timeout=httpx.Timeout(timeout_seconds))
+
+    @property
+    def identity(self) -> str:
+        """``base_url``/``model`` this client targets -- folded into the content-block
+        cache key so two clients pointed at different hosts/models never share a
+        cached result for the same text (see ``_cache_key``).
+        """
+        return f"{self._base_url}|{self._model}"
+
+    def complete_spans(self, text: str) -> list[dict[str, Any]]:
+        """POST one chat-completion request; return the raw parsed ``spans`` list.
+
+        Deliberately does not set ``response_format`` -- live-tested
+        (2026-09-08) against a real LM Studio instance running a
+        llama.cpp-backed model: that server 400s on
+        ``{"type": "json_object"}`` (it accepts only ``json_schema`` or
+        ``text``), while the exact same request with no ``response_format``
+        at all gets back precisely the requested ``{"spans": [...]}`` shape
+        as a plain string in ``choices[0].message.content`` -- the system
+        prompt's own instruction is sufficient, and omitting the field is
+        more portable across OpenAI-compatible servers than depending on one
+        server's structured-output dialect. Raises ``LLMDetectionError``
+        (malformed response) or an ``httpx`` exception (connection/timeout/
+        non-2xx) on any failure -- never falls back to anything itself.
+        ``detect_llm`` validates and offsets each entry; callers further up
+        (``detect``) catch every exception from this method and fail closed
+        to the regex layer's spans.
+        """
+        response = self._client.post(
+            "/v1/chat/completions",
+            json={
+                "model": self._model,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Text:\n{text}"},
+                ],
+            },
+        )
+        response.raise_for_status()
+        try:
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            spans = parsed["spans"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
+        if not isinstance(spans, list):
+            raise LLMDetectionError(f"'spans' must be a list, got {type(spans).__name__}")
+        return spans
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> LLMClient:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+#: Content-block cache: content hash -> the spans `detect_llm` found for it
+#: last time. Scoped to this process's lifetime -- the gateway's target use
+#: case is one long-running process per debugging session, so a query result
+#: that recurs across turns is analyzed by the LLM once, not every turn.
+#: Never caches a failure, so a transient outage can still succeed next call.
+_llm_span_cache: dict[str, list[Span]] = {}
+
+
+def _cache_key(text: str, client_identity: str) -> str:
+    return hashlib.sha256(f"{client_identity}|{text}".encode()).hexdigest()
+
+
+def _locate_next(text: str, value: str, taken_starts: set[int]) -> int | None:
+    """Find an occurrence of ``value`` in ``text`` not already in ``taken_starts``.
+
+    The model returns matched values, not trustworthy offsets -- it cannot be
+    trusted to count characters correctly -- so each value is located here
+    instead. ``taken_starts`` must be scoped to this *same* value (see
+    ``detect_llm``): two identical values in one response correctly claim
+    two different occurrences of themselves rather than colliding on the
+    first one, but two *different* values that happen to start at the same
+    offset (e.g. "Calle Mayor" and "Calle Mayor 5") must never block each
+    other -- ``merge_spans`` is what resolves that overlap, not this
+    function. A value the model hallucinated (never appears verbatim)
+    returns ``None`` and is skipped by the caller, never fabricated at a
+    default offset.
+    """
+    start = text.find(value)
+    while start != -1:
+        if start not in taken_starts:
+            return start
+        start = text.find(value, start + 1)
+    return None
+
+
+def detect_llm(text: str, client: LLMClient) -> list[Span]:
+    """Ask ``client`` for spans over ``text``, validated and offset into it.
+
+    Raises ``LLMDetectionError`` or an ``httpx`` exception on any malformed
+    or failed response -- callers must catch and fail closed (``detect``
+    does this). Every raised message describes only the *shape* of the bad
+    entry (its type, or which field was wrong) -- never its content, since a
+    malformed entry's content can itself be the raw PII this whole module
+    exists to keep out of any log. Results are cached by content hash (see
+    ``_llm_span_cache``), so a repeated block within this process is not
+    re-sent to the model.
+    """
+    key = _cache_key(text, client.identity)
+    cached = _llm_span_cache.get(key)
+    if cached is not None:
+        return cached
+
+    raw_spans = client.complete_spans(text)
+    valid_types = {entity_type.value for entity_type in EntityType}
+    # Scoped per distinct value, not shared across every value in the
+    # response: two different values that happen to start at the same
+    # offset (a plausible model output for overlapping PERSON/ADDRESS
+    # granularities) must not block each other from being located --
+    # merge_spans() is what resolves that overlap, once both candidates
+    # exist.
+    taken_starts_by_value: dict[str, set[int]] = {}
+    found: list[Span] = []
+    for item in raw_spans:
+        if not isinstance(item, dict):
+            raise LLMDetectionError(f"span entry is not an object (got {type(item).__name__})")
+        value = item.get("value")
+        entity_type_raw = item.get("entity_type")
+        if not isinstance(value, str) or not value:
+            raise LLMDetectionError(
+                f"span entry's 'value' must be a non-empty string (got {type(value).__name__})"
+            )
+        if entity_type_raw not in valid_types:
+            raise LLMDetectionError(
+                f"span entry has an unrecognized entity_type (got {type(entity_type_raw).__name__})"
+            )
+        taken_starts = taken_starts_by_value.setdefault(value, set())
+        start = _locate_next(text, value, taken_starts)
+        if start is None:
+            continue
+        taken_starts.add(start)
+        found.append(
+            Span(
+                start=start,
+                end=start + len(value),
+                entity_type=EntityType(entity_type_raw),
+                text=value,
+                detector=Detector.LLM,
+            )
+        )
+    _llm_span_cache[key] = found
+    return found
+
+
+def clear_llm_cache() -> None:
+    """Drop every cached LLM result. Exposed for tests and process-lifetime resets."""
+    _llm_span_cache.clear()
+
+
+def detect(
+    text: str,
+    *,
+    use_regex: bool = True,
+    use_llm: bool = True,
+    llm_client: LLMClient | None = None,
+) -> list[Span]:
+    """Union the regex and LLM layers over ``text``, per the enabled flags.
+
+    ``use_llm`` has no effect unless ``llm_client`` is also supplied -- this
+    is the "switchable off" entry point: a caller with no client (e.g.
+    ``VEIL_LLM_BASE_URL`` unset) gets exactly today's regex-only behavior,
+    with no attempt at a network call. When a client is supplied, any
+    failure on that leg -- connection refused, timeout, non-2xx, malformed
+    JSON -- is caught here and logged (no PII/secret), falling back to
+    whatever ``use_regex`` alone produced rather than propagating.
+    """
+    spans: list[Span] = []
+    if use_regex:
+        spans.extend(detect_regex(text))
+    if use_llm and llm_client is not None:
+        try:
+            spans.extend(detect_llm(text, llm_client))
+        except Exception as exc:
+            print(
+                f"veil detector: LLM layer failed ({type(exc).__name__}: {exc}), "
+                "falling back to regex-only spans for this block",
+                file=sys.stderr,
+            )
+    return merge_spans(spans)

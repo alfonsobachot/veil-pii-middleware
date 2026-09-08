@@ -2,24 +2,18 @@
 
 ## Objective
 
-Reconcile the `session_id` used to key the gateway's `Vault`
-(`veil_pii_middleware/adapters/gateway/server.py::_new_session_id()`) with
-the real Claude Code `session_id` the hooks adapters already use
-(`adapters/hooks/pre_tool_use.py`, `adapters/hooks/post_tool_use.py`, both
-reading `payload["session_id"]`). Today the gateway mints its own
-`gateway-<uuid>` once per process; a token minted by one mechanism cannot be
-resolved by the other. `docs/private/BRIEF.md` §6 (risk row added
-2026-09-07) and §8 item 10c record this as the top-priority day-2 item: it
-breaks the project's own central scenario (BRIEF §1) — gateway and hooks
-both active on the same session, now the documented normal mode of use, not
-an edge case (§2.1 correction, 2026-09-07) — the first time both adapters
-handle the same conversation.
-
-Fix: read the `X-Claude-Code-Session-Id` request header (confirmed present
-on real Claude Code traffic by mission-7's live spike — header *name* only,
-values are never logged; see Evidence below for what mission-8 did and did
-not separately confirm) and key that request's `Vault` by it, instead of the
-fixed per-process UUID.
+Implement the probabilistic (LLM) detection layer in
+`veil_pii_middleware/core/detector.py` (BRIEF §3.1, work-plan item 11),
+targeting LM Studio as the actual host via its OpenAI-compatible
+`/v1/chat/completions` endpoint. Today `core/detector.py` implements the
+regex layer only; `Detector` already has `REGEX`/`LLM` members and `Span`
+already accepts either, but nothing produces an `LLM` span. Wire the new
+layer into `core/tokenizer.py::_tokenize_text()` (currently hardcoded to
+`detect_regex()` + `merge_spans()`) so gateway/hooks traffic actually
+benefits, and into `demo/eval.py` so regex-only / LLM-only / union recall
+and precision are reported per entity type per detector — this project's
+central comparison artifact per user decision (see memory:
+`llm-layer-covers-all-entities`).
 
 ## Routing
 
@@ -32,108 +26,167 @@ Validation plan: .harness/validation.md
 
 | Question | Answer / Evidence |
 |---|---|
-| What should happen if the header is missing/empty/malformed on a request (universality across every `ANTHROPIC_BASE_URL`-speaking client, not just Claude Code, is unconfirmed)? | Fall back to the existing per-process UUID (`_new_session_id()`, generated once at gateway startup, unchanged mechanism) and log a stderr warning. Not a fail-closed case: CLAUDE.md's fail-closed doctrine guards detection/tokenization capability (a request that can't be scanned must not be forwarded raw) — this header only selects which vault a token is correlated under; its absence loses cross-adapter correlation for that request, not the "no raw PII to an external API" guarantee, which the outbound `tokenize()` call still provides unconditionally either way. Blocking here would break today's working gateway-only usage (no hooks in play) for any client that doesn't send this exact header, a population this project has not verified. |
-| Can the header's value change across requests within one gateway process's lifetime (e.g. Claude Code varies it within one conversation)? Unconfirmed by either prior spike's evidence. | Does not need a live spike to resolve, and does not gate the design: `server.py`'s three request-time call sites (`_tokenize_body`, the SSE response path, `_relay_buffered_response`) already open a fresh `Vault` per request rather than holding one open for the process's lifetime (verified by reading current `_handle()` — each opens its own `with Vault(...)`). Reconciliation is therefore just "read the header once per request and pass that value to the `Vault(...)` calls this request already makes" — no change to `Vault`'s lifetime management, so the header varying or not varying between requests is handled correctly either way without needing to confirm which. The throwaway live spike was explicitly declined for this reason (see Non-goals). |
-| How should `tests/test_gateway.py`'s fixture change, given it builds the handler with `gateway_server._new_session_id()` directly and no test request sends the header today? | The fixture gets a fixed, hook-shaped test session id distinct from the `gateway-<uuid>` format (e.g. `hooks-<uuid>`, making it unambiguous in assertions which id space a token was minted under); a small test-local request helper attaches the header by default so every existing test becomes representative of real Claude Code traffic (which always sends this header, per mission-7's spike) without individually editing each assertion. One dedicated new test omits the header explicitly to keep the fallback-to-per-process-UUID path covered. |
-| Should the suite prove real cross-adapter reconciliation, not just that the gateway reads the header? | Yes: a new test opens a second `Vault(VAULT_DB_PATH, <the header's session id>)` directly — the same call shape `pre_tool_use.py` makes from a hook payload's `session_id` — and resolves a token the gateway minted under that id via the header. This is the actual proof the fix works, without invoking hooks code (out of scope). |
+| How should the LLM layer be switchable off, mechanically? | A new `detect(text, *, use_regex=True, use_llm=True, llm_client=None) -> list[Span]` entry point in `core/detector.py`, taking plain booleans/an optional client — no env-var reads inside `core/`. `merge_spans()` is unchanged and already handles the union. Callers (tokenizer.py's wiring, eval.py's CLI, tests) decide the booleans; env vars are read only at those outer edges, matching the codebase's existing free-function style (no new config class). |
+| Is there a live LM Studio instance reachable right now to spike the client against, the way mission-7/8 live-tested the gateway? | No. Build and test the client entirely against a mocked HTTP layer (an `httpx` transport mock, matching `test_gateway.py`'s own pattern for the Anthropic API). `.harness/handoff.md` will carry a concrete manual verification checklist for running it against a real LM Studio instance later, before the client is trusted end-to-end. |
+| Does this mission update `core/tokenizer.py::_tokenize_text()` (currently hardcoded to `detect_regex()`+`merge_spans()`) so the LLM layer is live for gateway/hooks traffic, not just reachable from tests/eval.py? | Yes. `_tokenize_text()` switches to the new `detect()` call; whether `use_llm` is `True` is decided once per call from whether `VEIL_LLM_BASE_URL` is set (see below) — this is what tokenizer.py's own existing comment already anticipates ("that is where a future LLM-layer span list unions in"). |
+| Does `demo/eval.py` need per-layer (regex-only / LLM-only / union) run modes in this mission? | Yes. Per standing project memory (`llm-layer-covers-all-entities`), this is "the demo's central comparison artifact." The existing 100%-recall gate (`.harness/bin/verify`'s `eval` row) stays bound to the regex-only configuration and `STRUCTURED_TYPES` (the original 7 regex-provable types, unchanged) — an LLM-only run is reported, never gated, since it will not reach 1.000 recall and gating it would leave the gate permanently red. |
+| What EntityType taxonomy should the LLM layer target for what regex can't prove? | Add exactly two new `EntityType` members: `PERSON` and `ADDRESS`. `demo/seed.py` already uses the literal string `"PERSON"` for its manifest ground truth (full names in `users.full_name` and `error_logs.message`); `ADDRESS` has no manifest ground truth yet (0 support in `eval.py` until a future mission seeds one), but the type exists so a found address is tokenized/audited correctly rather than mis-typed. "Indirect references" (BRIEF's third example, e.g. "the son of the Acme administrator") are not a separate taxonomy leaf — the prompt still asks the model to resolve them, but the span returned is `entity_type=PERSON` (an indirect reference is a style of naming a person, not a different value type). |
+| What timeout should the LLM call use before falling back to regex-only spans? | 10 seconds, single attempt, no retry. Generous enough for a LAN-local LM Studio host under light load; short enough that a hung endpoint does not stall every cache-miss block of a debugging session. Any exception on that call — connect error, timeout, non-2xx, malformed/unparseable JSON, a response shape that doesn't match the expected spans schema — triggers the same fallback path. |
 
-Evidence gathered before asking: mission-7's live spike (`docs/missions/mission-7/handoff.md`,
-Spike 1) captured real outbound header *names* from a live Claude Code
-request and confirmed `X-Claude-Code-Session-Id` is present — values were
-never logged, so its *stability across requests* was never checked, then or
-since. Contrary to `docs/private/BRIEF.md`'s §6 risk-row phrasing ("confirmed
-in both mission-7's and mission-8's live spikes"), mission-8's own handoff
-(`docs/missions/mission-8/handoff.md`) does not independently mention this
-header at all — its spike focused on response-body/SSE shape, not request
-headers. This mission's design (previous answer) does not depend on closing
-that gap, so it is noted here as a documentation correction, not chased with
-a new spike. `adapters/hooks/pre_tool_use.py`/`post_tool_use.py` both already
-validate `session_id` as "a non-empty `str`, else block/warn" with no
-further format constraint — this mission's header validation matches that
-existing precedent rather than inventing a stricter schema.
+Evidence gathered before asking: `core/detector.py`'s current docstring, `EntityType`/`Detector`
+enums, `Span`, `merge_spans()`, `STRUCTURED_TYPES = frozenset(EntityType)`;
+`core/tokenizer.py::_tokenize_text()`'s existing "future LLM-layer" comment;
+`demo/seed.py`'s `PERSON` manifest constant; `demo/eval.py`'s `by_detector`
+breakdown already keyed by `Detector` value; `pyproject.toml` (httpx already a
+runtime dependency, no new HTTP library needed); BRIEF §3.1, §6, §7 item 4,
+§8 items 11-12; memory `llm-layer-covers-all-entities` (user override:
+LLM layer must attempt every entity type, not just names, and the regex
+layer must be switchable off).
 
 ## Scope
 
-- `veil_pii_middleware/adapters/gateway/server.py`: read the
-  `X-Claude-Code-Session-Id` request header once per request in `_handle()`;
-  use it (if present and non-empty after stripping whitespace) as the
-  `session_id` passed to every `Vault(...)` call this request already makes
-  (`_tokenize_body`, the SSE response path, `_relay_buffered_response`);
-  otherwise fall back to the existing per-process UUID from
-  `_new_session_id()` and log a stderr warning (no PII, no secret — matching
-  existing stderr-safety precedent). `make_handler`'s `session_id` parameter
-  becomes explicitly the *fallback* default, documented as such. `main()`'s
-  startup log line is reworded so it no longer implies one fixed session
-  governs every request.
-- `tests/test_gateway.py`: fixture carries a fixed, hook-shaped test session
-  id and a request helper that attaches the header by default; a new test
-  covering the header-missing fallback path; a new test proving real
-  cross-adapter reconciliation by directly resolving a gateway-minted token
-  through a second `Vault` opened with the header's session id (mimicking
-  `pre_tool_use.py`'s own call shape).
+- `veil_pii_middleware/core/detector.py`:
+  - Two new `EntityType` members: `PERSON`, `ADDRESS`.
+  - `STRUCTURED_TYPES` becomes an explicit frozenset of the original seven
+    regex-provable types (`EMAIL, DNI, NIE, IBAN, PHONE, CARD, IP`) — no
+    longer `frozenset(EntityType)`, since that would silently pull in the two
+    new LLM-only members and break the recall gate's scoping the moment they
+    are added.
+  - An `LLMClient` (or equivalently named) class wrapping an OpenAI-compatible
+    `/v1/chat/completions` call via `httpx`: base URL from `VEIL_LLM_BASE_URL`
+    (env var, never hardcoded to any host/port), model name from
+    `VEIL_LLM_MODEL`, 10s timeout, no retry. Constructed from the environment
+    once by callers (tokenizer.py's wiring, eval.py's CLI), not read
+    internally by `detect()` on every call.
+  - A prompt requiring the model to return spans as strict JSON only (never
+    rewritten text) covering every `EntityType` member — the seven structured
+    types plus `PERSON`/`ADDRESS` — with an explicit instruction that an
+    indirect reference to a person still resolves to `PERSON`.
+  - `detect_llm(text, client) -> list[Span]`: calls the client, offsets spans
+    against `text` by finding the returned value's location (the model
+    returns values, not authoritative offsets, since an LLM cannot be
+    trusted to count characters correctly); parses/validates the JSON
+    response and raises on any malformed/unexpected shape. On success, spans
+    are tagged `Detector.LLM`.
+  - A content-block hash cache: an in-memory, module-level mapping from
+    `sha256(text)` to that block's cached `detect_llm` result, so a repeated
+    block within one process's lifetime (the gateway's target use case — one
+    long-running process per debugging session) is not re-sent to the LLM.
+    Scoped to one process; not persisted to disk (hooks run as short-lived
+    per-invocation processes today and gain no benefit from a cache that
+    resets every call — out of scope to change that).
+  - `detect(text, *, use_regex=True, use_llm=True, llm_client=None) ->
+    list[Span]`: unions `detect_regex()` (if `use_regex`) and `detect_llm()`
+    (if `use_llm` and a client is supplied) via the existing `merge_spans()`,
+    fail-closed on the LLM leg — any exception from `detect_llm()` is caught
+    and logged (no PII/secret), and the call returns the regex spans (or an
+    empty list if `use_regex=False` too) rather than propagating.
+- `veil_pii_middleware/core/tokenizer.py`: `_tokenize_text()` calls the new
+  `detect()` instead of `detect_regex()`+`merge_spans()` directly. `use_llm`
+  is decided once per call from whether `VEIL_LLM_BASE_URL` is set (empty/
+  unset → `use_llm=False`, so every existing caller and test that does not
+  set this env var is completely unaffected — no new network calls, no new
+  timeouts, behavior identical to today). When set, an `LLMClient` is built
+  from the environment and passed through.
+- `veil_pii_middleware/demo/eval.py`: `evaluate()` gains a way to run in
+  three modes — regex-only (today's default, unchanged), LLM-only, and union
+  — reporting recall/precision per entity type per detector for each. The
+  `--min-recall`/`--max-false-positives` gate stays scoped to
+  `STRUCTURED_TYPES` under the regex-only configuration; LLM-only/union runs
+  are reported, not gated.
+- `tests/test_detector.py`: tests for `detect_llm`/`detect` against a mocked
+  HTTP layer — happy path (valid JSON spans for each new entity type),
+  malformed JSON, timeout, non-2xx, and the fail-closed fallback to regex
+  spans in each failure case; cache-hit behavior (same content-block hash
+  does not re-invoke the mocked client).
+- `tests/test_tokenizer.py`: a test proving `_tokenize_text()`/`tokenize()`
+  is unaffected when `VEIL_LLM_BASE_URL` is unset (today's existing
+  behavior, still regex-only), and a test proving an LLM-detected span (via
+  a mocked client) is tokenized the same way a regex span is.
+- `.harness/handoff.md`: a concrete manual verification checklist for
+  running the client against a real LM Studio instance (start LM Studio,
+  load a model, set `VEIL_LLM_BASE_URL`/`VEIL_LLM_MODEL`, run a scripted
+  check), since no live spike was possible in this mission.
 
 ## Non-goals
 
-- Any change to `core/vault.py` or `core/tokenizer.py` — this is purely a
-  "which `session_id` string gets passed in" fix at the adapter layer; the
-  vault/tokenizer contract is unmodified.
-- Any change to `adapters/hooks/pre_tool_use.py`/`post_tool_use.py` — they
-  already do the correct thing (use the real session id from their own
-  payload); this mission makes the gateway match them, not the reverse.
-- A live spike to confirm whether the header's value is stable or varies
-  within one Claude Code process/conversation — declined; the design
-  (per-request `Vault` opens, unchanged) is correct regardless of the
-  answer, so nothing gates on it (Intake Grill, Q2).
-- Local LLM detector layer, `input_json_delta`/tool-call-argument rewriting,
-  and `MessageDisplay`/`/reveal` — all already out of scope per prior
-  missions' decisions, not reopened here.
-- Format/schema validation of the header value beyond "non-empty after
-  stripping whitespace" — matches existing `session_id` validation
-  precedent in the hooks adapters; no new validation invented.
-- Multi-process/concurrent-gateway vault correlation — mission-7's accepted
-  limitation, unchanged.
+- Any change to `core/vault.py` — untouched by this mission.
+- `adapters/hooks/pre_tool_use.py`/`post_tool_use.py` and
+  `adapters/gateway/server.py` — none of them call `detect_regex()`/`detect()`
+  directly (they call through `core/tokenizer.py`), so no adapter file needs
+  editing; they inherit the new behavior automatically once
+  `_tokenize_text()` is wired and `VEIL_LLM_BASE_URL` is set in their
+  environment. Not verified live against a real LM Studio instance in this
+  mission (see the live-spike answer above).
+- A disk-persisted/cross-process cache for the content-block hash — the
+  in-memory, per-process cache is the target use case (the gateway's
+  long-running process); making hooks' short-lived processes benefit too is
+  a separate, unrequested change.
+- `ADDRESS` ground truth in `demo/seed.py`'s manifest — the entity type is
+  added to the taxonomy so a found address is correctly typed, but seeding
+  actual address instances into the demo corpus is not part of this mission.
+- A generic "indirect reference" `EntityType` member — folded into `PERSON`
+  per the Intake Grill answer above.
+- Retry/backoff policy for the LLM call beyond a single attempt — a prior
+  explicit decision (10s, no retry), not reopened here.
+- Any change to the audit log (`core/audit.py` does not yet exist; wiring
+  the audit log itself is a separate, later work-plan item) beyond making
+  sure `Span.detector` values this mission produces (`Detector.LLM`) are
+  already representable by the existing `Detector` enum — true today,
+  nothing to add.
 
 ## Acceptance criteria
 
-1. A token minted by the gateway for a request carrying
-   `X-Claude-Code-Session-Id: <sid>` is resolvable by directly opening
-   `Vault(VAULT_DB_PATH, "<sid>")` — the same shape `pre_tool_use.py` uses —
-   proving real cross-adapter reconciliation, not just that the header is
-   read.
-2. A request with the header missing, empty, or whitespace-only still
-   completes successfully (falls back to the existing per-process UUID
-   behavior, unchanged from mission-7/8) and emits a stderr warning
-   containing no PII or secret.
-3. Every pre-existing `tests/test_gateway.py` test still passes with the
-   fixture's new default header attached (i.e. this mission does not change
-   request/response tokenization behavior for traffic that already carried
-   no session-id concerns).
-4. `core/vault.py` and `core/tokenizer.py` are unmodified (confirmed by
-   `git diff --stat`).
-5. `.harness/bin/verify` exits 0.
-6. `.harness/handoff.md` documents the fix, the corrected evidence record
-   for BRIEF §6's citation gap, and the reconciliation test's result plainly
-   enough that a human can decide, without re-running anything, whether the
-   fix is correct.
+1. `detect_llm()`/`detect()` produce `Span`s tagged `Detector.LLM` for
+   `PERSON` and `ADDRESS` entities from a mocked LLM response, and correctly
+   union with regex spans via the existing `merge_spans()` (longest wins,
+   ties to regex) with no changes to `merge_spans()` itself.
+2. The LLM prompt (inspectable in source/tests) requests every `EntityType`
+   member, not only `PERSON`/`ADDRESS` — verifiable by asserting the prompt
+   text or schema enumerates all seven structured types plus the two new
+   ones.
+3. Fail-closed proven by test: an LLM call that times out, connects to a
+   dead endpoint, returns a non-2xx status, or returns malformed/unparseable
+   JSON still yields the regex layer's spans unchanged — the whole
+   `detect()` call never raises out to the caller for an LLM-side failure,
+   and `_tokenize_text()`/`tokenize()` still succeeds.
+4. Cache proven by test: two calls to `detect_llm()`/`detect()` with the
+   same text within one process invoke the mocked HTTP client exactly once.
+5. `VEIL_LLM_BASE_URL` unset reproduces exactly today's regex-only behavior
+   through `tokenize()` — proven by a test that the existing tokenizer/
+   gateway/hooks test suite continues to pass unmodified in outcome (no new
+   network calls attempted).
+6. `demo/eval.py --mode regex|llm|union` (or equivalent CLI surface) reports
+   recall/precision per entity type per detector for each mode; the
+   `--min-recall`/`--max-false-positives` gate remains scoped to
+   `STRUCTURED_TYPES` (the original seven) so `.harness/bin/verify`'s `eval`
+   row is unaffected by the two new entity types or by an LLM-only run's
+   necessarily-lower recall.
+7. `core/vault.py` is unmodified (confirmed by `git diff --stat`).
+8. `.harness/bin/verify` exits 0.
+9. `.harness/handoff.md` documents the fail-closed proof, the cache proof,
+   and a concrete, step-by-step manual checklist for verifying the client
+   against a real LM Studio instance (since this mission has no live spike
+   evidence) plainly enough that a human can decide, without re-running
+   anything, whether the mission is correct and what remains to be
+   confirmed live.
 
 ## Risk
 
-Risk class: medium
+Risk class: high
 
-Rationale: does not touch `core/vault.py` or `core/tokenizer.py` (the
-designated high-risk surface per CLAUDE.md's "Review and risk" convention),
-but changes which `session_id` a gateway request's `Vault` calls are keyed
-by — a mistake here would either silently break correlation (a token minted
-under the wrong id resolves as "not found," a display defect, not a PII
-leak, same class of failure mission-8 already made non-fatal via the
-placeholder path) or, in the worst case, key a vault operation using an
-untrusted value in an unintended way. The header is client-supplied
-(HTTP-level, not merely local-process state) governing vault keying for the
-first time in this project — the same trust boundary the hooks adapters
-already accept for `payload["session_id"]` from Claude Code itself (a local
-process on the developer's own machine, not a hostile network peer), so this
-is treated as consistent with existing precedent, not a new attack surface,
-but is called out explicitly since it is a new instance of that pattern.
+Rationale: this is the designated high-risk surface per CLAUDE.md's "Review
+and risk" convention ("changes to detection, vault or tokenization... require
+human approval before merge") — a missed span here is a data leak. This
+mission also introduces the project's first outbound network call made from
+inside `core/` itself (previously only the gateway adapter spoke HTTP, and
+only to the upstream Anthropic API over a connection the user's own Claude
+Code session already established) — a bug in the fail-closed path could
+either silently stop degrading safely (violating BRIEF acceptance criterion
+4) or, in the worst case, block/hang detection entirely. The LAN-unencrypted
+raw-PII-to-LM-Studio trade-off is a prior, explicit, out-of-scope decision
+(BRIEF §3.1), not re-litigated here, but the code implementing it is new and
+warrants full human review before merge.
 
 ## Merge policy
 
@@ -142,44 +195,51 @@ No commit, push, or merge without explicit human review of the diff and
 
 ## Tooling And Approach Assessment
 
-1. **What project type is this?** A correctness fix reconciling an
-   identity-keying mismatch between two already-implemented adapters
-   (gateway vs. hooks) in an existing network-facing component — not new
-   feature surface, and (per the Intake Grill) no live spike gates the
-   design this time, unlike missions 7 and 8.
-2. **What methods, tooling, or approaches does that imply?** Read an
-   inbound HTTP header per request via the already-available
-   `self.headers` on `BaseHTTPRequestHandler` (no new dependency); thread a
-   per-request `session_id` value through the three call sites in
-   `_handle()` that already open a `Vault` per request (no lifetime change
-   needed); extend the existing httpx-based integration test harness in
-   `tests/test_gateway.py` with a direct second `Vault` open to prove real
-   hook-shaped resolution, without invoking any hooks code.
-3. **What risks or missing decisions does it reveal?** (a) the gateway now
-   lets an inbound HTTP header select which vault "session" a token is
-   minted under — the same trust boundary the hooks adapters already accept
-   for their own payload's `session_id`, not a new attack surface, but the
-   first time an HTTP header (rather than local hook-invocation state)
-   plays that role, worth stating explicitly. (b) "malformed" is scoped
-   narrowly — missing, or empty/whitespace-only after stripping — matching
-   the hooks adapters' own existing `session_id` validation, not a new
-   schema. (c) `main()`'s startup log line currently reads
-   `(session {session_id})`, implying one fixed session per process; must
-   be reworded to state it is only the fallback value now.
-4. **What should be added to validation?** A test proving cross-adapter
-   reconciliation by directly resolving a gateway-minted token through a
-   second `Vault` opened with the header's session id; a test for the
-   header-missing fallback path, including its stderr warning containing no
-   PII/secret (matching the existing `test_no_secret_or_pii_appears_in_gateway_stderr`
-   pattern); confirmation every pre-existing test still passes with the
-   fixture's new default header attached; `git diff --stat` confirming
-   `core/vault.py`/`core/tokenizer.py` are untouched.
-5. **What is explicitly not needed now?** Any change to `core/vault.py` or
-   `core/tokenizer.py`; any change to the hooks adapters; a live spike (the
-   design does not depend on confirming header stability); header
-   format/schema validation beyond non-empty; multi-process/concurrent
-   gateway vault correlation (mission-7's accepted limitation, unchanged).
+1. **What project type is this?** Adding a new detection backend (a network
+   client against an OpenAI-compatible chat-completions endpoint) to an
+   existing hybrid-detector module, plus wiring it into one existing call
+   site (`tokenizer.py`) and one existing evaluation script (`eval.py`). Not
+   new architectural surface — `Detector.LLM`, `Span.detector`, and
+   `merge_spans()`'s union/tie-break policy already anticipate this.
+2. **What methods, tooling, or approaches does that imply?** `httpx` (already
+   a runtime dependency, used identically by the gateway adapter) for the
+   `/v1/chat/completions` POST; a mocked `httpx.MockTransport` for tests,
+   matching `test_gateway.py`'s existing pattern for the Anthropic API rather
+   than inventing a new test-double style; `hashlib.sha256` (stdlib) for the
+   content-block cache key, matching `Span`'s own `frozen=True, slots=True`
+   hashability design already noted as being "for the content-block cache."
+3. **What risks or missing decisions does it reveal?** (a) offset recovery:
+   the model returns matched *values*, not trustworthy offsets, so
+   `detect_llm()` must locate each returned value in the source text itself
+   (first/all occurrences) rather than trusting a model-reported index —
+   this needs a defined, tested policy for a value that appears more than
+   once or not at all in the text (not currently specified; resolve during
+   implementation with the narrowest safe rule: search for the value and
+   skip — do not guess — an instance that cannot be found verbatim, logging
+   nothing PII-bearing about the miss). (b) `EntityType` gaining two new
+   members changes `STRUCTURED_TYPES`'s current definition
+   (`frozenset(EntityType)`) from implicit to explicit — a one-line but
+   easy-to-miss change; called out explicitly in Scope above so it is not
+   dropped silently. (c) the LAN-unencrypted transport to LM Studio is
+   already an accepted trade-off (BRIEF §3.1) and not reopened, but this is
+   the first code that actually implements sending text over it — worth the
+   reviewer's attention even though the decision itself is not in question.
+4. **What should be added to validation?** Mocked-HTTP tests for the happy
+   path, malformed JSON, timeout, non-2xx, and the fail-closed fallback;
+   cache-hit test; a test proving `VEIL_LLM_BASE_URL` unset changes nothing
+   about existing tokenizer/gateway/hooks behavior; `eval.py`'s three modes
+   producing a report; `git diff --stat` confirming `core/vault.py`
+   untouched; a manual LM Studio verification checklist in `handoff.md`
+   (since no live spike ran).
+5. **What is explicitly not needed now?** A live spike against a real LM
+   Studio instance (none reachable this session — deferred to the manual
+   checklist); retry/backoff beyond one attempt; a disk-persisted cache;
+   `ADDRESS` manifest ground truth; a separate "indirect reference" entity
+   type; any change to `core/vault.py`, `core/audit.py` (not yet built), or
+   the adapter files themselves.
 
 ## Status
 
-implemented — awaiting human review for merge (see `.harness/handoff.md`)
+implemented — awaiting human review for merge (see `.harness/handoff.md`;
+now includes completed live LM Studio verification, not just the mocked
+test suite)

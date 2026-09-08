@@ -10,27 +10,44 @@ would score a detector that finds *roughly* the right region, and the
 tokenizer needs the exact one.
 
 Person names are in the manifest on purpose. No regex can prove them, so they
-report as misses until the LLM layer lands — the BRIEF is explicit that false
+report as misses in regex-only mode — the BRIEF is explicit that false
 negatives are published rather than hidden, and they are excluded from the
-gated set rather than deleted from the corpus.
+gated set rather than deleted from the corpus. ``--mode llm``/``--mode union``
+run the same sweep through the LLM layer instead of (or in addition to) regex,
+so this is the concrete comparison: the 100%-recall gate stays bound to
+``--mode regex`` (``STRUCTURED_TYPES`` only), since an LLM-only run is not
+expected to reach it and gating it would leave the gate permanently red.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
-from veil_pii_middleware.core.detector import STRUCTURED_TYPES, Span, detect_regex
+from veil_pii_middleware.core.detector import (
+    LLM_BASE_URL_ENV_VAR,
+    LLM_MODEL_ENV_VAR,
+    STRUCTURED_TYPES,
+    LLMClient,
+    Span,
+    detect,
+    detect_regex,
+)
 from veil_pii_middleware.demo.seed import (
     DEFAULT_DB_PATH,
     DEFAULT_DECOYS_PATH,
     DEFAULT_MANIFEST_PATH,
 )
+
+#: Which layers a run enables. "regex" is today's default and the only mode
+#: the recall gate is bound to; "llm"/"union" report, they do not gate.
+Mode = Literal["regex", "llm", "union"]
 
 __all__ = [
     "DecoyHit",
@@ -113,9 +130,24 @@ def _load_texts(db_path: Path, cells: set[tuple[str, str, int]]) -> dict[tuple[s
 
 
 def evaluate(
-    db_path: Path = DEFAULT_DB_PATH, manifest_path: Path = DEFAULT_MANIFEST_PATH
+    db_path: Path = DEFAULT_DB_PATH,
+    manifest_path: Path = DEFAULT_MANIFEST_PATH,
+    *,
+    mode: Mode = "regex",
+    llm_client: LLMClient | None = None,
 ) -> Report:
-    """Score the regex layer over every cell the manifest says holds PII."""
+    """Score the enabled layer(s) over every cell the manifest says holds PII.
+
+    ``mode="regex"`` (the default) matches every prior behavior of this
+    function exactly. ``mode="llm"``/``"union"`` require ``llm_client``; a
+    result is cached per content block by ``core.detector``, so a value
+    repeated across cells is only sent to the model once.
+    """
+    if mode != "regex" and llm_client is None:
+        raise ValueError(f"mode={mode!r} requires an llm_client")
+    use_regex = mode in ("regex", "union")
+    use_llm = mode in ("llm", "union")
+
     manifest: list[dict[str, Any]] = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     expected: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
@@ -132,7 +164,9 @@ def evaluate(
         text = texts.get(cell)
         if text is None:
             raise ValueError(f"manifest points at a row that is not in the database: {cell}")
-        spans: list[Span] = detect_regex(text)
+        spans: list[Span] = detect(
+            text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client
+        )
         # (offset, value) is the identity of a detection, matching how the
         # manifest records ground truth.
         found: set[tuple[int, str]] = {(span.start, span.text) for span in spans}
@@ -280,33 +314,70 @@ def _print_decoy_report(decoy_report: DecoyReport, max_false_positives: int) -> 
         print(f"PASS — decoys at or below the {max_false_positives} false-positive budget")
 
 
+def _llm_client_from_env() -> LLMClient:
+    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
+    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
+    if not base_url or not model:
+        raise SystemExit(
+            f"--mode requires both {LLM_BASE_URL_ENV_VAR} and {LLM_MODEL_ENV_VAR} to be set"
+        )
+    return LLMClient(base_url, model)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Score the detector against the manifest.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
     parser.add_argument("--decoys", type=Path, default=DEFAULT_DECOYS_PATH)
     parser.add_argument(
+        "--mode",
+        choices=("regex", "llm", "union"),
+        default="regex",
+        help=(
+            "Which layer(s) to score. Only 'regex' (the default) gates "
+            "--min-recall/--max-false-positives; 'llm'/'union' are report-only "
+            f"and read {LLM_BASE_URL_ENV_VAR}/{LLM_MODEL_ENV_VAR}."
+        ),
+    )
+    parser.add_argument(
         "--min-recall",
         type=float,
         default=1.0,
-        help="Fail when any structured entity type scores below this recall.",
+        help="Fail when any structured entity type scores below this recall (--mode regex only).",
     )
     parser.add_argument(
         "--max-false-positives",
         type=int,
         default=0,
-        help="Fail when more than this many decoys are detected.",
+        help="Fail when more than this many decoys are detected (--mode regex only).",
     )
     args = parser.parse_args(argv)
+    mode: Mode = args.mode
 
-    report = evaluate(args.db, args.manifest)
-    _print_report(report, args.min_recall)
+    llm_client = _llm_client_from_env() if mode != "regex" else None
+    try:
+        report = evaluate(args.db, args.manifest, mode=mode, llm_client=llm_client)
+        _print_report(report, args.min_recall)
 
-    decoy_report = evaluate_decoys(args.db, args.decoys)
-    _print_decoy_report(decoy_report, args.max_false_positives)
+        decoy_report = evaluate_decoys(args.db, args.decoys)
+        _print_decoy_report(decoy_report, args.max_false_positives)
+    finally:
+        if llm_client is not None:
+            llm_client.close()
 
-    recall_failed = bool(report.failing_types(args.min_recall))
+    # The recall gate is scoped to --mode regex only (an LLM-only/union run
+    # is not expected to reach it and gating it would leave the gate
+    # permanently red) -- but evaluate_decoys() always scores the regex
+    # layer regardless of --mode, so a genuine regex false-positive
+    # regression must still fail the process even when --mode is llm/union,
+    # not be silently swallowed by that mode's "report-only" framing.
+    recall_failed = mode == "regex" and bool(report.failing_types(args.min_recall))
     decoys_failed = decoy_report.exceeds(args.max_false_positives)
+    if mode != "regex":
+        print(
+            f"\n--mode {mode}'s recall is report-only (exit code reflects --mode regex's "
+            "recall gate only); the decoy false-positive gate still applies regardless of --mode."
+        )
     return 1 if recall_failed or decoys_failed else 0
 
 

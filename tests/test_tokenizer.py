@@ -7,12 +7,21 @@ fail-closed behavior on a token that cannot be resolved.
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from veil_pii_middleware.core.detector import EntityType
+from veil_pii_middleware.core.detector import (
+    LLM_BASE_URL_ENV_VAR,
+    LLM_MODEL_ENV_VAR,
+    EntityType,
+    LLMClient,
+    clear_llm_cache,
+)
 from veil_pii_middleware.core.tokenizer import (
     UNRESOLVED_TOKEN_PLACEHOLDER,
     IncrementalDetokenizer,
@@ -415,3 +424,138 @@ class TestOffsetCorrectnessUnderMultipleSpans:
 
         restored = detokenize(result, vault)
         assert restored == text
+
+
+# --------------------------------------------------------------------------
+# LLM-layer wiring: VEIL_LLM_BASE_URL/VEIL_LLM_MODEL gate an env-built client
+# --------------------------------------------------------------------------
+
+
+class _FakeLLMState:
+    def __init__(self) -> None:
+        self.request_count = 0
+        self.status = 200
+        self.completion_content: str = json.dumps({"spans": []})
+
+
+def _make_llm_handler(state: _FakeLLMState) -> type[BaseHTTPRequestHandler]:
+    class FakeLLMHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length:
+                self.rfile.read(length)
+            state.request_count += 1
+            payload = json.dumps(
+                {"choices": [{"message": {"content": state.completion_content}}]}
+            ).encode()
+            self.send_response(state.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    return FakeLLMHandler
+
+
+@pytest.fixture
+def fake_llm_server() -> Iterator[tuple[_FakeLLMState, str]]:
+    state = _FakeLLMState()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_llm_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield state, base_url
+    finally:
+        server.shutdown()
+        clear_llm_cache()
+
+
+class TestLLMLayerWiring:
+    def test_env_unset_reproduces_regex_only_behavior_exactly(
+        self, vault: Vault, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(LLM_BASE_URL_ENV_VAR, raising=False)
+        monkeypatch.delenv(LLM_MODEL_ENV_VAR, raising=False)
+        text = f"Ana Garcia, correo {VALID_EMAIL}"
+
+        result = tokenize(text, vault)
+
+        assert isinstance(result, str)
+        assert VALID_EMAIL not in result
+        assert "PII_EMAIL_0001" in result
+        # No PERSON entity type exists in the deterministic layer's output,
+        # so an unconfigured LLM layer must leave the name untouched.
+        assert "Ana Garcia" in result
+
+    def test_explicit_llm_client_tokenizes_a_person_span(
+        self, vault: Vault, fake_llm_server: tuple[_FakeLLMState, str]
+    ) -> None:
+        state, base_url = fake_llm_server
+        state.completion_content = json.dumps(
+            {"spans": [{"value": "Ana Garcia", "entity_type": "PERSON"}]}
+        )
+        text = f"Ana Garcia, correo {VALID_EMAIL}"
+        client = LLMClient(base_url, "test-model", timeout_seconds=2.0)
+
+        try:
+            result = tokenize(text, vault, llm_client=client)
+        finally:
+            client.close()
+
+        assert isinstance(result, str)
+        assert "Ana Garcia" not in result
+        assert "PII_PERSON_0001" in result
+        assert "PII_EMAIL_0001" in result
+
+        restored = detokenize(result, vault)
+        assert restored == text
+
+    def test_env_configured_client_is_used_and_closed_automatically(
+        self,
+        vault: Vault,
+        fake_llm_server: tuple[_FakeLLMState, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state, base_url = fake_llm_server
+        state.completion_content = json.dumps(
+            {"spans": [{"value": "Ana Garcia", "entity_type": "PERSON"}]}
+        )
+        monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, base_url)
+        monkeypatch.setenv(LLM_MODEL_ENV_VAR, "test-model")
+
+        result = tokenize("Ana Garcia", vault)
+
+        assert result == "PII_PERSON_0001"
+        assert state.request_count == 1
+
+    def test_llm_non_2xx_response_still_tokenizes_structured_entities(
+        self,
+        vault: Vault,
+        fake_llm_server: tuple[_FakeLLMState, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A misbehaving LLM endpoint must not stop the regex layer's own guarantee.
+
+        This is BRIEF acceptance criterion 4 exercised at the level a real
+        adapter actually calls: `tokenize()` itself, not just `detect()`.
+        """
+        state, base_url = fake_llm_server
+        state.status = 500
+        monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, base_url)
+        monkeypatch.setenv(LLM_MODEL_ENV_VAR, "test-model")
+        text = f"Ana Garcia, correo {VALID_EMAIL}"
+
+        result = tokenize(text, vault)
+
+        assert isinstance(result, str)
+        assert VALID_EMAIL not in result
+        assert "PII_EMAIL_0001" in result
+        # No exception propagated and the call still completed -- the LLM
+        # layer's failure did not block the structured entity from being
+        # tokenized, matching detect()'s fail-closed contract.
