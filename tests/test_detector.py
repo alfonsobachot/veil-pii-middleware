@@ -526,6 +526,36 @@ class TestDetectLLM:
         for entity_type in EntityType:
             assert entity_type.value in system_prompt
 
+    def test_prompt_states_dni_vs_nie_leading_letter_rule(
+        self, fake_llm: tuple[_FakeLLMState, str]
+    ) -> None:
+        """BRIEF SS6, item 15: mission-10's live LM Studio run measured 0% DNI
+
+        recall / 0.087 NIE precision because the prompt gave no structural
+        rule to tell the two apart. The fix adds that rule to the prompt --
+        this only proves the rule is present in the text sent to the model,
+        not that a real model now applies it correctly (see handoff.md for
+        the live before/after comparison).
+        """
+        state, base_url = fake_llm
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            detect_llm("hola", client)
+
+        system_prompt = str(state.requests[0]["messages"][0]["content"]).upper()
+        assert "NO LEADING" in system_prompt or "NEVER STARTS WITH A LETTER" in system_prompt
+        assert "X, Y OR Z" in system_prompt
+
+    def test_prompt_states_iban_phone_card_ip_structural_rules(
+        self, fake_llm: tuple[_FakeLLMState, str]
+    ) -> None:
+        state, base_url = fake_llm
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            detect_llm("hola", client)
+
+        system_prompt = str(state.requests[0]["messages"][0]["content"])
+        assert "0 and 255" in system_prompt
+        assert "12 to 19 digits" in system_prompt
+
     def test_request_omits_response_format(self, fake_llm: tuple[_FakeLLMState, str]) -> None:
         """Regression: a real LM Studio instance 400s on response_format=json_object.
 

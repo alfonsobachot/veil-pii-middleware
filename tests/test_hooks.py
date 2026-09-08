@@ -173,6 +173,29 @@ class TestPostToolUseTokenizesGenericShape:
         assert updated["rows"][0]["email"] == token
 
 
+class TestPostToolUseAuditLogWiring:
+    def test_minted_token_produces_an_audit_entry_tagged_with_this_adapter(
+        self, tmp_path: Path
+    ) -> None:
+        payload = {
+            "session_id": "session-a",
+            "tool_name": "Bash",
+            "tool_input": {"command": _DEMO_DB_COMMAND},
+            "tool_response": {"stdout": "alice@example.com", "exit_code": 0},
+        }
+        result = _run("veil_pii_middleware.adapters.hooks.post_tool_use", payload, tmp_path)
+        assert result.returncode == 0
+
+        audit_path = tmp_path / ".veil" / "audit.jsonl"
+        assert audit_path.exists()
+        lines = audit_path.read_text(encoding="utf-8").splitlines()
+        entries = [json.loads(line) for line in lines]
+        assert any(
+            e["adapter"] == "hooks:post_tool_use" and e["entity_type"] == "EMAIL" for e in entries
+        )
+        assert "alice@example.com" not in audit_path.read_text(encoding="utf-8")
+
+
 class TestPostToolUsePassesThroughOutOfScopeCalls:
     def test_non_demo_db_bash_command_passes_through(self, tmp_path: Path) -> None:
         payload = {

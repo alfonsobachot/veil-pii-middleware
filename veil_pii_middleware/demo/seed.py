@@ -364,6 +364,12 @@ _VERSION_DECOYS: Final = ("1.2.3", "10.4.2")
 # Zero-padded reference/account numbers. `0012345678` is eight digits after a
 # `00` prefix, one short of the legacy international-phone floor of nine.
 _ZERO_PADDED_DECOYS: Final = ("0012345678", "0098765432")
+# Four dot-separated groups shaped exactly like an IP, but with an octet over
+# 255 -- `valid_ipv4` must reject these; added 2026-09-08 (BRIEF SS6, item 16)
+# because the regex layer's own decoy corpus had no invalid-octet IP to catch
+# a regression, and an LLM layer accepting one as a real IP was previously
+# unmeasured in every `--mode` (`evaluate_decoys()` hardcoded `detect_regex()`).
+_INVALID_OCTET_IP_DECOYS: Final = ("192.168.1.256", "999.1.2.3")
 
 
 def _bad_dni_letters(faker: Faker, count: int) -> list[str]:
@@ -459,6 +465,8 @@ def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         samples.append(
             ("ZERO_PADDED_ACCOUNT", f"Cuenta de referencia {account} sin movimientos.", account)
         )
+    for ip in _INVALID_OCTET_IP_DECOYS:
+        samples.append(("INVALID_OCTET_IP", f"Direccion de origen registrada: {ip}.", ip))
 
     for row_id, (category, note, value) in enumerate(samples, start=1):
         cursor.execute("INSERT INTO decoy_samples VALUES (?, ?, ?)", (row_id, category, note))

@@ -19,6 +19,7 @@ docs/private/
 # Secrets and local state
 .env
 .env.*
+.claude/settings.local.json
 
 # Vault: encrypted token <-> value mappings, never committed
 vault/

@@ -10,12 +10,16 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TypeAlias
 
+from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.detector import (
     LLM_BASE_URL_ENV_VAR,
     LLM_MODEL_ENV_VAR,
     LLMClient,
+    Span,
     detect,
 )
 from veil_pii_middleware.core.vault import TokenNotFoundError, Vault, VaultIntegrityError
@@ -76,7 +80,33 @@ def _default_llm_client() -> LLMClient | None:
     return LLMClient(base_url, model)
 
 
-def tokenize(value: JSONValue, vault: Vault, *, llm_client: LLMClient | None = None) -> JSONValue:
+@dataclass(frozen=True, slots=True)
+class _TokenizeContext:
+    """Bundles ``tokenize()``'s optional side-channels for the recursive walk.
+
+    Kept as one object rather than five positional parameters threaded
+    through ``_tokenize``/``_tokenize_text`` -- both audit logging and span
+    collection are independent, optional features layered onto the same
+    substitution pass, and grouping them keeps that recursion readable.
+    """
+
+    llm_client: LLMClient | None
+    audit_log: AuditLog | None
+    adapter: str | None
+    span_sink: list[Span] | None
+    skip: Callable[[str], bool] | None
+
+
+def tokenize(
+    value: JSONValue,
+    vault: Vault,
+    *,
+    llm_client: LLMClient | None = None,
+    audit_log: AuditLog | None = None,
+    adapter: str | None = None,
+    span_sink: list[Span] | None = None,
+    skip: Callable[[str], bool] | None = None,
+) -> JSONValue:
     """Replace every PII span ``detect()`` finds in ``value`` with a vault token.
 
     Recurses into dicts and lists, tokenizing only string leaves; keys and
@@ -89,30 +119,64 @@ def tokenize(value: JSONValue, vault: Vault, *, llm_client: LLMClient | None = N
     before the LLM layer existed. A client built internally here is closed
     before returning; one supplied by the caller is left open for the caller
     to manage.
+
+    ``audit_log``/``adapter`` are optional and independent of the LLM wiring:
+    when ``audit_log`` is supplied, ``adapter`` must be a non-empty string,
+    and one ``AuditLog.record(...)`` call is made per span substituted,
+    across every string leaf ``value`` contains. Omitting ``audit_log`` (the
+    default, and every pre-existing caller) writes nothing -- identical
+    behavior to before this parameter existed.
+
+    ``span_sink``, if supplied, has every span this call detects appended to
+    it (in the order found, before substitution), across every string leaf --
+    for a caller (the gateway's observability panel) that needs the same
+    spans this call already computed, without running a second, duplicate
+    detection pass. Omitting it (the default) costs nothing extra.
+
+    ``skip``, if supplied, is called once per string leaf before any
+    detection runs; when it returns ``True`` for a leaf, that leaf is
+    returned completely unscanned -- no regex/LLM call, no audit entry, no
+    span in ``span_sink``, no substitution. For excluding known
+    protocol/metadata content a specific transport injects (e.g. a reserved
+    system-prompt header the gateway adapter must pass through byte-for-byte
+    for the upstream API to accept the request) -- never for excluding
+    *user* content, which this module has no way to distinguish from
+    metadata on its own and must keep scanning by default. The predicate
+    itself carries no knowledge of any specific transport; only the caller
+    supplying it does, keeping this module transport-agnostic.
     """
+    if audit_log is not None and not adapter:
+        raise ValueError("adapter must be a non-empty string when audit_log is supplied")
     client = llm_client if llm_client is not None else _default_llm_client()
+    context = _TokenizeContext(
+        llm_client=client, audit_log=audit_log, adapter=adapter, span_sink=span_sink, skip=skip
+    )
     try:
-        return _tokenize(value, vault, client)
+        return _tokenize(value, vault, context)
     finally:
         if llm_client is None and client is not None:
             client.close()
 
 
-def _tokenize(value: JSONValue, vault: Vault, llm_client: LLMClient | None) -> JSONValue:
+def _tokenize(value: JSONValue, vault: Vault, context: _TokenizeContext) -> JSONValue:
     if isinstance(value, str):
-        return _tokenize_text(value, vault, llm_client)
+        return _tokenize_text(value, vault, context)
     if isinstance(value, dict):
-        return {key: _tokenize(item, vault, llm_client) for key, item in value.items()}
+        return {key: _tokenize(item, vault, context) for key, item in value.items()}
     if isinstance(value, list):
-        return [_tokenize(item, vault, llm_client) for item in value]
+        return [_tokenize(item, vault, context) for item in value]
     return value
 
 
-def _tokenize_text(text: str, vault: Vault, llm_client: LLMClient | None) -> str:
+def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
+    if context.skip is not None and context.skip(text):
+        return text
     # Routes through detect() rather than assuming regex is the only source
     # of spans -- this is where the LLM layer's spans union in, gated by
     # whether llm_client is set (see tokenize()'s docstring).
-    spans = detect(text, llm_client=llm_client)
+    spans = detect(text, llm_client=context.llm_client)
+    if context.span_sink is not None:
+        context.span_sink.extend(sorted(spans, key=lambda s: s.start))
     # Right-to-left by start offset: substituting a token of a different
     # length than the original span must not invalidate the offsets of spans
     # still waiting to be replaced.
@@ -124,6 +188,15 @@ def _tokenize_text(text: str, vault: Vault, llm_client: LLMClient | None) -> str
                 f"PII_{span.entity_type.value}_NNNN format -- this session has "
                 f"minted too many {span.entity_type.value} tokens to stay "
                 "unambiguous for detokenize"
+            )
+        if context.audit_log is not None and context.adapter is not None:
+            context.audit_log.record(
+                token=token,
+                entity_type=span.entity_type,
+                detector=span.detector,
+                offset=span.start,
+                value=span.text,
+                adapter=context.adapter,
             )
         text = text[: span.start] + token + text[span.end :]
     return text

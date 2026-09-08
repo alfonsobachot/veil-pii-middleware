@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>veil — observability panel</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-border: #2a2e38;
+    --text: #e6e8ec;
+    --muted: #8a90a0;
+    --regex: #4fb0ff;
+    --llm: #ff9f4f;
+    --stage-idle: #262a34;
+    --stage-active: #3a7bd5;
+    --danger: #ff5c5c;
+    --ok: #4fd48a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.4 -apple-system, Segoe UI, sans-serif;
+  }
+  header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--panel-border);
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  header h1 { font-size: 15px; margin: 0; }
+  header .sub { color: var(--muted); }
+
+  #pipeline {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 16px;
+    overflow-x: auto;
+  }
+  .stage-box {
+    flex: 0 0 auto;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: var(--stage-idle);
+    border: 1px solid var(--panel-border);
+    white-space: nowrap;
+    transition: background 120ms ease, border-color 120ms ease;
+  }
+  .stage-box.active {
+    background: var(--stage-active);
+    border-color: var(--stage-active);
+    color: #fff;
+  }
+  .arrow { color: var(--muted); }
+
+  #panes {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+    padding: 0 16px 16px;
+  }
+  .pane {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    min-height: 140px;
+  }
+  .pane h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 8px;
+  }
+  .pane pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+  }
+  .span-regex { background: color-mix(in srgb, var(--regex) 35%, transparent); border-radius: 2px; }
+  .span-llm { background: color-mix(in srgb, var(--llm) 35%, transparent); border-radius: 2px; }
+  .token { text-decoration: underline dotted var(--muted); cursor: help; }
+
+  #bottom {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr 0.9fr;
+    gap: 12px;
+    padding: 0 16px 16px;
+  }
+  #bottom table { display: block; max-height: 220px; overflow-y: auto; }
+  #bottom thead, #bottom tbody tr { display: table; width: 100%; table-layout: fixed; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--panel-border); }
+  th { color: var(--muted); font-weight: 500; }
+  button {
+    font: inherit;
+    background: var(--stage-idle);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--stage-active); }
+  .legend { display: flex; gap: 14px; color: var(--muted); padding: 0 16px 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const STAGES = ["received", "tokenized", "forwarded", "response_received", "detokenized", "displayed"];
+const STAGE_LABEL = {
+  received: "Received",
+  tokenized: "Tokenized",
+  forwarded: "Forwarded upstream",
+  response_received: "Response received",
+  detokenized: "Detokenized",
+  displayed: "Displayed",
+};
+
+const TOKEN_RE = /PII_([A-Z]+)_\d{4}/g;
+
+function renderTokenizedText(text) {
+  // Splits on PII_<TYPE>_NNNN tokens so a hover can show the entity type
+  // parsed straight out of the token itself -- no extra data needed.
+  const parts = [];
+  let last = 0;
+  let match;
+  TOKEN_RE.lastIndex = 0;
+  while ((match = TOKEN_RE.exec(text)) !== null) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    parts.push(
+      <span className="token" title={`entity type: ${match[1]}`} key={match.index}>
+        {match[0]}
+      </span>
+    );
+    last = match.index + match[0].length;
+  }
+  parts.push(text.slice(last));
+  return parts;
+}
+
+function renderSpannedText(text, spans) {
+  if (!spans || spans.length === 0) return text;
+  const sorted = [...spans].sort((a, b) => a.start - b.start);
+  const parts = [];
+  let last = 0;
+  sorted.forEach((span, i) => {
+    if (span.start > last) parts.push(text.slice(last, span.start));
+    const cls = span.detector === "LLM" ? "span-llm" : "span-regex";
+    parts.push(
+      <span className={cls} title={`${span.entity_type} (${span.detector})`} key={i}>
+        {text.slice(span.start, span.end)}
+      </span>
+    );
+    last = span.end;
+  });
+  parts.push(text.slice(last));
+  return parts;
+}
+
+function useEventSource(path, onEvent) {
+  const handlerRef = useRef(onEvent);
+  handlerRef.current = onEvent;
+  useEffect(() => {
+    const source = new EventSource(path);
+    source.onmessage = (ev) => {
+      try {
+        handlerRef.current(JSON.parse(ev.data));
+      } catch (err) {
+        // A malformed line is skipped, never crashes the panel.
+      }
+    };
+    return () => source.close();
+  }, [path]);
+}
+
+function Pipeline({ currentStage }) {
+  return (
+    <div id="pipeline">
+      {STAGES.map((stage, i) => (
+        <React.Fragment key={stage}>
+          {i > 0 && <span className="arrow">&#8594;</span>}
+          <div className={"stage-box" + (stage === currentStage ? " active" : "")}>
+            {STAGE_LABEL[stage]}
+          </div>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function Panes({ texts, spans }) {
+  return (
+    <div id="panes">
+      <div className="pane">
+        <h2>1. Input</h2>
+        <pre>{renderSpannedText(texts.received || "", spans)}</pre>
+      </div>
+      <div className="pane">
+        <h2>2. Outbound to API</h2>
+        <pre>{renderTokenizedText(texts.forwarded || texts.tokenized || "")}</pre>
+      </div>
+      <div className="pane">
+        <h2>3. API response</h2>
+        <pre>{renderTokenizedText(texts.response_received || "")}</pre>
+      </div>
+      <div className="pane">
+        <h2>4. Developer view</h2>
+        <pre>{texts.displayed || texts.detokenized || ""}</pre>
+      </div>
+    </div>
+  );
+}
+
+const MAX_AUDIT_ROWS = 50;
+
+function AuditLogPane() {
+  // Consumes /veil-panel/audit-stream directly (BRIEF SS5: "a panel that
+  // consumes the audit log over SSE") -- structurally separate from the
+  // pipeline-stream feeding the four panes above: every row here is exactly
+  // what core/audit.py ever writes (token, type, detector, offset, adapter,
+  // a value *hash*) and never the value itself, unlike the pipeline stream.
+  const [entries, setEntries] = useState([]);
+
+  useEventSource("/veil-panel/audit-stream", (entry) => {
+    setEntries((prev) => [entry, ...prev].slice(0, MAX_AUDIT_ROWS));
+  });
+
+  return (
+    <div className="pane">
+      <h2>Audit log (live, no values -- {entries.length} of this session)</h2>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Adapter</th><th>Type</th><th>Detector</th><th>Token</th></tr>
+        </thead>
+        <tbody>
+          {entries.map((e, i) => (
+            <tr key={`${e.token}-${e.timestamp}-${i}`}>
+              <td>{new Date(e.timestamp).toLocaleTimeString()}</td>
+              <td>{e.adapter}</td>
+              <td>{e.entity_type}</td>
+              <td>{e.detector}</td>
+              <td>{e.token}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function VaultInspector() {
+  const [mappings, setMappings] = useState([]);
+  const [sessionId, setSessionId] = useState("");
+  const [revealed, setRevealed] = useState({});
+
+  const refresh = useCallback(() => {
+    fetch("/veil-panel/vault")
+      .then((r) => r.json())
+      .then((data) => {
+        setMappings(data.mappings || []);
+        setSessionId(data.session_id || "");
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 4000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  const reveal = (token) => {
+    fetch("/veil-panel/vault/reveal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, session_id: sessionId }),
+    })
+      .then((r) => r.json())
+      .then((data) => setRevealed((prev) => ({ ...prev, [token]: data.value ?? data.error })));
+  };
+
+  return (
+    <div className="pane">
+      <h2>Vault inspector — session {sessionId || "(none yet)"}</h2>
+      <table>
+        <thead>
+          <tr><th>Token</th><th>Type</th><th>Ciphertext</th><th>Created</th><th></th></tr>
+        </thead>
+        <tbody>
+          {mappings.map((m) => (
+            <tr key={m.token}>
+              <td>{m.token}</td>
+              <td>{m.entity_type}</td>
+              <td title={m.ciphertext_b64}>{m.ciphertext_b64.slice(0, 12)}&hellip;</td>
+              <td>{new Date(m.created_at * 1000).toLocaleTimeString()}</td>
+              <td>
+                {revealed[m.token] ? (
+                  <code>{revealed[m.token]}</code>
+                ) : (
+                  <button onClick={() => reveal(m.token)}>Reveal</button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Metrics() {
+  const [report, setReport] = useState(null);
+
+  const refresh = useCallback(() => {
+    fetch("/veil-panel/metrics").then((r) => r.json()).then(setReport).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  if (!report) return <div className="pane"><h2>Metrics</h2><p>Loading&hellip;</p></div>;
+  if (!report.available) {
+    return (
+      <div className="pane">
+        <h2>Metrics</h2>
+        <p>Not available: {report.reason}</p>
+        <button onClick={refresh}>Retry</button>
+      </div>
+    );
+  }
+  return (
+    <div className="pane">
+      <h2>Metrics (demo/eval.py, regex mode) <button onClick={refresh}>Refresh</button></h2>
+      <table>
+        <thead>
+          <tr><th>Entity</th><th>Support</th><th>Found</th><th>FP</th><th>Recall</th><th>Precision</th></tr>
+        </thead>
+        <tbody>
+          {Object.entries(report.by_type).map(([name, m]) => (
+            <tr key={name}>
+              <td>{name}</td>
+              <td>{m.support}</td>
+              <td>{m.true_positives}</td>
+              <td>{m.false_positives}</td>
+              <td>{m.recall.toFixed(3)}</td>
+              <td>{m.precision.toFixed(3)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function App() {
+  const [currentStage, setCurrentStage] = useState(null);
+  const [texts, setTexts] = useState({});
+  const [spans, setSpans] = useState([]);
+
+  useEventSource("/veil-panel/pipeline-stream", (event) => {
+    setCurrentStage(event.stage);
+    setTexts((prev) => ({ ...prev, [event.stage]: event.text }));
+    if (event.stage === "received") setSpans(event.spans || []);
+  });
+
+  return (
+    <div>
+      <header>
+        <h1>veil — observability panel</h1>
+        <span className="sub">
+          live session, local only -- the panes below show real request/response text for
+          inspection; the audit log itself (bottom-left) never records a value, only a hash
+        </span>
+      </header>
+      <div className="legend">
+        <span><span className="swatch" style={{ background: "var(--regex)" }}></span> regex-detected span</span>
+        <span><span className="swatch" style={{ background: "var(--llm)" }}></span> LLM-detected span</span>
+      </div>
+      <Pipeline currentStage={currentStage} />
+      <Panes texts={texts} spans={spans} />
+      <div id="bottom">
+        <AuditLogPane />
+        <VaultInspector />
+        <Metrics />
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

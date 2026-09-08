@@ -19,10 +19,15 @@ import os
 import sys
 from pathlib import Path
 
+from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.tokenizer import tokenize
 from veil_pii_middleware.core.vault import Vault
 
 __all__ = ["main"]
+
+#: Recorded on every audit entry this adapter produces so the observability
+#: frontend (BRIEF SS5) can attribute a token to the leg that minted it.
+_ADAPTER_NAME = "command"
 
 #: Slash commands receive no session JSON on stdin (unlike PreToolUse /
 #: PostToolUse hooks), so the session id comes from this env var when set --
@@ -34,6 +39,13 @@ _FALLBACK_SESSION_ID = "veil-demo"
 #: the current working directory, which is the project root when Claude Code
 #: invokes the slash command.
 _VAULT_DB_PATH = Path(".veil") / "vault.db"
+
+#: Same fixed, git-ignored audit log every adapter shares (see
+#: adapters/hooks/_paths.py::AUDIT_LOG_PATH) -- not imported from there to
+#: avoid a hooks-package dependency from this unrelated adapter; the path
+#: itself must still match so the gateway's SSE tail sees this adapter's
+#: entries too.
+_AUDIT_LOG_PATH = Path(".veil") / "audit.jsonl"
 
 
 def main() -> int:
@@ -56,7 +68,9 @@ def main() -> int:
             session_id = _FALLBACK_SESSION_ID
         _VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with Vault(_VAULT_DB_PATH, session_id) as vault:
-            sanitized = tokenize(prompt, vault)
+            sanitized = tokenize(
+                prompt, vault, audit_log=AuditLog(_AUDIT_LOG_PATH), adapter=_ADAPTER_NAME
+            )
         if not isinstance(sanitized, str):
             # tokenize() always returns a str for a str input; this only
             # guards mypy's narrowing and would indicate a core/ contract

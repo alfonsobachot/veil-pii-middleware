@@ -26,12 +26,17 @@ from __future__ import annotations
 import json
 import sys
 
-from veil_pii_middleware.adapters.hooks._paths import VAULT_DB_PATH
+from veil_pii_middleware.adapters.hooks._paths import AUDIT_LOG_PATH, VAULT_DB_PATH
 from veil_pii_middleware.adapters.hooks._scope import is_demo_db_command
+from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.tokenizer import JSONValue, tokenize
 from veil_pii_middleware.core.vault import Vault
 
 __all__ = ["main"]
+
+#: Recorded on every audit entry this hook produces so the observability
+#: frontend (BRIEF SS5) can attribute a token to the leg that minted it.
+_ADAPTER_NAME = "hooks:post_tool_use"
 
 
 def main() -> int:
@@ -63,7 +68,12 @@ def main() -> int:
     try:
         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with Vault(VAULT_DB_PATH, session_id) as vault:
-            tokenized = tokenize(tool_response, vault)
+            tokenized = tokenize(
+                tool_response,
+                vault,
+                audit_log=AuditLog(AUDIT_LOG_PATH),
+                adapter=_ADAPTER_NAME,
+            )
     except Exception:
         print("post_tool_use: tokenization failed", file=sys.stderr)
         return 1

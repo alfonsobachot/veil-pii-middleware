@@ -15,6 +15,7 @@ import json
 import os
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +26,8 @@ import httpx
 import pytest
 from veil_pii_middleware.adapters.gateway import server as gateway_server
 from veil_pii_middleware.core.vault import Vault
+from veil_pii_middleware.demo import eval as eval_module
+from veil_pii_middleware.demo.eval import Metrics, Report
 
 _TEST_KEY_B64 = base64.b64encode(os.urandom(32)).decode()
 VALID_EMAIL = "alice@example.com"
@@ -168,6 +171,7 @@ class _Servers:
 def servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Servers]:
     monkeypatch.setenv("VEIL_VAULT_KEY", _TEST_KEY_B64)
     monkeypatch.setattr(gateway_server, "VAULT_DB_PATH", tmp_path / ".veil" / "vault.db")
+    monkeypatch.setattr(gateway_server, "AUDIT_LOG_PATH", tmp_path / ".veil" / "audit.jsonl")
 
     upstream_state = _RecordingUpstream()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _make_upstream_handler(upstream_state))
@@ -218,6 +222,26 @@ class TestRequestTokenization:
         second = json.loads(servers.upstream_state.requests[1]["body"])
         assert first == second
         assert "PII_EMAIL_0001" in first["messages"][0]["content"]
+
+    def test_accept_encoding_forced_to_a_decodable_value(self, servers: _Servers) -> None:
+        """Found via a live test against the real Anthropic API: it replies
+
+        Brotli-compressed (`content-encoding: br`) when the client's own
+        Accept-Encoding offers it, and httpx cannot decode Brotli without an
+        optional package this project does not install -- the gateway then
+        relayed still-compressed bytes to the client as if they were plain
+        text. The upstream request must always ask for something httpx's
+        stdlib-only decoders can handle, regardless of what the real client
+        (which may support Brotli itself) sent.
+        """
+        resp = _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": []},
+            headers={"Accept-Encoding": "br, gzip, deflate"},
+        )
+        assert resp.status_code == 200
+        upstream_req = servers.upstream_state.requests[0]
+        assert upstream_req["headers"]["accept-encoding"] == "gzip, deflate"
 
     def test_auth_header_forwarded_unchanged(self, servers: _Servers) -> None:
         resp = _post(
@@ -629,6 +653,63 @@ class TestMidStreamUpstreamFailure:
         assert resp.status_code == 200
 
 
+class TestSkipReservedAnthropicMetadataPredicate:
+    def test_matches_the_reserved_prefix(self) -> None:
+        assert gateway_server._skip_reserved_anthropic_metadata(
+            "x-anthropic-billing-header: cc_version=1.0.0; cc_entrypoint=sdk-cli;"
+        )
+
+    def test_does_not_match_ordinary_text(self) -> None:
+        assert not gateway_server._skip_reserved_anthropic_metadata(
+            "please don't share my card 4111111111111111"
+        )
+
+
+class TestReservedAnthropicMetadataExclusion:
+    """Claude Code injects a reserved system-prompt block on every request
+
+    ("x-anthropic-billing-header: cc_version=...; cc_entrypoint=...;"). Found
+    live: the LLM layer mistook its "cc_" prefix for a credit-card indicator
+    and tokenized it, and the real Anthropic API rejects the whole request
+    if that block's value is altered at all. The gateway must exclude it
+    from detection entirely while still scanning everything else normally.
+    """
+
+    def test_reserved_system_block_passes_through_even_with_card_shaped_content(
+        self, servers: _Servers
+    ) -> None:
+        body = {
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.263.325; 4111111111111111",
+                }
+            ],
+            "messages": [{"role": "user", "content": "nothing sensitive here"}],
+        }
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json=body)
+
+        assert resp.status_code == 200
+        forwarded = json.loads(servers.upstream_state.requests[0]["body"])
+        assert forwarded["system"][0]["text"] == body["system"][0]["text"]
+        assert "PII_CARD_" not in forwarded["system"][0]["text"]
+
+    def test_other_content_is_still_tokenized_normally(self, servers: _Servers) -> None:
+        body = {
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=1.0.0;"}],
+            "messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}],
+        }
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json=body)
+
+        assert resp.status_code == 200
+        forwarded = json.loads(servers.upstream_state.requests[0]["body"])
+        assert forwarded["system"][0]["text"] == body["system"][0]["text"]
+        assert VALID_EMAIL not in forwarded["messages"][0]["content"]
+        assert "PII_EMAIL_" in forwarded["messages"][0]["content"]
+
+
 class TestFailsClosed:
     def test_malformed_json_body_is_blocked_not_forwarded(self, servers: _Servers) -> None:
         resp = _post(
@@ -659,3 +740,252 @@ class TestFailsClosed:
         assert "dave@example.com" not in err
         assert _TEST_KEY_B64 not in out
         assert _TEST_KEY_B64 not in err
+
+
+def _read_one_sse_chunk(url: str, *, timeout: float = 5.0) -> str:
+    """Block until one non-empty chunk of an SSE response arrives, then return it."""
+    with httpx.stream("GET", url, timeout=timeout) as response:
+        for chunk in response.iter_text():
+            if chunk.strip():
+                return chunk
+    raise AssertionError(f"no SSE data received from {url} within {timeout}s")
+
+
+class TestPanelDoesNotShadowTheProxy:
+    def test_non_panel_path_still_proxies(self, servers: _Servers) -> None:
+        resp = _post(f"{servers.gateway_url}/v1/messages", json={"messages": []})
+        assert resp.status_code == 200
+        assert len(servers.upstream_state.requests) == 1
+
+    def test_path_merely_containing_veil_panel_as_a_substring_still_proxies(
+        self, servers: _Servers
+    ) -> None:
+        resp = _get(f"{servers.gateway_url}/v1/not-veil-panel-at-all")
+        assert resp.status_code == 200
+        assert servers.upstream_state.requests[0]["path"] == "/v1/not-veil-panel-at-all"
+
+    def test_wrong_verb_on_a_panel_route_404s_rather_than_proxying(self, servers: _Servers) -> None:
+        # GET on a POST-only panel route -- must never fall through to the
+        # real upstream with a nonsensical path.
+        resp = _get(f"{servers.gateway_url}/veil-panel/vault/reveal")
+        assert resp.status_code == 404
+        assert servers.upstream_state.requests == []
+
+    def test_unknown_panel_sub_path_404s_rather_than_proxying(self, servers: _Servers) -> None:
+        resp = _get(f"{servers.gateway_url}/veil-panel/does-not-exist")
+        assert resp.status_code == 404
+        assert servers.upstream_state.requests == []
+
+    def test_favicon_request_never_reaches_the_upstream(self, servers: _Servers) -> None:
+        """A browser tab open on the panel fetches /favicon.ico automatically.
+
+        Found during manual panel verification: without this, the favicon
+        request fell through to the proxy and was silently forwarded to the
+        real upstream API, polluting the pipeline-stream with an unrelated
+        response that looked like noise in the demo.
+        """
+        resp = _get(f"{servers.gateway_url}/favicon.ico")
+        assert resp.status_code == 204
+        assert servers.upstream_state.requests == []
+
+
+class TestPanelStaticPage:
+    def test_serves_html_with_no_build_step(self, servers: _Servers) -> None:
+        resp = _get(f"{servers.gateway_url}/veil-panel")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        body = resp.text
+        assert "react" in body.lower()
+        assert "babel" in body.lower()
+        assert "node_modules" not in body
+        assert "package.json" not in body
+
+
+class TestAuditStream:
+    def test_emits_a_new_entry_as_it_is_appended(self, servers: _Servers) -> None:
+        results: list[str] = []
+
+        def _listen() -> None:
+            results.append(_read_one_sse_chunk(f"{servers.gateway_url}/veil-panel/audit-stream"))
+
+        listener = threading.Thread(target=_listen, daemon=True)
+        listener.start()
+        time.sleep(0.3)  # let the tail seek to EOF before the write happens
+
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+        )
+
+        listener.join(timeout=5)
+        assert results, "expected one SSE chunk from the audit stream"
+        assert "PII_EMAIL_" in results[0]
+        assert "gateway" in results[0]
+        assert VALID_EMAIL not in results[0]
+
+
+def _read_sse_chunks_until_idle(
+    url: str, *, idle_timeout: float = 1.5, overall_timeout: float = 8.0
+) -> list[str]:
+    """Collect SSE chunks until the stream goes quiet for ``idle_timeout``.
+
+    Used where a single request is expected to publish *several* events in
+    quick succession (the pipeline-stage stream) and the test needs all of
+    them, not just the first -- `httpx.ReadTimeout` after a quiet stretch is
+    the natural "no more events coming soon" signal here, not a failure.
+    """
+    chunks: list[str] = []
+    deadline = time.monotonic() + overall_timeout
+    with httpx.stream("GET", url, timeout=idle_timeout) as response:
+        try:
+            for chunk in response.iter_text():
+                if chunk.strip():
+                    chunks.append(chunk)
+                if time.monotonic() > deadline:
+                    break
+        except httpx.ReadTimeout:
+            pass
+    return chunks
+
+
+class TestPipelineStream:
+    def test_emits_every_documented_stage_never_persisted_to_the_audit_log(
+        self, servers: _Servers, tmp_path: Path
+    ) -> None:
+        results: list[list[str]] = []
+
+        def _listen() -> None:
+            results.append(
+                _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+            )
+
+        listener = threading.Thread(target=_listen, daemon=True)
+        listener.start()
+        time.sleep(0.3)  # let the stream subscribe before the write happens
+
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+        )
+
+        listener.join(timeout=10)
+        assert results and results[0], "expected SSE chunks from the pipeline stream"
+        combined = "".join(results[0])
+        assert '"request_id"' in combined
+        for stage in gateway_server.PIPELINE_STAGES:
+            assert f'"stage": "{stage}"' in combined, f"missing stage {stage!r}: {combined!r}"
+
+        audit_path = tmp_path / ".veil" / "audit.jsonl"
+        if audit_path.exists():
+            assert "pipeline" not in audit_path.read_text(encoding="utf-8")
+            assert "stage" not in audit_path.read_text(encoding="utf-8")
+
+
+class TestVaultInspectorEndpoints:
+    def _mint_email_token(self, servers: _Servers) -> str:
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+        )
+        forwarded = json.loads(servers.upstream_state.requests[-1]["body"])
+        token = str(forwarded["messages"][0]["content"]).split()[-1]
+        assert token == "PII_EMAIL_0001"
+        return token
+
+    def test_list_never_includes_a_decrypted_value(self, servers: _Servers) -> None:
+        self._mint_email_token(servers)
+
+        resp = _get(f"{servers.gateway_url}/veil-panel/vault")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert VALID_EMAIL not in json.dumps(data)
+        mapping = next(m for m in data["mappings"] if m["token"] == "PII_EMAIL_0001")
+        assert mapping["entity_type"] == "EMAIL"
+        assert "ciphertext_b64" in mapping
+        assert "created_at" in mapping
+
+    def test_reveal_returns_the_value_for_the_right_token(self, servers: _Servers) -> None:
+        token = self._mint_email_token(servers)
+
+        # No session header needed: the panel defaults to the most-recently-
+        # seen real session, already set by `_mint_email_token`'s own POST.
+        resp = httpx.post(
+            f"{servers.gateway_url}/veil-panel/vault/reveal",
+            json={"token": token},
+            timeout=10,
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["value"] == VALID_EMAIL
+
+    def test_reveal_logs_a_forensic_trail_without_the_value(
+        self, servers: _Servers, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        """The one endpoint whose job is decrypting PII on request should at
+        least leave a record of when/which token, even with no auth layer.
+        """
+        token = self._mint_email_token(servers)
+        capfd.readouterr()  # discard output from minting itself
+
+        httpx.post(
+            f"{servers.gateway_url}/veil-panel/vault/reveal", json={"token": token}, timeout=10
+        )
+
+        out, err = capfd.readouterr()
+        assert token in err
+        assert VALID_EMAIL not in err
+        assert VALID_EMAIL not in out
+
+    def test_reveal_rejects_an_unknown_token(self, servers: _Servers) -> None:
+        self._mint_email_token(servers)
+
+        resp = httpx.post(
+            f"{servers.gateway_url}/veil-panel/vault/reveal",
+            json={"token": "PII_EMAIL_9999"},
+            timeout=10,
+        )
+
+        assert resp.status_code == 404
+        assert "value" not in resp.json()
+
+    def test_reveal_rejects_a_malformed_body(self, servers: _Servers) -> None:
+        resp = httpx.post(
+            f"{servers.gateway_url}/veil-panel/vault/reveal",
+            content=b"not json",
+            timeout=10,
+        )
+        assert resp.status_code == 400
+
+
+class TestMetricsEndpoint:
+    def test_reports_unavailable_when_demo_data_missing(
+        self, servers: _Servers, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _raise(*args: Any, **kwargs: Any) -> Report:
+            raise FileNotFoundError("no manifest.json")
+
+        monkeypatch.setattr(eval_module, "evaluate", _raise)
+
+        resp = _get(f"{servers.gateway_url}/veil-panel/metrics")
+
+        assert resp.status_code == 200
+        assert resp.json()["available"] is False
+
+    def test_reports_recall_and_precision_when_available(
+        self, servers: _Servers, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_report = Report(
+            by_type={"EMAIL": Metrics(support=2, true_positives=2, false_positives=0)},
+            by_detector={},
+            misses=[],
+        )
+        monkeypatch.setattr(eval_module, "evaluate", lambda *a, **k: fake_report)
+
+        resp = _get(f"{servers.gateway_url}/veil-panel/metrics")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is True
+        assert data["by_type"]["EMAIL"]["recall"] == 1.0
+        assert data["by_type"]["EMAIL"]["precision"] == 1.0

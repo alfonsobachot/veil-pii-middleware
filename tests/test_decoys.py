@@ -18,7 +18,8 @@ from pathlib import Path
 
 import pytest
 import veil_pii_middleware.core.detector as detector
-from veil_pii_middleware.core.detector import EntityType
+import veil_pii_middleware.demo.eval as eval_module
+from veil_pii_middleware.core.detector import EntityType, LLMClient, Span
 from veil_pii_middleware.demo.eval import evaluate_decoys
 from veil_pii_middleware.demo.seed import seed_demo
 
@@ -92,6 +93,7 @@ def test_every_decoy_category_is_present(corpus: tuple[Path, Path, Path]) -> Non
         "THOUSANDS_SEPARATOR",
         "VERSION_STRING",
         "ZERO_PADDED_ACCOUNT",
+        "INVALID_OCTET_IP",
     }
 
 
@@ -107,6 +109,56 @@ def test_no_decoy_is_detected_under_the_real_validators(
     report = evaluate_decoys(db_path, decoys_path)
     assert report.hits == []
     assert report.exceeds(0) is False
+
+
+# --------------------------------------------------------------------------
+# BRIEF SS6, item 16: the decoy check must exercise whatever layer(s) the
+# calling --mode enabled, not a hardcoded detect_regex() call
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_decoys_routes_through_detect_with_the_callers_flags(
+    corpus: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before this fix, `evaluate_decoys()` always called `detect_regex()`
+    directly regardless of `--mode`, so an LLM hallucinating a decoy as valid
+    PII went completely unmeasured in every mode. It must now route through
+    the same `detect()` `evaluate()` uses, with the caller's own
+    `use_regex`/`use_llm`/`llm_client`.
+    """
+    db_path, _, decoys_path = corpus
+    calls: list[tuple[bool, bool, LLMClient | None]] = []
+
+    def _fake_detect(
+        text: str,
+        *,
+        use_regex: bool = True,
+        use_llm: bool = True,
+        llm_client: LLMClient | None = None,
+    ) -> list[Span]:
+        calls.append((use_regex, use_llm, llm_client))
+        return []
+
+    monkeypatch.setattr(eval_module, "detect", _fake_detect)
+    sentinel = object.__new__(LLMClient)
+
+    eval_module.evaluate_decoys(
+        db_path, decoys_path, use_regex=False, use_llm=True, llm_client=sentinel
+    )
+
+    assert calls, "detect() was never called"
+    assert all(call == (False, True, sentinel) for call in calls)
+
+
+def test_evaluate_decoys_default_matches_regex_only_behavior(
+    corpus: tuple[Path, Path, Path],
+) -> None:
+    """Omitting use_regex/use_llm/llm_client (every pre-mission caller) must
+    reproduce today's regex-only behavior exactly.
+    """
+    db_path, _, decoys_path = corpus
+    report = evaluate_decoys(db_path, decoys_path)
+    assert report.hits == []
 
 
 # --------------------------------------------------------------------------

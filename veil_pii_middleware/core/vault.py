@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
@@ -27,10 +28,28 @@ from veil_pii_middleware.core.detector import EntityType
 __all__ = [
     "MASTER_KEY_ENV_VAR",
     "InvalidMasterKeyError",
+    "MappingInfo",
     "TokenNotFoundError",
     "Vault",
     "VaultIntegrityError",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class MappingInfo:
+    """One row of the vault, for the observability frontend's vault inspector.
+
+    Deliberately carries no plaintext and no nonce -- only what BRIEF SS5's
+    vault-inspector pane displays by default (token, type, ciphertext,
+    timestamp). Revealing the value behind a token is a separate, explicit
+    action (``Vault.resolve``), never implied by listing.
+    """
+
+    token: str
+    entity_type: str
+    ciphertext_b64: str
+    created_at: int
+
 
 #: Environment variable carrying the master key: base64-encoded, 32 raw bytes
 #: (256 bits) for AES-256-GCM. Never read from the repository or a default.
@@ -269,6 +288,32 @@ class Vault:
                 f"ciphertext for token {token!r} failed authentication"
             ) from exc
         return plaintext.decode()
+
+    def list_mappings(self) -> list[MappingInfo]:
+        """Return every mapping in this vault's session, newest first.
+
+        Read-only, and never decrypts -- ``ciphertext_b64`` is the encrypted
+        bytes as stored, unusable without the master key. This is the only
+        query the vault inspector's default (non-reveal) view is allowed to
+        use; ``resolve()`` remains the sole path to a decrypted value.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT token, entity_type, ciphertext, created_at FROM mappings
+            WHERE session_id = ?
+            ORDER BY created_at DESC, token DESC
+            """,
+            (self._session_id,),
+        )
+        return [
+            MappingInfo(
+                token=str(row[0]),
+                entity_type=str(row[1]),
+                ciphertext_b64=base64.b64encode(bytes(row[2])).decode(),
+                created_at=int(row[3]),
+            )
+            for row in cur.fetchall()
+        ]
 
     def purge_expired(self, ttl_seconds: int, *, now: int | None = None) -> int:
         """Delete mappings older than ``ttl_seconds``. Returns the count deleted.

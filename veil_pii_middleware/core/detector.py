@@ -392,11 +392,41 @@ DEFAULT_LLM_TIMEOUT_SECONDS: Final = 10.0
 
 _ENTITY_TYPE_NAMES: Final = tuple(entity_type.value for entity_type in EntityType)
 
+#: Per-type structural/format rules, added 2026-09-08 (BRIEF SS6, work-plan
+#: item 15) after mission-10's live LM Studio verification measured 0% DNI
+#: recall / 0.087 NIE precision: the model reliably found the right span but
+#: mislabeled its entity type whenever two types are structurally close, with
+#: no rule in the prompt to go on. Each line states the one distinguishing
+#: fact a chat model needs -- not a full grammar -- to stop guessing between
+#: near-identical shapes.
+_STRUCTURAL_RULES: Final = (
+    "Structural rules to tell similar-looking types apart:\n"
+    "- DNI: exactly 8 digits followed by 1 control letter, with NO leading "
+    'letter (e.g. "12345678Z").\n'
+    "- NIE: starts with X, Y or Z, then 7 digits, then 1 control letter "
+    '(e.g. "X1234567L"). The leading X/Y/Z is what makes it a NIE and not a '
+    "DNI -- a DNI never starts with a letter.\n"
+    "- IBAN: starts with 2 letters (a country code) followed by 2 digits, "
+    'then up to 30 further alphanumeric characters (e.g. "ES91 2100 0418 '
+    '4502 0005 1332").\n'
+    "- PHONE: a plain run of digits (9 for a Spanish number, more for an "
+    'international one with a "+" or "00" prefix), with no country-code '
+    "letters and no control letter -- unlike DNI/NIE/IBAN, a phone number "
+    'carries no letters at all (aside from an optional leading "+").\n'
+    "- CARD: 12 to 19 digits only, no letters, usually longer than a phone "
+    "number and grouped in 4s.\n"
+    "- IP: exactly four dot-separated numbers, each between 0 and 255 "
+    '(e.g. "192.168.1.15") -- never more or fewer than four groups, and '
+    "never a number over 255 in any group."
+)
+
 _SYSTEM_PROMPT: Final = (
     "You are a PII span detector for a debugging tool. Given a block of "
     "text, find every instance of these entity types: "
     + ", ".join(_ENTITY_TYPE_NAMES)
-    + ". Respond with ONLY a JSON object of the exact shape "
+    + ". "
+    + _STRUCTURAL_RULES
+    + " Respond with ONLY a JSON object of the exact shape "
     '{"spans": [{"value": "<exact substring copied from the text>", '
     '"entity_type": "<one of the listed types>"}, ...]} -- no prose, no '
     "markdown code fences, no explanation, nothing before or after the JSON. "

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -58,6 +59,20 @@ class TestKnownPiiTokenized:
         assert "12345678Z" not in result.stdout
         assert "PII_EMAIL_" in result.stdout
         assert "PII_DNI_" in result.stdout
+
+
+class TestAuditLogWiring:
+    def test_minted_token_produces_an_audit_entry_tagged_with_this_adapter(
+        self, tmp_path: Path
+    ) -> None:
+        result = _run("contact alice@example.com", tmp_path)
+        assert result.returncode == 0
+
+        audit_path = tmp_path / ".veil" / "audit.jsonl"
+        assert audit_path.exists()
+        entries = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        assert any(e["adapter"] == "command" and e["entity_type"] == "EMAIL" for e in entries)
+        assert "alice@example.com" not in audit_path.read_text(encoding="utf-8")
 
 
 class TestNoPiiPassesThroughUnchanged:

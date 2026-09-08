@@ -15,11 +15,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.detector import (
     LLM_BASE_URL_ENV_VAR,
     LLM_MODEL_ENV_VAR,
     EntityType,
     LLMClient,
+    Span,
     clear_llm_cache,
 )
 from veil_pii_middleware.core.tokenizer import (
@@ -559,3 +561,135 @@ class TestLLMLayerWiring:
         # No exception propagated and the call still completed -- the LLM
         # layer's failure did not block the structured entity from being
         # tokenized, matching detect()'s fail-closed contract.
+
+
+# --------------------------------------------------------------------------
+# Audit-log wiring (work-plan item 13): optional, additive, silent by default
+# --------------------------------------------------------------------------
+
+
+class TestAuditLogWiring:
+    def test_omitting_audit_log_writes_nothing(self, vault: Vault, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        tokenize(f"contact {VALID_EMAIL}", vault)
+        assert not log_path.exists()
+
+    def test_adapter_required_when_audit_log_supplied(self, vault: Vault, tmp_path: Path) -> None:
+        log = AuditLog(tmp_path / "audit.jsonl")
+        with pytest.raises(ValueError, match="adapter"):
+            tokenize(VALID_EMAIL, vault, audit_log=log)
+
+    def test_one_entry_per_substituted_span(self, vault: Vault, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log = AuditLog(log_path)
+        text = f"Cliente {VALID_EMAIL}, DNI {VALID_DNI}"
+
+        tokenize(text, vault, audit_log=log, adapter="test")
+
+        entries = list(AuditLog.read_entries(log_path))
+        assert len(entries) == 2
+        by_type = {e.entity_type: e for e in entries}
+        assert by_type["EMAIL"].token == "PII_EMAIL_0001"
+        assert by_type["EMAIL"].detector == "REGEX"
+        assert by_type["EMAIL"].adapter == "test"
+        assert by_type["DNI"].token == "PII_DNI_0001"
+
+    def test_audit_entries_across_string_leaves_in_a_structure(
+        self, vault: Vault, tmp_path: Path
+    ) -> None:
+        log = AuditLog(tmp_path / "audit.jsonl")
+        payload: JSONValue = {"a": VALID_EMAIL, "b": [VALID_DNI]}
+
+        tokenize(payload, vault, audit_log=log, adapter="test")
+
+        entries = list(AuditLog.read_entries(tmp_path / "audit.jsonl"))
+        assert {e.entity_type for e in entries} == {"EMAIL", "DNI"}
+
+    def test_no_raw_value_ever_written(self, vault: Vault, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log = AuditLog(log_path)
+        tokenize(f"contact {VALID_EMAIL}", vault, audit_log=log, adapter="test")
+        assert VALID_EMAIL not in log_path.read_text(encoding="utf-8")
+
+
+class TestSpanSinkForThePipelinePanel:
+    def test_span_sink_receives_every_span_before_substitution(self, vault: Vault) -> None:
+        text = f"Cliente {VALID_EMAIL}, DNI {VALID_DNI}"
+        spans: list[Span] = []
+
+        result = tokenize(text, vault, span_sink=spans)
+
+        assert isinstance(result, str)
+        assert {s.entity_type.value for s in spans} == {"EMAIL", "DNI"}
+        for span in spans:
+            assert text[span.start : span.end] == span.text
+
+    def test_span_sink_empty_when_no_pii(self, vault: Vault) -> None:
+        spans: list[Span] = []
+        tokenize("nothing sensitive here", vault, span_sink=spans)
+        assert spans == []
+
+    def test_span_sink_not_populated_when_omitted(self, vault: Vault) -> None:
+        # Nothing to assert on a parameter the caller never passed -- this
+        # just proves tokenize() still works with span_sink entirely absent.
+        result = tokenize(VALID_EMAIL, vault)
+        assert result == "PII_EMAIL_0001"
+
+
+class TestSkipPredicateForProtocolMetadata:
+    """`skip` excludes known protocol/metadata content, never user content.
+
+    Motivated by a live finding: Claude Code injects a reserved system-prompt
+    block ("x-anthropic-billing-header: cc_version=...; cc_entrypoint=...;")
+    into every request; the LLM layer mistook its "cc_" prefix for a
+    credit-card indicator and tokenized it, and the real Anthropic API
+    rejects the whole request if that exact block is altered at all. `skip`
+    is the general mechanism the gateway adapter uses to exclude it.
+    """
+
+    def test_skipped_leaf_passes_through_completely_unscanned(self, vault: Vault) -> None:
+        text = f"contact {VALID_EMAIL}"
+        result = tokenize(text, vault, skip=lambda t: True)
+        assert result == text
+
+    def test_skip_only_applies_to_matching_leaves(self, vault: Vault) -> None:
+        payload: JSONValue = {
+            "metadata": "reserved: do-not-scan-me",
+            "message": VALID_EMAIL,
+        }
+
+        result = tokenize(payload, vault, skip=lambda t: t.startswith("reserved:"))
+
+        assert isinstance(result, dict)
+        assert result["metadata"] == "reserved: do-not-scan-me"
+        assert result["message"] == "PII_EMAIL_0001"
+
+    def test_skipped_leaf_produces_no_audit_entry(self, vault: Vault, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log = AuditLog(log_path)
+        # A value that would otherwise be detected -- proves skip prevents
+        # detection itself, not just substitution.
+        text = f"reserved: {VALID_EMAIL}"
+
+        result = tokenize(
+            text,
+            vault,
+            skip=lambda t: t.startswith("reserved:"),
+            audit_log=log,
+            adapter="test",
+        )
+
+        assert result == text
+        assert not log_path.exists()
+
+    def test_skipped_leaf_is_absent_from_span_sink(self, vault: Vault) -> None:
+        spans: list[Span] = []
+        text = f"reserved: {VALID_EMAIL}"
+
+        tokenize(text, vault, skip=lambda t: t.startswith("reserved:"), span_sink=spans)
+
+        assert spans == []
+
+    def test_omitting_skip_scans_everything_as_before(self, vault: Vault) -> None:
+        result = tokenize(VALID_EMAIL, vault)
+        assert result == "PII_EMAIL_0001"

@@ -22,6 +22,7 @@ expected to reach it and gating it would leave the gate permanently red.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -37,7 +38,6 @@ from veil_pii_middleware.core.detector import (
     LLMClient,
     Span,
     detect,
-    detect_regex,
 )
 from veil_pii_middleware.demo.seed import (
     DEFAULT_DB_PATH,
@@ -119,7 +119,14 @@ def _load_texts(db_path: Path, cells: set[tuple[str, str, int]]) -> dict[tuple[s
     for table, column, row_id in cells:
         by_column[(table, column)].append(row_id)
 
-    with sqlite3.connect(db_path) as connection:
+    # `with sqlite3.connect(...)` only commits/rolls back on exit -- it does
+    # NOT close the connection (a common Python sqlite3 pitfall). That never
+    # mattered for eval.py's own short-lived CLI process, but the gateway's
+    # `/veil-panel/metrics` endpoint calls this repeatedly from one
+    # long-running process, so a real close is needed or the file handle
+    # outlives this call and blocks `seed.py` from regenerating the database
+    # (observed: `PermissionError` on Windows).
+    with contextlib.closing(sqlite3.connect(db_path)) as connection:
         for (table, column), row_ids in sorted(by_column.items()):
             # Identifiers come from the manifest this repo generates, never
             # from user input, and sqlite cannot parameterize them.
@@ -230,14 +237,25 @@ class DecoyReport:
 
 
 def evaluate_decoys(
-    db_path: Path = DEFAULT_DB_PATH, decoys_path: Path = DEFAULT_DECOYS_PATH
+    db_path: Path = DEFAULT_DB_PATH,
+    decoys_path: Path = DEFAULT_DECOYS_PATH,
+    *,
+    use_regex: bool = True,
+    use_llm: bool = False,
+    llm_client: LLMClient | None = None,
 ) -> DecoyReport:
-    """Score the regex layer against values that must never be detected.
+    """Score the enabled layer(s) against values that must never be detected.
 
     `decoys_path` is a known-negative set, symmetric to the manifest's
     known-positive one: none of these values appear in the manifest, and a
     span landing on one of them is a false positive by definition, not a
     judgement call the way an unmatched span in `evaluate()` can be.
+
+    `use_regex`/`use_llm`/`llm_client` mirror `evaluate()`'s own -- routing
+    through `detect()` instead of a hardcoded regex-only call means a
+    `--mode llm`/`--mode union` run's decoy check actually exercises the LLM
+    layer too (BRIEF SS6: previously this check never did, in any mode, so an
+    LLM hallucinating a decoy as valid would have gone completely unmeasured).
     """
     decoys: list[dict[str, Any]] = json.loads(decoys_path.read_text(encoding="utf-8"))
     cells = {(str(d["table"]), str(d["column"]), int(d["row_id"])) for d in decoys}
@@ -250,7 +268,8 @@ def evaluate_decoys(
         if text is None:
             raise ValueError(f"decoy points at a row that is not in the database: {cell}")
         offset, value = int(decoy["offset"]), str(decoy["value"])
-        for span in detect_regex(text):
+        spans = detect(text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client)
+        for span in spans:
             if span.start == offset and span.text == value:
                 hits.append(
                     DecoyHit(
@@ -354,12 +373,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     mode: Mode = args.mode
 
+    use_regex = mode in ("regex", "union")
+    use_llm = mode in ("llm", "union")
     llm_client = _llm_client_from_env() if mode != "regex" else None
     try:
         report = evaluate(args.db, args.manifest, mode=mode, llm_client=llm_client)
         _print_report(report, args.min_recall)
 
-        decoy_report = evaluate_decoys(args.db, args.decoys)
+        # Same use_regex/use_llm/llm_client this run already resolved for
+        # evaluate() above (BRIEF SS6, item 16) -- previously this call
+        # always hardcoded detect_regex(), so an LLM hallucinating a decoy
+        # as valid PII went completely unmeasured in every --mode. Now
+        # --mode llm/union's decoy check exercises the LLM layer too, the
+        # same layer(s) that mode's recall numbers reflect.
+        decoy_report = evaluate_decoys(
+            args.db, args.decoys, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client
+        )
         _print_decoy_report(decoy_report, args.max_false_positives)
     finally:
         if llm_client is not None:
@@ -367,16 +396,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # The recall gate is scoped to --mode regex only (an LLM-only/union run
     # is not expected to reach it and gating it would leave the gate
-    # permanently red) -- but evaluate_decoys() always scores the regex
-    # layer regardless of --mode, so a genuine regex false-positive
-    # regression must still fail the process even when --mode is llm/union,
-    # not be silently swallowed by that mode's "report-only" framing.
+    # permanently red). The decoy gate still runs and still fails the
+    # process in every mode, but as of BRIEF SS6 item 16 it now scores
+    # whichever layer(s) that mode enabled (regex-only, LLM-only, or the
+    # union) -- symmetric with what that mode's recall numbers reflect,
+    # rather than always silently checking regex alone.
     recall_failed = mode == "regex" and bool(report.failing_types(args.min_recall))
     decoys_failed = decoy_report.exceeds(args.max_false_positives)
     if mode != "regex":
         print(
             f"\n--mode {mode}'s recall is report-only (exit code reflects --mode regex's "
-            "recall gate only); the decoy false-positive gate still applies regardless of --mode."
+            f"recall gate only); the decoy false-positive gate still applies, scored against "
+            f"--mode {mode}'s own enabled layer(s)."
         )
     return 1 if recall_failed or decoys_failed else 0
 
