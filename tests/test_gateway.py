@@ -1098,6 +1098,61 @@ class TestCycleKindClassification:
             event = next(e for e in events if e["stage"] == stage)
             assert event["kind"] == "conversation", stage
 
+    def test_a_real_turn_prefixed_with_a_system_reminder_is_not_hidden(
+        self, servers: _Servers
+    ) -> None:
+        """Regression guard: this was the actual over-hiding bug reported live.
+
+        Claude Code prepends a `<system-reminder>` block before the human's
+        own typed text on essentially every real conversational turn (not
+        just on agent-loop continuation turns whose *only* content is a
+        reminder) -- a plain `str.startswith("<system-reminder")` check
+        mislabeled every one of these as `"internal_continuation"`, hiding
+        virtually all real conversation from the panel's default view.
+        """
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<system-reminder>\ntoken budget: 42\n</system-reminder>\n"
+                    "Soy Alfonso, mi DNI es 12345678A",
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "conversation", stage
+
+    def test_session_tag_around_real_content_does_not_force_title_generation(
+        self, servers: _Servers
+    ) -> None:
+        """`<session>` alone must not be the title-generation signal.
+
+        A human tester live-reported an ordinary conversational turn whose
+        content was also wrapped in `<session>...</session>` -- distinct
+        from Claude Code's dedicated title-generation request, which is
+        identified by its own system prompt (`_TITLE_GENERATION_SYSTEM_MARKER`),
+        not by the presence of a `<session>` tag.
+        """
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<session>\nprior context\n</session>\n"
+                    "Soy Alfonso, mi DNI es 12345678A",
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "conversation", stage
+
 
 class TestMessageTextExtraction:
     """Mission-12: panes must show the human message, not the raw JSON document.
@@ -1180,6 +1235,34 @@ class TestMessageTextExtraction:
         received = next(e for e in events if e["stage"] == "received")
         assert received["text"]
         assert "[tool_result]" in received["text"]
+
+    def test_input_pane_shows_exactly_the_human_typed_text_no_more_no_less(
+        self, servers: _Servers
+    ) -> None:
+        """Live-reported regression: injected wrapper tags must not leak into the pane.
+
+        A real Claude Code turn interleaves `<system-reminder>` (and
+        occasionally `<session>`) framing with the human's own text in the
+        very same message. The Input pane must show exactly what the human
+        typed -- "ni mas ni menos" -- not that framing.
+        """
+        human_text = "Soy Alfonso, mi DNI es 12345678A"
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<system-reminder>\nsome budget note\n</system-reminder>\n"
+                    f"<session>\nprior context\n</session>\n{human_text}",
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        received = next(e for e in events if e["stage"] == "received")
+        assert received["text"] == human_text
+        assert "system-reminder" not in received["text"]
+        assert "session" not in received["text"]
 
 
 class TestResponseTextExtraction:

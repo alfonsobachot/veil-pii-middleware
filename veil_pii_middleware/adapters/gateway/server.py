@@ -90,6 +90,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import sqlite3
 import sys
 import threading
@@ -510,12 +511,50 @@ def _default_llm_client_for_display() -> LLMClient | None:
 #: request in the panel as if it were a real conversational turn.
 _TITLE_GENERATION_SYSTEM_MARKER: Final = "naming a coding session"
 
-#: Prefix Claude Code itself uses to wrap agent-loop-injected content
-#: (tool results, token-budget reminders, sub-agent instructions) that is
-#: not anything a human typed -- confirmed the same way as the marker
-#: above. A cycle whose extracted last-user-message text is entirely one
-#: of these carries no human-authored input to show.
-_INTERNAL_CONTINUATION_PREFIX: Final = "<system-reminder"
+#: Tag names Claude Code itself wraps around non-human-authored content
+#: within an otherwise-ordinary user turn -- confirmed the same way as the
+#: marker above, and directly by this project's own live Claude Code
+#: sessions: a `<system-reminder>` block is prepended to essentially every
+#: real conversational turn, and `<local-command-caveat>`/`<command-name>`/
+#: `<command-message>`/`<command-args>`/`<local-command-stdout>` wrap a
+#: local slash-command's echoed output. `<session>` wraps session context
+#: Claude Code includes both in its dedicated title-generation request and,
+#: live-reported by a human tester, around context it prepends to an
+#: ordinary conversational turn too -- so its presence alone must not be
+#: used to hide a cycle (see ``_TITLE_GENERATION_SYSTEM_MARKER`` for that).
+#: Stripped from *displayed* text only -- never from what is tokenized or
+#: forwarded upstream, which is computed separately from the untouched
+#: parsed body.
+_INJECTED_WRAPPER_TAGS: Final = (
+    "system-reminder",
+    "local-command-caveat",
+    "local-command-stdout",
+    "command-name",
+    "command-message",
+    "command-args",
+    "session",
+)
+
+_INJECTED_WRAPPER_TAG_RE: Final = re.compile(
+    r"<(" + "|".join(_INJECTED_WRAPPER_TAGS) + r")\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_injected_wrapper_tags(text: str) -> str:
+    """Remove Claude-Code-injected framing blocks, leaving only human-authored text.
+
+    A real user turn is not always *just* what the human typed -- Claude
+    Code interleaves framing like `<system-reminder>...</system-reminder>`
+    or `<session>...</session>` in the same message. The panel's Input pane
+    must show exactly what the human typed, "ni mas ni menos" -- so this
+    removes every recognized wrapper block (``_INJECTED_WRAPPER_TAGS``,
+    best-effort by tag name, not a protocol guarantee) and collapses the
+    blank lines left behind, rather than showing the raw interleaved text
+    or hiding the whole cycle because a wrapper happens to sit at the start.
+    """
+    stripped = _INJECTED_WRAPPER_TAG_RE.sub("", text)
+    return re.sub(r"\n{2,}", "\n", stripped).strip()
 
 
 def _extract_system_text(parsed: JSONValue) -> str:
@@ -540,7 +579,7 @@ def _extract_system_text(parsed: JSONValue) -> str:
     return "\n".join(parts)
 
 
-def _classify_cycle_kind(parsed: JSONValue, received_text: str) -> str:
+def _classify_cycle_kind(parsed: JSONValue, stripped_received_text: str) -> str:
     """Best-effort label for what kind of request this cycle is.
 
     Heuristic, not a protocol guarantee. ``"title_generation"`` and
@@ -550,10 +589,20 @@ def _classify_cycle_kind(parsed: JSONValue, received_text: str) -> str:
     because anything about them is wrong. ``"conversation"`` is the
     default for everything else, including a request this heuristic fails
     to recognize as one of the other two.
+
+    ``stripped_received_text`` must already have gone through
+    ``_strip_injected_wrapper_tags`` -- classifying on the *raw* text would
+    mislabel any ordinary conversational turn that happens to have a
+    `<system-reminder>` (or other wrapper) block interleaved with the
+    human's own text as ``"internal_continuation"``, which is the
+    over-hiding bug this replaced: a plain prefix check on the raw text
+    fires on the common case where Claude Code prepends a reminder block
+    *before* real human-authored content, not just on a turn that is
+    entirely reminder content.
     """
     if _TITLE_GENERATION_SYSTEM_MARKER in _extract_system_text(parsed).lower():
         return "title_generation"
-    if received_text.strip().lower().startswith(_INTERNAL_CONTINUATION_PREFIX):
+    if not stripped_received_text:
         return "internal_continuation"
     return "conversation"
 
@@ -565,17 +614,25 @@ def _tokenize_body(
 
     Returns ``(forward_body, received_text, received_spans, outbound_text, cycle_kind)``:
     ``received_text`` is the last user message's display text *before*
-    substitution (``_extract_last_user_message_text``); ``received_spans``
-    is that same text's own spans, with offsets relative to ``received_text``
-    itself -- ``core/tokenizer.py``'s per-leaf ``span_sink`` has no leaf
-    identity attached, so those offsets cannot be reused against a shorter
-    display string without misaligning, hence one extra, scoped ``detect()``
-    call here instead (a cache hit, not a second LLM round trip, whenever
-    ``received_text`` is exactly a leaf ``tokenize()`` already scanned --
-    true whenever the message's content is a single string); ``outbound_text``
-    is the same message's text *after* substitution, for the "Outbound to
-    API" pane; ``cycle_kind`` is ``_classify_cycle_kind``'s label for the
-    whole cycle.
+    substitution (``_extract_last_user_message_text``, then
+    ``_strip_injected_wrapper_tags`` so the pane shows exactly what the
+    human typed, not Claude-Code-injected framing interleaved with it);
+    ``received_spans`` is that same stripped text's own spans, with offsets
+    relative to ``received_text`` itself -- ``core/tokenizer.py``'s per-leaf
+    ``span_sink`` has no leaf identity attached, so those offsets cannot be
+    reused against a shorter display string without misaligning, hence one
+    extra, scoped ``detect()`` call here instead (a cache hit, not a second
+    LLM round trip, whenever ``received_text`` is exactly a leaf
+    ``tokenize()`` already scanned -- true whenever the message's content is
+    a single string with no wrapper tags to strip); ``outbound_text`` is the
+    same message's text *after* substitution, likewise stripped, for the
+    "Outbound to API" pane; ``cycle_kind`` is ``_classify_cycle_kind``'s
+    label for the whole cycle, computed from the *stripped* received text.
+
+    The stripping only affects what this function returns for the
+    pipeline-stream side channel -- ``tokenize()`` above runs against the
+    untouched ``parsed`` body, so what is actually forwarded upstream is
+    unaffected.
     """
     parsed = json.loads(raw_body)
     display_client = _default_llm_client_for_display()
@@ -590,8 +647,8 @@ def _tokenize_body(
                 adapter="gateway",
                 skip=_skip_reserved_anthropic_metadata,
             )
-        received_text = _extract_last_user_message_text(parsed)
-        outbound_text = _extract_last_user_message_text(tokenized)
+        received_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(parsed))
+        outbound_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(tokenized))
         cycle_kind = _classify_cycle_kind(parsed, received_text)
         received_spans = (
             detect(

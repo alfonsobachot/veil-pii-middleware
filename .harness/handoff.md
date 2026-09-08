@@ -161,8 +161,113 @@ the `pinnedToLatest` flag by comparing whatever was *already* selected
 against the newest cycle, which is a no-op unless they already matched.
 Fixed to actually select the latest visible cycle.
 
+## Post-writeup fix #2 (over-hiding regression, found during the human's own live testing)
+
+After the first post-writeup fix above shipped, the human reported it
+over-corrected: the cycle selector was now hiding essentially every real
+conversational turn, and the Input pane still showed injected wrapper
+text instead of exactly what they typed. Root cause: `_classify_cycle_kind`'s
+`internal_continuation` check was `received_text.strip().lower().startswith("<system-reminder")`.
+Claude Code prepends a `<system-reminder>` block before the human's own
+typed text on essentially every real turn (visible in this very
+project's own live sessions), not just on turns that are *entirely*
+reminder content — so the prefix check fired on almost everything.
+
+Fix: a new `_strip_injected_wrapper_tags` (`adapters/gateway/server.py`)
+removes known Claude-Code-injected framing blocks --
+`<system-reminder>`, `<local-command-caveat>`, `<command-name>`,
+`<command-message>`, `<command-args>`, `<local-command-stdout>`,
+`<session>` -- from `received_text`/`outbound_text` before they are
+classified or displayed. `_classify_cycle_kind` now takes the
+*already-stripped* text and only returns `"internal_continuation"` when
+nothing human-authored survives the stripping, not on a prefix match.
+`<session>` is included because a human tester live-reported it wrapping
+part of an *ordinary* conversational turn's content, not only Claude
+Code's dedicated title-generation request (which is still identified
+independently, via `_TITLE_GENERATION_SYSTEM_MARKER` in the system
+prompt) -- so its mere presence must never by itself hide a cycle.
+
+New tests in `tests/test_gateway.py`: `TestCycleKindClassification::test_a_real_turn_prefixed_with_a_system_reminder_is_not_hidden`,
+`::test_session_tag_around_real_content_does_not_force_title_generation`,
+and `TestMessageTextExtraction::test_input_pane_shows_exactly_the_human_typed_text_no_more_no_less`
+(asserts the Input pane text equals the human-typed string exactly, with
+no wrapper-tag substrings present). Full `.harness/bin/verify` re-run:
+exit 0.
+
+**Live re-verification.** Started a real gateway process
+(`VEIL_LLM_BASE_URL=http://192.168.31.123:1234 VEIL_LLM_MODEL=qwen_qwen3-4b-instruct-2507`,
+a reachable LM Studio instance) and, from a separate process (never this
+session's own connection, per this project's established pattern),
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8788 claude -p "Soy Alfonso, mi DNI
+es 12345678A. Dame la informacion de esta manera: DNI: [DNI_NUMBER],
+NOMBRE: [NOMBRE]"`. Captured the pipeline-stream's replayed backlog
+afterward (raw socket read of `/veil-panel/pipeline-stream`, since the
+in-memory ring buffer holds the last `PIPELINE_HISTORY_LIMIT` cycles).
+The `"received"` stage of the conversational cycle was exactly
+`"Soy Alfonso, mi DNI es 12345678A. Dame la informacion de esta manera:
+DNI: [DNI_NUMBER], NOMBRE: [NOMBRE]"` -- the literal typed text, no
+`<system-reminder>`/`<session>` wrapper, confirming the fix live, not
+just in tests. `claude -p`'s own CLI wrapping did not add a
+`<system-reminder>` block ahead of the human text in this run (an
+interactive session's transcript, including this one's, shows it does in
+that mode) -- both shapes are now handled correctly either way, since the
+fix strips the tag if present and is a no-op if absent.
+
+## Live investigation of the reported output-format issue (found same session, NOT fixed here)
+
+The human separately reported: "the format is wrong" when asking, in the
+same message, for the answer formatted as `DNI: [DNI_NUMBER], NOMBRE:
+[NOMBRE]`. Investigated with the same live gateway/`claude -p` capture
+above rather than guessing (this project's own precedent: the original
+`<session>`/title-generation finding earlier in this mission was also
+only found by capturing real traffic, not by reasoning about it).
+
+**Finding: this is not a text-extraction or substitution bug.** The
+`"detokenized"`/`"displayed"` pipeline stage for the cycle that produced
+the actual answer read exactly `"DNI: 12345678A, NOMBRE: Alfonso\n\nNota:
+..."` -- the requested template, byte-for-byte, values correctly resolved
+from `PII_DNI_0001` back to `12345678A`. `response_received` (pre-
+detokenization) showed `"DNI: PII_DNI_0001, NOMBRE: Alfonso"` --
+confirming the LLM itself received and honored the requested format; our
+substitution round-trip did not corrupt it.
+
+**What actually looks broken:** Claude Code's own agent loop split this
+one logical "turn" across *two separate gateway request/response cycles*.
+The cycle whose `"received"` stage shows the human's own exact typed
+text (`request_id` `8a36d68d...` in this run) got an **empty** response
+in this pipeline capture. The actual formatted answer landed on a
+*different* cycle (`e00a2404...`) whose own `"received"` stage is just
+the generic placeholder `"[tool_result]"` -- i.e., a follow-up request
+Claude Code made as part of its own agent loop, not something that reads,
+in the panel, as connected to the human's question at all. A human
+looking at the panel, selecting the chip that shows their own message,
+would see a blank Output pane, while the real (correctly formatted)
+answer sits under an unrelated-looking `"[tool_result]"` chip -- which is
+exactly the kind of thing a user would describe as "the format is wrong"
+even though every byte of the actual text is correct.
+
+**Why this is not fixed in this pass:** this is a materially different,
+larger problem than the wrapper-tag/over-hiding bug above -- it is about
+*which gateway request/response cycles belong to the same logical
+conversational turn*, a correlation this mission's per-HTTP-request cycle
+model does not attempt. Fixing it needs a real design decision (e.g.,
+chaining cycles within one `session_id` whose predecessor's response
+`stop_reason` was `tool_use`, and how to render that chain in the
+selector/panes) that deserves its own Intake Grill, not a guess bolted
+onto this reopening. Flagged for human follow-up below rather than
+silently scope-creeped in.
+
 ## Remaining for human follow-up
 
+- **New, needs its own scoping decision: cross-cycle correlation for the
+  "output format" report.** See "Live investigation of the reported
+  output-format issue" above. The text itself is correct end to end;
+  what's missing is a way for the panel to show one logical conversational
+  turn (which can span multiple gateway request/response cycles once
+  Claude Code's agent loop makes an intermediate tool-use round-trip) as
+  one connected thing, instead of the answer appearing to vanish from the
+  cycle the human recognizes as "their" message. Needs a human decision on
+  approach before a mission is scoped for it.
 - **The live LLM/union comparison numbers were never exercised against a
   real LM Studio instance this mission** (none was reachable) — only the
   partial-failure path (regex real, LLM/union unavailable) was proven, live

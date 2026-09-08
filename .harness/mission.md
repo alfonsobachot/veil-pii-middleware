@@ -333,6 +333,41 @@ No commit, push, or merge without explicit human review of the diff and
 
 implemented — awaiting human review for merge (see `.harness/handoff.md`).
 
+Reopened and re-closed 2026-09-08: the human live-tested the
+`_classify_cycle_kind` fix below (their own prior approval) and reported
+it over-hides real conversation, and that the Input pane still shows
+injected wrapper text (`<session>...</session>`, etc.) instead of exactly
+what they typed. This was a regression fix against this mission's own
+already-approved scope (same file, same functions), not new scope, so it
+proceeded under the existing approval rather than a fresh Intake Grill
+round. Root cause: `_classify_cycle_kind`'s `internal_continuation` check
+used `received_text.strip().lower().startswith("<system-reminder")` —
+true for *any* real conversational turn where Claude Code happens to
+prepend a `<system-reminder>` block before the human's own typed text
+(the common case, confirmed by this very session's own transcript shape),
+not just for a turn that is *entirely* reminder content. Fixed by
+stripping known Claude-Code-injected wrapper tags (`<system-reminder>`,
+`<local-command-caveat>`, `<command-name>`, `<command-message>`,
+`<command-args>`, `<local-command-stdout>`, `<session>`) out of the
+*displayed* text via a new `_strip_injected_wrapper_tags`, applied to
+`received_text`/`outbound_text` before they're shown or classified;
+`internal_continuation` now fires only when nothing human-authored
+survives that stripping, not on a mere prefix match. Re-verified: full
+`.harness/bin/verify` (exit 0) plus a live capture through a real gateway
+process and a separate `claude -p` call (see `.harness/handoff.md`).
+
+The same live session surfaced a second, distinct, NOT-yet-fixed issue
+(the human's separately reported "el formato es erróneo" report) — see
+`.harness/handoff.md`'s "Live investigation of the reported output-format
+issue" section and "Remaining for human follow-up" below. It is
+out-of-scope for this reopening: it is not a defect in text
+extraction/substitution (both are byte-for-byte correct, live-confirmed)
+but a cross-cycle UX gap needing its own scoping conversation.
+
+---
+
+implemented — awaiting human review for merge (see `.harness/handoff.md`).
+
 Root cause of the three live-testing observations, confirmed by capturing
 raw traffic through a throwaway diagnostic proxy that bypassed this
 module's own extraction entirely: all three are genuine Claude Code
