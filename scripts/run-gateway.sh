@@ -22,10 +22,17 @@ fi
 export VEIL_VAULT_KEY
 VEIL_VAULT_KEY="$(cat "$KEY_FILE")"
 
-# Optional LLM detection layer (names, addresses, ...). Override by exporting
-# these yourself before calling this script; unset them to run regex-only.
-export VEIL_LLM_BASE_URL="${VEIL_LLM_BASE_URL:-http://192.168.31.123:1234}"
-export VEIL_LLM_MODEL="${VEIL_LLM_MODEL:-qwen_qwen3-4b-instruct-2507}"
+# Optional LLM detection layer (names, addresses, ...). Export both
+# VEIL_LLM_BASE_URL and VEIL_LLM_MODEL yourself before calling this script to
+# enable it (e.g. an LM Studio/Ollama instance on your own LAN or machine);
+# leave them unset to run regex-only -- there is no default host here, since
+# any fixed default would point at somebody's personal machine.
+if [ -n "${VEIL_LLM_BASE_URL:-}" ]; then
+  export VEIL_LLM_BASE_URL
+fi
+if [ -n "${VEIL_LLM_MODEL:-}" ]; then
+  export VEIL_LLM_MODEL
+fi
 
 echo "veil: panel at http://127.0.0.1:$PORT/veil-panel"
 echo "veil: point a client at it with ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT (see scripts/ask.sh)"
