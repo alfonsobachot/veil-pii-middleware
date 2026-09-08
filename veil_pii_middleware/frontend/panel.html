@@ -30,15 +30,53 @@
     display: flex;
     align-items: baseline;
     gap: 10px;
+    flex-wrap: wrap;
   }
   header h1 { font-size: 15px; margin: 0; }
   header .sub { color: var(--muted); }
+
+  #tabs { display: flex; gap: 4px; margin-left: auto; }
+  .tab-btn {
+    font: inherit;
+    background: none;
+    color: var(--muted);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  .tab-btn.active { color: var(--text); border-color: var(--stage-active); background: var(--panel); }
+
+  #cycle-selector {
+    display: flex;
+    gap: 6px;
+    padding: 10px 16px 0;
+    overflow-x: auto;
+  }
+  .cycle-chip {
+    font: inherit;
+    background: var(--panel);
+    color: var(--muted);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cycle-chip.selected { color: var(--text); border-color: var(--stage-active); }
+  .cycle-chip.in-flight { border-style: dashed; }
+  .cycle-chip.internal-kind { opacity: 0.6; font-style: italic; }
+  .cycle-empty { color: var(--muted); padding: 10px 16px 0; }
+  #show-internal-toggle { margin: 6px 16px 0; font-size: 12px; color: var(--muted); }
 
   #pipeline {
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 16px;
+    padding: 16px 16px 4px;
     overflow-x: auto;
   }
   .stage-box {
@@ -55,7 +93,16 @@
     border-color: var(--stage-active);
     color: #fff;
   }
+  .stage-box.pending { opacity: 0.4; }
   .arrow { color: var(--muted); }
+
+  #stage-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 16px 12px;
+  }
+  #stage-caption { color: var(--muted); padding: 0 16px 12px; min-height: 1.2em; }
 
   #panes {
     display: grid;
@@ -84,13 +131,14 @@
     font-family: ui-monospace, Consolas, monospace;
     font-size: 12px;
   }
+  .pane-pending { color: var(--muted); font-style: italic; }
   .span-regex { background: color-mix(in srgb, var(--regex) 35%, transparent); border-radius: 2px; }
   .span-llm { background: color-mix(in srgb, var(--llm) 35%, transparent); border-radius: 2px; }
   .token { text-decoration: underline dotted var(--muted); cursor: help; }
 
   #bottom {
     display: grid;
-    grid-template-columns: 1.1fr 0.9fr 0.9fr;
+    grid-template-columns: 1fr 1fr;
     gap: 12px;
     padding: 0 16px 16px;
   }
@@ -108,10 +156,15 @@
     padding: 2px 8px;
     cursor: pointer;
   }
-  button:hover { border-color: var(--stage-active); }
+  button:hover:not(:disabled) { border-color: var(--stage-active); }
+  button:disabled { opacity: 0.4; cursor: default; }
   .legend { display: flex; gap: 14px; color: var(--muted); padding: 0 16px 8px; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  #metrics-tab { padding: 16px; }
+  .metrics-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .mode-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 </style>
 </head>
 <body>
@@ -132,6 +185,36 @@ const STAGE_LABEL = {
   response_received: "Response received",
   detokenized: "Detokenized",
   displayed: "Displayed",
+};
+// One line per stage explaining what it does -- shown as the step-through
+// caption, since the real cycle happens far too fast to read live (BRIEF's
+// own "timebox this" warning, and the reason this walkthrough exists).
+const STAGE_EXPLANATION = {
+  received: "The gateway reads the raw request and scans it for PII spans (regex + LLM layers).",
+  tokenized: "Every detected span is replaced with a stable PII_<TYPE>_<NNNN> vault token.",
+  forwarded: "The tokenized body is sent to the real Anthropic API -- no raw PII ever leaves this machine.",
+  response_received: "The model's response arrives, potentially echoing a token back.",
+  detokenized: "Any token the model echoed is resolved back to its real value.",
+  displayed: "The fully-resolved response reaches the developer's terminal.",
+};
+
+// Which stage index must have been reached before each pane has anything
+// to show -- mirrors which pipeline event first populates that pane's text.
+const PANE_STAGE_INDEX = { input: 0, outbound: 1, response: 3, developer: 4 };
+
+const HISTORY_LIMIT = 20; // must match gateway_server.PIPELINE_HISTORY_LIMIT
+const PLAY_INTERVAL_MS = 900;
+
+// Cycle kinds gateway_server._classify_cycle_kind can tag a cycle with,
+// hidden from the selector by default: real Claude Code requests, but
+// neither is anything a human typed (a session-title-generation request;
+// an agent-loop continuation turn whose only "new" content is a
+// Claude-Code-injected <system-reminder> block). A "Show N hidden" toggle
+// reveals them for anyone who wants to inspect them anyway.
+const HIDDEN_KINDS = new Set(["title_generation", "internal_continuation"]);
+const HIDDEN_KIND_LABEL = {
+  title_generation: "session title request",
+  internal_continuation: "internal agent-loop turn",
 };
 
 const TOKEN_RE = /PII_([A-Z]+)_\d{4}/g;
@@ -191,13 +274,69 @@ function useEventSource(path, onEvent) {
   }, [path]);
 }
 
-function Pipeline({ currentStage }) {
+function cyclePreview(cycle) {
+  const text = (cycle.stages.received && cycle.stages.received.text) || "";
+  const trimmed = text.slice(0, 36);
+  const preview = trimmed ? trimmed + (text.length > 36 ? "…" : "") : "(no input text yet)";
+  const kindLabel = HIDDEN_KIND_LABEL[cycle.kind];
+  return kindLabel ? `[${kindLabel}] ${preview}` : preview;
+}
+
+function cycleIsComplete(cycle) {
+  return STAGES.every((stage) => cycle.stages[stage]);
+}
+
+function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount, showInternal, onToggleShowInternal }) {
+  return (
+    <>
+      {order.length === 0 ? (
+        <p className="cycle-empty">No requests observed yet -- run one through the gateway.</p>
+      ) : (
+        <div id="cycle-selector">
+          {[...order].reverse().map((requestId) => {
+            const cycle = cycles[requestId];
+            if (!cycle) return null;
+            const classes = ["cycle-chip"];
+            if (requestId === selectedRequestId) classes.push("selected");
+            if (!cycleIsComplete(cycle)) classes.push("in-flight");
+            if (HIDDEN_KINDS.has(cycle.kind)) classes.push("internal-kind");
+            return (
+              <button
+                key={requestId}
+                className={classes.join(" ")}
+                title={cyclePreview(cycle)}
+                onClick={() => onSelect(requestId)}
+              >
+                {cyclePreview(cycle)}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {(hiddenCount > 0 || showInternal) && (
+        <button id="show-internal-toggle" onClick={onToggleShowInternal}>
+          {showInternal
+            ? "Hide session-title / internal-agent-loop cycles"
+            : `Show ${hiddenCount} hidden session-title / internal-agent-loop cycle${hiddenCount === 1 ? "" : "s"}`}
+        </button>
+      )}
+    </>
+  );
+}
+
+function Pipeline({ viewedStage, stagesPresent }) {
   return (
     <div id="pipeline">
       {STAGES.map((stage, i) => (
         <React.Fragment key={stage}>
           {i > 0 && <span className="arrow">&#8594;</span>}
-          <div className={"stage-box" + (stage === currentStage ? " active" : "")}>
+          <div
+            className={
+              "stage-box" +
+              (stage === viewedStage ? " active" : "") +
+              (stagesPresent.includes(stage) ? "" : " pending")
+            }
+          >
             {STAGE_LABEL[stage]}
           </div>
         </React.Fragment>
@@ -206,24 +345,54 @@ function Pipeline({ currentStage }) {
   );
 }
 
-function Panes({ texts, spans }) {
+function StageControls({ viewedStageIndex, latestStageIndex, isComplete, isPlaying, onPrev, onNext, onPlayToggle, onJumpToLatest, pinnedToLatest }) {
+  return (
+    <div id="stage-controls">
+      <button onClick={onPrev} disabled={viewedStageIndex <= 0}>&#8592; Prev</button>
+      <button onClick={onNext} disabled={viewedStageIndex >= latestStageIndex}>Next &#8594;</button>
+      <button onClick={onPlayToggle} disabled={!isComplete}>{isPlaying ? "Pause" : "Play ▶"}</button>
+      <button onClick={onJumpToLatest} disabled={pinnedToLatest}>Jump to latest</button>
+    </div>
+  );
+}
+
+function Panes({ cycle, viewedStageIndex }) {
+  const stages = cycle ? cycle.stages : {};
+  const reached = (paneKey) => viewedStageIndex >= PANE_STAGE_INDEX[paneKey];
+  const pending = <span className="pane-pending">not reached yet</span>;
   return (
     <div id="panes">
       <div className="pane">
         <h2>1. Input</h2>
-        <pre>{renderSpannedText(texts.received || "", spans)}</pre>
+        <pre>
+          {reached("input") && stages.received
+            ? renderSpannedText(stages.received.text || "", stages.received.spans)
+            : pending}
+        </pre>
       </div>
       <div className="pane">
         <h2>2. Outbound to API</h2>
-        <pre>{renderTokenizedText(texts.forwarded || texts.tokenized || "")}</pre>
+        <pre>
+          {reached("outbound") && (stages.forwarded || stages.tokenized)
+            ? renderTokenizedText((stages.forwarded || stages.tokenized).text || "")
+            : pending}
+        </pre>
       </div>
       <div className="pane">
         <h2>3. API response</h2>
-        <pre>{renderTokenizedText(texts.response_received || "")}</pre>
+        <pre>
+          {reached("response") && stages.response_received
+            ? renderTokenizedText(stages.response_received.text || "")
+            : pending}
+        </pre>
       </div>
       <div className="pane">
         <h2>4. Developer view</h2>
-        <pre>{texts.displayed || texts.detokenized || ""}</pre>
+        <pre>
+          {reached("developer") && (stages.displayed || stages.detokenized)
+            ? (stages.displayed || stages.detokenized).text || ""
+            : pending}
+        </pre>
       </div>
     </div>
   );
@@ -326,61 +495,269 @@ function VaultInspector() {
   );
 }
 
-function Metrics() {
-  const [report, setReport] = useState(null);
+function ModeReport({ mode, report }) {
+  return (
+    <div className="pane">
+      <h2>{mode}</h2>
+      {!report ? (
+        <p>&hellip;</p>
+      ) : !report.available ? (
+        <p>unavailable: {report.reason}</p>
+      ) : (
+        <>
+          <table>
+            <thead>
+              <tr><th>Entity</th><th>Support</th><th>Found</th><th>FP</th><th>Recall</th><th>Precision</th></tr>
+            </thead>
+            <tbody>
+              {Object.entries(report.by_type).map(([name, m]) => (
+                <tr key={name}>
+                  <td>{name}</td>
+                  <td>{m.support}</td>
+                  <td>{m.true_positives}</td>
+                  <td>{m.false_positives}</td>
+                  <td>{m.recall.toFixed(3)}</td>
+                  <td>{m.precision.toFixed(3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {Object.keys(report.by_detector).length > 0 && (
+            <table>
+              <thead><tr><th>Detector</th><th>Found</th><th>FP</th></tr></thead>
+              <tbody>
+                {Object.entries(report.by_detector).map(([name, m]) => (
+                  <tr key={name}>
+                    <td>{name}</td>
+                    <td>{m.true_positives}</td>
+                    <td>{m.false_positives}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
 
-  const refresh = useCallback(() => {
-    fetch("/veil-panel/metrics").then((r) => r.json()).then(setReport).catch(() => {});
+function MetricsTab() {
+  // Regex/LLM/union comparison (mission-12). The llm/union modes are
+  // genuinely expensive (one real LLM call per manifest entry), so this
+  // never runs on its own -- it shows whatever was last persisted to
+  // `.veil/metrics_comparison.json` (surviving a gateway restart) until
+  // "Run comparison" is pressed explicitly.
+  const [comparison, setComparison] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(() => {
+    fetch("/veil-panel/metrics/comparison")
+      .then((r) => r.json())
+      .then(setComparison)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    load();
+  }, [load]);
 
-  if (!report) return <div className="pane"><h2>Metrics</h2><p>Loading&hellip;</p></div>;
-  if (!report.available) {
-    return (
-      <div className="pane">
-        <h2>Metrics</h2>
-        <p>Not available: {report.reason}</p>
-        <button onClick={refresh}>Retry</button>
-      </div>
-    );
-  }
+  const run = () => {
+    setRunning(true);
+    setError(null);
+    fetch("/veil-panel/metrics/comparison", { method: "POST" })
+      .then((r) => r.json())
+      .then((data) => {
+        setComparison(data);
+        setRunning(false);
+      })
+      .catch((err) => {
+        setError(String(err));
+        setRunning(false);
+      });
+  };
+
+  const hasResult = comparison && comparison.available;
+
   return (
-    <div className="pane">
-      <h2>Metrics (demo/eval.py, regex mode) <button onClick={refresh}>Refresh</button></h2>
-      <table>
-        <thead>
-          <tr><th>Entity</th><th>Support</th><th>Found</th><th>FP</th><th>Recall</th><th>Precision</th></tr>
-        </thead>
-        <tbody>
-          {Object.entries(report.by_type).map(([name, m]) => (
-            <tr key={name}>
-              <td>{name}</td>
-              <td>{m.support}</td>
-              <td>{m.true_positives}</td>
-              <td>{m.false_positives}</td>
-              <td>{m.recall.toFixed(3)}</td>
-              <td>{m.precision.toFixed(3)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div id="metrics-tab">
+      <div className="metrics-header">
+        <button onClick={run} disabled={running}>{running ? "Running…" : "Run comparison"}</button>
+        {hasResult && (
+          <span className="sub">last run at {new Date(comparison.generated_at).toLocaleString()}</span>
+        )}
+        {!hasResult && !running && <span className="sub">no comparison has been run yet</span>}
+        {running && <span className="sub">running regex + LLM + union against the manifest&hellip;</span>}
+        {error && <span className="sub" style={{ color: "var(--danger)" }}>{error}</span>}
+      </div>
+      {hasResult && (
+        <div className="mode-grid">
+          <ModeReport mode="regex" report={comparison.modes.regex} />
+          <ModeReport mode="llm" report={comparison.modes.llm} />
+          <ModeReport mode="union" report={comparison.modes.union} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LiveTab({ hidden }) {
+  const [cycles, setCycles] = useState({});
+  const [order, setOrder] = useState([]);
+  const [selectedRequestId, setSelectedRequestId] = useState(null);
+  const [pinnedToLatest, setPinnedToLatest] = useState(true);
+  const [manualStageIndex, setManualStageIndex] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [showInternal, setShowInternal] = useState(false);
+
+  const knownRequestIdsRef = useRef(new Set());
+  const pinnedToLatestRef = useRef(true);
+  useEffect(() => {
+    pinnedToLatestRef.current = pinnedToLatest;
+  }, [pinnedToLatest]);
+
+  useEventSource("/veil-panel/pipeline-stream", (event) => {
+    const { request_id, stage, text, spans, timestamp, kind } = event;
+    const isNewCycle = !knownRequestIdsRef.current.has(request_id);
+    knownRequestIdsRef.current.add(request_id);
+
+    setCycles((prev) => {
+      const existing = prev[request_id];
+      const stages = { ...(existing ? existing.stages : {}), [stage]: { text, spans, timestamp } };
+      return {
+        ...prev,
+        [request_id]: {
+          requestId: request_id,
+          stages,
+          kind: kind || (existing ? existing.kind : undefined) || "conversation",
+          firstSeenAt: existing ? existing.firstSeenAt : timestamp,
+        },
+      };
+    });
+
+    setOrder((prev) => {
+      if (prev.includes(request_id)) return prev;
+      const next = [...prev, request_id];
+      if (next.length > HISTORY_LIMIT) {
+        const dropped = next.slice(0, next.length - HISTORY_LIMIT);
+        dropped.forEach((id) => knownRequestIdsRef.current.delete(id));
+        return next.slice(next.length - HISTORY_LIMIT);
+      }
+      return next;
+    });
+
+    if (isNewCycle) {
+      // Pinning to "latest" only ever follows a real conversational
+      // cycle -- jumping the selection onto a hidden session-title/
+      // internal-agent-loop cycle would leave the panes pointed at
+      // something the selector doesn't even show.
+      const isHiddenKind = !showInternal && HIDDEN_KINDS.has(kind || "conversation");
+      if (pinnedToLatestRef.current && !isHiddenKind) {
+        setSelectedRequestId(request_id);
+      }
+      setManualStageIndex(null);
+      setIsPlaying(false);
+    }
+  });
+
+  const visibleOrder = showInternal
+    ? order
+    : order.filter((id) => !HIDDEN_KINDS.has(cycles[id] ? cycles[id].kind : "conversation"));
+  const hiddenCount = order.length - visibleOrder.length;
+
+  const selectCycle = (requestId) => {
+    setSelectedRequestId(requestId);
+    setManualStageIndex(null);
+    setIsPlaying(false);
+    setPinnedToLatest(
+      visibleOrder.length > 0 && requestId === visibleOrder[visibleOrder.length - 1]
+    );
+  };
+
+  const selectedCycle = selectedRequestId ? cycles[selectedRequestId] : null;
+  const stagesPresent = selectedCycle ? STAGES.filter((s) => selectedCycle.stages[s]) : [];
+  const latestStageIndex = stagesPresent.length - 1;
+  const isComplete = selectedCycle ? cycleIsComplete(selectedCycle) : false;
+  const viewedStageIndex = manualStageIndex !== null ? Math.min(manualStageIndex, latestStageIndex) : latestStageIndex;
+  const viewedStage = viewedStageIndex >= 0 ? STAGES[viewedStageIndex] : null;
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    const id = setInterval(() => {
+      setManualStageIndex((prevIndex) => {
+        const next = (prevIndex ?? 0) + 1;
+        if (next >= STAGES.length) {
+          setIsPlaying(false);
+          return STAGES.length - 1;
+        }
+        return next;
+      });
+    }, PLAY_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [isPlaying]);
+
+  const stepPrev = () => {
+    setIsPlaying(false);
+    setManualStageIndex(Math.max(0, viewedStageIndex - 1));
+  };
+  const stepNext = () => {
+    setIsPlaying(false);
+    setManualStageIndex(Math.min(latestStageIndex, viewedStageIndex + 1));
+  };
+  const togglePlay = () => {
+    if (isPlaying) {
+      setIsPlaying(false);
+      return;
+    }
+    setManualStageIndex(0);
+    setIsPlaying(true);
+  };
+  const jumpToLatest = () => {
+    const latestVisibleId = visibleOrder[visibleOrder.length - 1];
+    if (latestVisibleId) {
+      setSelectedRequestId(latestVisibleId);
+    }
+    setManualStageIndex(null);
+    setIsPlaying(false);
+    setPinnedToLatest(true);
+  };
+
+  return (
+    <div hidden={hidden}>
+      <CycleSelector
+        order={visibleOrder}
+        cycles={cycles}
+        selectedRequestId={selectedRequestId}
+        onSelect={selectCycle}
+        hiddenCount={hiddenCount}
+        showInternal={showInternal}
+        onToggleShowInternal={() => setShowInternal((prev) => !prev)}
+      />
+      <Pipeline viewedStage={viewedStage} stagesPresent={stagesPresent} />
+      <StageControls
+        viewedStageIndex={viewedStageIndex}
+        latestStageIndex={latestStageIndex}
+        isComplete={isComplete}
+        isPlaying={isPlaying}
+        onPrev={stepPrev}
+        onNext={stepNext}
+        onPlayToggle={togglePlay}
+        onJumpToLatest={jumpToLatest}
+        pinnedToLatest={pinnedToLatest}
+      />
+      <div id="stage-caption">{viewedStage ? STAGE_EXPLANATION[viewedStage] : "Select or run a request to begin."}</div>
+      <Panes cycle={selectedCycle} viewedStageIndex={viewedStageIndex} />
+      <div id="bottom">
+        <AuditLogPane />
+        <VaultInspector />
+      </div>
     </div>
   );
 }
 
 function App() {
-  const [currentStage, setCurrentStage] = useState(null);
-  const [texts, setTexts] = useState({});
-  const [spans, setSpans] = useState([]);
-
-  useEventSource("/veil-panel/pipeline-stream", (event) => {
-    setCurrentStage(event.stage);
-    setTexts((prev) => ({ ...prev, [event.stage]: event.text }));
-    if (event.stage === "received") setSpans(event.spans || []);
-  });
+  const [tab, setTab] = useState("live");
 
   return (
     <div>
@@ -388,20 +765,23 @@ function App() {
         <h1>veil — observability panel</h1>
         <span className="sub">
           live session, local only -- the panes below show real request/response text for
-          inspection; the audit log itself (bottom-left) never records a value, only a hash
+          inspection; the audit log itself never records a value, only a hash
         </span>
+        <div id="tabs">
+          <button className={"tab-btn" + (tab === "live" ? " active" : "")} onClick={() => setTab("live")}>
+            Live
+          </button>
+          <button className={"tab-btn" + (tab === "metrics" ? " active" : "")} onClick={() => setTab("metrics")}>
+            Metrics
+          </button>
+        </div>
       </header>
       <div className="legend">
         <span><span className="swatch" style={{ background: "var(--regex)" }}></span> regex-detected span</span>
         <span><span className="swatch" style={{ background: "var(--llm)" }}></span> LLM-detected span</span>
       </div>
-      <Pipeline currentStage={currentStage} />
-      <Panes texts={texts} spans={spans} />
-      <div id="bottom">
-        <AuditLogPane />
-        <VaultInspector />
-        <Metrics />
-      </div>
+      <LiveTab hidden={tab !== "live"} />
+      {tab === "metrics" && <MetricsTab />}
     </div>
   );
 }

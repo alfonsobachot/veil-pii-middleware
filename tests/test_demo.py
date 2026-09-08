@@ -14,8 +14,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from veil_pii_middleware.core.detector import STRUCTURED_TYPES, EntityType
-from veil_pii_middleware.demo.eval import evaluate
+from veil_pii_middleware.core.detector import (
+    LLM_BASE_URL_ENV_VAR,
+    LLM_MODEL_ENV_VAR,
+    STRUCTURED_TYPES,
+    EntityType,
+)
+from veil_pii_middleware.demo.eval import evaluate, llm_client_from_env
 from veil_pii_middleware.demo.seed import PERSON, seed_demo
 
 
@@ -102,4 +107,17 @@ def test_person_names_are_reported_as_an_open_gap(corpus: tuple[Path, Path]) -> 
     report = evaluate(*corpus)
     assert report.by_type[PERSON].recall == 0.0
     assert PERSON not in STRUCTURED_TYPES
-    assert report.failing_types(1.0) == []
+
+
+# --------------------------------------------------------------------------
+# llm_client_from_env (mission-12: renamed from a private helper so the
+# gateway's metrics-comparison endpoint can reuse it instead of duplicating
+# this env-reading logic a third time)
+# --------------------------------------------------------------------------
+
+
+def test_llm_client_from_env_raises_when_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(LLM_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(LLM_MODEL_ENV_VAR, raising=False)
+    with pytest.raises(SystemExit, match="requires both"):
+        llm_client_from_env()

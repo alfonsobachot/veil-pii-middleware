@@ -18,14 +18,11 @@ Exit codes:
 
 ## Live Spike
 
-None run this mission — declined by the Intake Grill. The audit-log JSONL
-schema and the two new SSE streams (audit tail, pipeline stage) are shapes
-this codebase defines itself, not a third-party dialect (unlike mission-10's
-LM Studio spike). Proven by tests plus a manual demo-run checklist in
-`.harness/handoff.md`. Item 15's DNI/NIE prompt fix is captured live against
-LM Studio in `handoff.md` only if such an instance is reachable this
-mission — otherwise documented as a required manual follow-up, matching how
-mission-10 handled its own live-verification gap.
+None run this mission — declined implicitly, same reasoning as mission-11:
+every new shape (the ring buffer, the per-cycle text extraction, the
+persisted comparison cache file) is this codebase's own design, not a
+third-party dialect to spike against. Proven by tests plus a manual
+demo-run checklist in `.harness/handoff.md`.
 
 ## Executable Checks
 
@@ -35,95 +32,80 @@ mission-10 handled its own live-verification gap.
 | Lint | `.venv/Scripts/ruff check . && .venv/Scripts/ruff format --check .` | exit `0` |
 | Typecheck | `.venv/Scripts/mypy` | exit `0`, strict, no new `type: ignore`, no implicit `Any` |
 | Unit tests | `.venv/Scripts/pytest` | exit `0` |
-| Audit log never writes plaintext (AC1) | pytest: `AuditLog.record(...)` called with a realistic email/DNI value; assert the value does not appear as a substring anywhere in the written file, only `sha256(value).hexdigest()` does | exit `0` |
-| Audit log entry shape (AC1) | pytest: one `record()` call produces one JSON line with exactly timestamp/token/entity_type/detector/offset/value_hash/adapter fields, no extras, no raw value | exit `0` |
-| Concurrent append safety | pytest: two threads/processes call `AuditLog.record(...)` interleaved a few hundred times each against the same file; assert every resulting line parses as valid JSON and the total line count equals the total call count (no merged/corrupted lines) | exit `0` |
-| Tokenizer audit wiring, one entry per span (AC2) | pytest: `tokenize(text, vault, audit_log=log, adapter="test")` on text with two distinct PII spans; assert exactly two audit entries, each matching one span's token/entity_type/detector/offset | exit `0` |
-| Tokenizer audit wiring, omitted stays silent (AC2) | pytest: existing tokenizer/gateway/hooks tests that never pass `audit_log` still pass unmodified, and a fresh assertion confirms no audit file is created/touched when `audit_log` is omitted | exit `0` |
-| Adapter tagging (AC3) | pytest, one per adapter: gateway request tokenization, `post_tool_use.py`, `sanitize.py` each produce an audit entry tagged with their own distinct `adapter` string for a token they mint | exit `0` |
-| Panel static route (AC4) | pytest: `GET /veil-panel` returns 200, `Content-Type: text/html`, and the body contains the CDN `<script>` tags for React/Babel Standalone (no bundler output, no `node_modules` reference) | exit `0` |
-| Audit SSE tail (AC5) | pytest: open `GET /veil-panel/audit-stream` in a background thread, append a line to `.veil/audit.jsonl` (or trigger a real tokenize-through-gateway request), assert the SSE client receives a corresponding event within a bounded wait | exit `0` |
-| Pipeline SSE stream (AC5) | pytest: open `GET /veil-panel/pipeline-stream`, issue a real proxied request through the gateway's existing test harness (fake upstream), assert at least one stage event per documented stage name arrives, and that no such event is ever written to `.veil/audit.jsonl` | exit `0` |
-| Vault list never leaks plaintext (AC6) | pytest: mint a token, call `GET /veil-panel/vault`, assert the response contains no decrypted value anywhere (only token/entity_type/ciphertext_b64/created_at) | exit `0` |
-| Vault reveal returns the right value (AC6) | pytest: mint a token for a known value, `POST /veil-panel/vault/reveal` with that token, assert the response is exactly that value; a token from a different/unknown session is rejected, not resolved | exit `0` |
-| Metrics endpoint (AC7) | pytest: `GET /veil-panel/metrics` returns 200 JSON matching `demo/eval.py --mode regex`'s report shape (per-entity-type recall/precision) | exit `0` |
-| Panel route dispatch does not shadow the proxy (Tooling Assessment 3b) | pytest: a request to a non-`/veil-panel` path (e.g. `/v1/messages`) still proxies to the fake upstream exactly as before this mission | exit `0` |
-| Item 15 prompt content (AC9) | pytest: assert `_SYSTEM_PROMPT` (or the request body it builds) contains the DNI-vs-NIE leading-letter distinguishing rule and IBAN/PHONE/CARD/IP structural rules as literal text | exit `0` |
-| Item 15 live before/after (AC9) | manual, only if an LM Studio instance is reachable this mission: `demo/eval.py --mode llm` DNI/NIE recall/precision, captured before and after the prompt edit, in `handoff.md` | documented either way |
-| Item 16 decoy mode-routing (AC10) | pytest: `evaluate_decoys(..., use_regex=False, use_llm=True, llm_client=<mock>)` actually invokes the mock client, proving the hardcoded `detect_regex()` call is gone | exit `0` |
-| Item 16 new decoy (AC10) | pytest: `demo/seed.py`'s decoys include an invalid-octet-IP entry, and `detect_regex()` does not flag it | exit `0` |
-| Recall/decoy gates unaffected | `.harness/bin/verify`'s `eval` row (`--min-recall 1.0 --max-false-positives 0`, regex-only mode) | exit `0`, identical pass/fail semantics to before this mission |
-| `core/vault.py` change is read-only and narrow | `git diff -- veil_pii_middleware/core/vault.py` reviewed by hand | only `list_mappings()` (or equivalently named) added; no change to `get_or_create_token`, `resolve`, `purge_expired`, the schema, or any cryptographic primitive |
-| No new runtime dependency | `git diff -- pyproject.toml` reviewed by hand | no new `dependencies` entry (frontend loads React/Babel from a CDN at request time, not installed) |
+| Existing gateway/tokenizer/hooks/sanitize tests still pass unmodified in behavior | `.venv/Scripts/pytest tests/test_gateway.py tests/test_tokenizer.py tests/test_hooks.py tests/test_sanitize.py` | exit `0`, no test needed to change its own assertions about the *wire* bytes relayed (only pipeline-stream-text-producing internals changed) |
+| Last-user-turn extraction, multi-field payload (AC1) | pytest: POST a body shaped like a real Claude Code request (non-trivial `system` string/blocks, a `tools` array, a multi-message `messages` history) containing PII only in the *last* user message; assert the `received` pipeline event's `text` equals exactly that message's text (not the whole JSON document) and its `spans` offsets slice correctly into that text, landing on the actual PII substring | exit `0` |
+| Span offsets provably wrong under the old whole-document approach (AC1, regression guard) | pytest: same payload as above, but constructed so the last user message's PII span, if `start`/`end` were instead applied against the *whole raw JSON body* text, would land on different (wrong) characters — assert the new code does *not* reproduce that miscount | exit `0` |
+| Non-text last-turn content block placeholder (AC2) | pytest: last user message's `content` is a list containing only a `tool_result`-shaped block (no `text`/`thinking` block); assert the `received` event's `text` is a short bracketed placeholder, not empty, and not a JSON dump of the block | exit `0` |
+| Buffered JSON response extraction (AC3) | pytest: a non-streaming upstream response shaped like `{"content": [{"type": "text", "text": "..."}]}` containing a token; assert `response_received`/`detokenized`/`displayed` events carry only the reconstructed text, no envelope fields (`id`, `role`, `stop_reason`, etc.) | exit `0` |
+| SSE response extraction (AC3) | pytest: an SSE upstream response with multiple `content_block_delta` events (mixing `text_delta` and `thinking_delta`) across one or more blocks; assert the pipeline events' text is exactly the reconstructed delta text in order, with no `event:`/`data:` line, no `message_start`/`content_block_start`/`content_block_stop` JSON, anywhere in the string | exit `0` |
+| Ring buffer replays completed cycles to a late subscriber, oldest first (AC4) | pytest: run two or three full request/response cycles through the gateway *before* opening `GET /veil-panel/pipeline-stream`; assert the new subscriber's first events (before any new live request) are exactly those cycles' stages, in the order the cycles originally completed | exit `0` |
+| Ring buffer is bounded at 20 and evicts oldest first | pytest: run 22 cycles, then connect; assert the backlog contains only the last 20 request ids, and the earliest 2 are absent | exit `0` |
+| Ring buffer never double-delivers or drops across the subscribe/publish race (AC4) | pytest: a thread publishing a burst of events concurrently with a thread calling `subscribe()` in a loop, repeated enough iterations to be a meaningful stress check; assert every subscriber's (backlog + live) event count for a given, fully-observed cycle equals exactly the number of stages published for it — never more, never fewer | exit `0` |
+| Pipeline stream still never reaches the audit log (regression guard, mission-11's existing proof) | pytest: after running the ring-buffer tests above, assert `.veil/audit.jsonl` contains no `"stage"`/`"pipeline"` text | exit `0` |
+| Metrics comparison cache miss (AC5) | pytest: fresh `tmp_path`-scoped `.veil/metrics_comparison.json` (does not exist yet); `GET /veil-panel/metrics/comparison` returns `{"available": false}` | exit `0` |
+| Metrics comparison persists across a simulated restart (AC5) | pytest: `POST /veil-panel/metrics/comparison` (with `evaluate` monkeypatched to avoid a real LLM call) against one `make_handler`-built server; then build a *second*, independent `make_handler` instance pointed at the same cache path and `GET /veil-panel/metrics/comparison` from it; assert it returns the same persisted result | exit `0` |
+| Metrics comparison partial failure (AC6) | pytest: monkeypatch `evaluate` so `mode="regex"` succeeds and `mode="llm"`/`"union"` raise; `POST /veil-panel/metrics/comparison` still returns 200 with the regex mode's real numbers and the other two modes marked unavailable with a reason, not a 500 | exit `0` |
+| Comparison cache holds no raw value (Non-goals / Scrutiny) | pytest: assert the persisted `.veil/metrics_comparison.json` contains no `"value"` key and no manifest `Miss` detail — aggregate `by_type`/`by_detector` counts only | exit `0` |
+| `llm_client_from_env` rename, no behavior change | pytest: `demo/eval.py main()`'s `--mode llm` path with the env vars unset still raises the same `SystemExit` message it did before the rename | exit `0` |
+| Existing recall/decoy gates unaffected | `.harness/bin/verify`'s `eval` row (`--min-recall 1.0 --max-false-positives 0`, regex-only mode) | exit `0`, identical pass/fail semantics to before this mission |
+| No new runtime dependency | `git diff -- pyproject.toml` reviewed by hand | no new `dependencies` entry |
+| `core/detector.py`/`core/tokenizer.py`/`core/vault.py` untouched beyond the one documented `_tokenize_body` lifecycle change | `git diff -- veil_pii_middleware/core/` reviewed by hand | no change to `core/detector.py` or `core/vault.py` at all; `core/tokenizer.py` diff is empty (only the *caller*, `_tokenize_body` in `server.py`, changes how it invokes `tokenize()`) |
 
 ## Scrutiny Validator
 
-- Confirm `AuditLog.record()` is the *only* place that formats a line for
-  `.veil/audit.jsonl`, and that it hashes the value internally — no call
-  site anywhere constructs or passes a pre-hashed or raw value string that
-  could be gotten wrong at the edge.
-- Confirm every new gateway route lives strictly under the `/veil-panel`
-  prefix and is checked before the existing unconditional proxy
-  pass-through, so a real Anthropic API request can never be intercepted by
-  a panel route (and vice versa — a panel request can never leak upstream).
-- Confirm `/veil-panel/vault` never serializes a decrypted value under any
-  field name, and `/veil-panel/vault/reveal` calls the existing
-  `Vault.resolve()` (not a new decryption path) so it inherits that method's
-  session-scoping and AEAD-authentication-failure handling unchanged.
-- Confirm the pipeline-stage SSE stream is populated only by the gateway's
-  own request/response handling code (no hook or command adapter publishes
-  to it), and that no pipeline-stage event is ever written to
-  `.veil/audit.jsonl` — the two streams stay structurally separate, per the
-  Intake Grill decision.
-- Confirm `list_mappings()` is genuinely read-only: no write, no schema
-  migration, no change to any existing query in `core/vault.py`.
-- Confirm the frontend has no build step: no `package.json`, no bundler
-  config, no `node_modules` reference; React/Babel are `<script src="https://...">`
-  CDN tags loaded at request time, and the page still functions if read
-  directly as a static file.
-- Confirm item 15's prompt edit changes only text in `_SYSTEM_PROMPT` (or
-  clearly-scoped request-building code around it) — no change to
-  `LLMClient`, `detect_llm`'s parsing/offset logic, or `detect()`'s
-  fail-closed behavior.
-- Confirm item 16's `evaluate_decoys()` change actually threads through the
-  same `use_regex`/`use_llm`/`llm_client` values `main()` resolved for
-  `evaluate()` on the same run, rather than introducing a second,
-  independently-resolved set of flags that could disagree with the `--mode`
-  the user asked for.
-- Confirm no `.veil/audit.jsonl` entry, vault-list response, or gateway
-  stderr log line anywhere in the new code contains a raw PII value.
-  **Correction from an earlier draft of this bullet** (flagged by
-  independent security review during implementation): the *pipeline-stage*
-  SSE stream is a deliberate, mission-scoped exception, not a leak --
-  `mission.md`'s own Scope section requires it to carry the actual
-  request/response text (BRIEF §5's four panes cannot be built otherwise:
-  "Input -- the user's text with detected spans highlighted"). This bullet
-  originally banned raw PII from that stream too, contradicting the mission
-  it was supposed to validate; the correct invariant is that raw PII is
-  confined to the pipeline stream and the one-token `/veil-panel/vault/reveal`
-  response -- both bound to the gateway's existing `127.0.0.1`-only listener,
-  both requiring an active local subscriber/request, neither persisted to
-  disk. See `.harness/handoff.md` for the explicit human sign-off this
-  distinction needs before merge.
+- Confirm the actual bytes written to the real client via `_write_chunk` in
+  `_relay_buffered_response`/`_relay_sse_response` are provably unchanged —
+  diff those two functions and confirm every `_write_chunk`/`wfile.write`
+  call site still writes from the same `body`/`out_bytes`/`out_event`
+  variables as before; only the functions' *return values* (fed to
+  `_publish_stage`, never to the client) change.
+- Confirm the new per-cycle `detect()` call in `_tokenize_body` reuses the
+  exact same `LLMClient` instance passed to `tokenize()` (not a second,
+  freshly-constructed client with the same env config) — the cache-hit
+  argument in `mission.md`'s Tooling Assessment depends on identity, and a
+  silent divergence here would double the number of real LLM calls per
+  request without any test catching it (both calls still "succeed").
+- Confirm `PipelineEventBus.publish`'s ring-buffer bookkeeping and its
+  subscriber-list snapshot happen inside the *same* lock acquisition as
+  `subscribe()`'s backlog snapshot + subscriber registration — re-read both
+  methods side by side against the four-ordering argument in `mission.md`'s
+  Intake Grill evidence section before approving; a version that takes the
+  lock twice (once for history, once for subscribers) reopens the race.
+- Confirm `/veil-panel/metrics/comparison`'s `POST` handler closes any
+  `LLMClient` it constructs (mirroring `demo/eval.py main()`'s existing
+  `finally: llm_client.close()`), even when a mode's `evaluate()` call
+  raises.
+- Confirm the frontend's cycle selector and the server's ring buffer agree
+  on "20" as the same bound in both places, not two independently-chosen
+  numbers that could silently drift apart.
+- Confirm no gateway stderr log line, `.veil/metrics_comparison.json`
+  entry, or new endpoint response anywhere in this mission's diff contains
+  a raw PII value — the pipeline-stream side channel remains the *only*
+  place in this codebase that legitimately carries one in memory (per
+  mission-11's existing, human-flagged design exception), and this mission
+  must not quietly add a second one.
 
 ## User-Testing Validator
 
-- No live spike was run for the two new SSE streams or the panel HTTP
-  surface — pytest-level endpoint-contract tests are the proof of wire
-  format and correctness, not of real browser rendering.
+- No live spike was run for the ring buffer, the extraction helpers, or the
+  comparison cache — pytest-level tests are the proof of correctness; a
+  human must still confirm the actual panel *reads* right (spacing, whether
+  a placeholder like `[tool_use]` looks sane in context, whether the
+  step-through animation timing feels legible rather than jarring).
 - Required manual follow-up, written into `.harness/handoff.md` as a
-  step-by-step checklist: start the gateway (`python -m
-  veil_pii_middleware.adapters.gateway.server`), open
-  `http://127.0.0.1:8787/veil-panel` in a browser, run a real Claude Code
-  session against the gateway (or a scripted `httpx` request standing in for
-  one), and confirm: the four panes populate and update live, span
-  highlighting visibly differs by detector color, hovering a token in the
-  outbound pane shows its entity type, the vault inspector lists tokens
-  without ever showing a value until "reveal" is clicked, the metrics pane
-  renders `eval.py`'s numbers, and the pipeline diagram highlights each
-  stage in sequence as the request proceeds.
-- If an LM Studio instance is reachable this mission: re-run
-  `demo/eval.py --mode llm` before and after the item 15 prompt edit and
-  record the DNI/NIE recall/precision delta in `handoff.md`. If none is
-  reachable, say so plainly and leave it as required follow-up, the same way
-  mission-10 did for its own live verification gap.
+  step-by-step checklist: start the gateway, run 2-3 real requests through
+  it (varying content: plain text, one with a tool call, one triggering
+  streaming), *then* open the panel and confirm the selector already shows
+  those cycles; select an older cycle, run a new request, and confirm the
+  selection does not jump away; step a completed cycle's pipeline stages
+  manually and via "Play"; open the Metrics tab before ever pressing "Run
+  comparison" and confirm it shows "no comparison has been run yet" (or the
+  actually-persisted last run) rather than an error; press "Run comparison"
+  (requires LM Studio reachable for the LLM/unified numbers — otherwise
+  confirm the regex numbers still show and the other two report
+  unavailable, not a crash); restart the gateway process and confirm the
+  Metrics tab still shows the last comparison without re-running it.
+- If no LM Studio instance is reachable this mission, say so plainly in
+  `handoff.md` and confirm the partial-failure path (regex succeeds, LLM/
+  union report unavailable) was still exercised, either live or via the
+  monkeypatched pytest coverage above.

@@ -56,6 +56,7 @@ __all__ = [
     "Report",
     "evaluate",
     "evaluate_decoys",
+    "llm_client_from_env",
     "main",
 ]
 
@@ -333,7 +334,13 @@ def _print_decoy_report(decoy_report: DecoyReport, max_false_positives: int) -> 
         print(f"PASS — decoys at or below the {max_false_positives} false-positive budget")
 
 
-def _llm_client_from_env() -> LLMClient:
+def llm_client_from_env() -> LLMClient:
+    """Build an ``LLMClient`` from the environment, or raise if unconfigured.
+
+    Shared by ``main()``'s ``--mode llm``/``--mode union`` and the gateway's
+    ``/veil-panel/metrics/comparison`` endpoint, so both read the same two
+    env vars the same way rather than duplicating this a third time.
+    """
     base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
     model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
     if not base_url or not model:
@@ -375,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
 
     use_regex = mode in ("regex", "union")
     use_llm = mode in ("llm", "union")
-    llm_client = _llm_client_from_env() if mode != "regex" else None
+    llm_client = llm_client_from_env() if mode != "regex" else None
     try:
         report = evaluate(args.db, args.manifest, mode=mode, llm_client=llm_client)
         _print_report(report, args.min_recall)

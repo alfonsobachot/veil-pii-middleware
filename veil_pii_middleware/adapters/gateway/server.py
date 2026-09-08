@@ -68,12 +68,20 @@ above: a static, unbuilt frontend page; an SSE tail of the shared
 adapters, so the panel sees every adapter's activity); a *separate*,
 in-memory-only SSE stream of pipeline-stage-transition events
 (``PIPELINE_STAGES``) this process publishes for its own request/response
-cycles -- structurally distinct from the audit log because it carries the
-actual request/response text BRIEF's four panes need to show, which the
-audit log deliberately never does; and small JSON endpoints for the vault
-inspector (list, and an explicit reveal-one-token action) and `demo/eval.py`
-metrics. None of this adds authentication beyond the gateway's existing
-``127.0.0.1``-only bind.
+cycles -- structurally distinct from the audit log because it carries
+human-readable request/response *display* text (mission-12: the last user
+turn's own text, and the model's reconstructed reply text -- never the
+whole raw JSON document or SSE wire framing) that BRIEF's four panes need
+to show, which the audit log deliberately never does. That stream keeps a
+bounded ring buffer of the last ``PIPELINE_HISTORY_LIMIT`` cycles
+(``PipelineEventBus``) so a panel tab opened against an already-running
+gateway still sees recent history rather than nothing; and small JSON
+endpoints for the vault inspector (list, and an explicit reveal-one-token
+action), a quick regex-only `demo/eval.py` metrics report, and a
+regex/LLM/union metrics *comparison* persisted to
+``METRICS_COMPARISON_PATH`` (expensive to compute, so it only ever runs on
+an explicit POST, and survives a gateway restart). None of this adds
+authentication beyond the gateway's existing ``127.0.0.1``-only bind.
 """
 
 from __future__ import annotations
@@ -87,6 +95,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -96,7 +105,13 @@ from urllib.parse import unquote, urlsplit
 import httpx
 
 from veil_pii_middleware.core.audit import AuditLog
-from veil_pii_middleware.core.detector import Span
+from veil_pii_middleware.core.detector import (
+    LLM_BASE_URL_ENV_VAR,
+    LLM_MODEL_ENV_VAR,
+    LLMClient,
+    Span,
+    detect,
+)
 from veil_pii_middleware.core.tokenizer import (
     IncrementalDetokenizer,
     JSONValue,
@@ -115,6 +130,14 @@ VAULT_DB_PATH = Path(".veil") / "vault.db"
 #: appends to -- one shared file is what lets the panel's audit-log SSE tail
 #: show every adapter's activity, not just the gateway's own.
 AUDIT_LOG_PATH = Path(".veil") / "audit.jsonl"
+
+#: Persisted cache of the last regex/LLM/union metrics comparison (mission-12
+#: item), git-ignored like every other ``.veil/`` file. Running the LLM/union
+#: modes is expensive (one real LLM call per manifest entry), so the panel's
+#: Metrics tab shows whatever was last written here rather than recomputing
+#: on every page load, and this file survives a gateway restart -- unlike the
+#: in-memory pipeline-stage stream below.
+METRICS_COMPARISON_PATH = Path(".veil") / "metrics_comparison.json"
 
 #: Reserved path prefix for the observability panel's own HTTP surface
 #: (BRIEF SS5) -- checked before the unconditional upstream-proxy pass-through,
@@ -140,6 +163,13 @@ PIPELINE_STAGES: Final = (
     "displayed",
 )
 
+#: How many completed request/response cycles ``PipelineEventBus`` keeps
+#: buffered in memory (oldest evicted first) so a panel tab opened against
+#: an already-running gateway can see recent history instead of nothing --
+#: see the module docstring and the mission's Intake Grill. Matches the
+#: frontend's own cycle-selector cap; both sides must agree on this number.
+PIPELINE_HISTORY_LIMIT: Final = 20
+
 
 def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
@@ -154,18 +184,32 @@ class PipelineEventBus:
     blocking the request thread that publishes -- this is a best-effort live
     view, not a delivery-guaranteed log (the audit log is that, and is a
     separate stream entirely).
+
+    Also keeps a bounded ring buffer of the last ``PIPELINE_HISTORY_LIMIT``
+    request/response cycles' events (by ``request_id``, oldest evicted
+    first) so a subscriber connecting after those cycles already completed
+    still sees them -- ``subscribe()`` returns that backlog as a snapshot
+    alongside the queue. The backlog snapshot and the subscriber-list
+    snapshot ``publish()`` takes both happen under the same lock, so a given
+    event is always delivered to a given subscriber exactly once, via
+    either the backlog or a live ``put``, never both and never neither,
+    regardless of how the two calls interleave across threads. Still purely
+    in-memory: a process restart loses it, same as before this buffer.
     """
 
     def __init__(self, maxsize: int = 500) -> None:
         self._maxsize = maxsize
         self._lock = threading.Lock()
         self._subscribers: set[queue.Queue[dict[str, Any]]] = set()
+        self._order: deque[str] = deque(maxlen=PIPELINE_HISTORY_LIMIT)
+        self._history: dict[str, list[dict[str, Any]]] = {}
 
-    def subscribe(self) -> queue.Queue[dict[str, Any]]:
+    def subscribe(self) -> tuple[queue.Queue[dict[str, Any]], list[dict[str, Any]]]:
         subscriber: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self._maxsize)
         with self._lock:
+            backlog = [event for request_id in self._order for event in self._history[request_id]]
             self._subscribers.add(subscriber)
-        return subscriber
+        return subscriber, backlog
 
     def unsubscribe(self, subscriber: queue.Queue[dict[str, Any]]) -> None:
         with self._lock:
@@ -173,6 +217,14 @@ class PipelineEventBus:
 
     def publish(self, event: dict[str, Any]) -> None:
         with self._lock:
+            request_id = event["request_id"]
+            if request_id not in self._history:
+                if len(self._order) == self._order.maxlen:
+                    evicted = self._order.popleft()
+                    self._history.pop(evicted, None)
+                self._order.append(request_id)
+                self._history[request_id] = []
+            self._history[request_id].append(event)
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
             try:
@@ -191,12 +243,18 @@ def _publish_stage(
     text: str,
     *,
     spans: list[Span] | None = None,
+    kind: str | None = None,
 ) -> None:
     """Publish one pipeline-stage event. ``spans`` is only meaningful for ``"received"``.
 
     Entity type/detector are the only span metadata a stage event carries --
     the offsets index into this same event's own ``text``, so nothing about
     the value itself is duplicated beyond what ``text`` already contains.
+
+    ``kind`` (``_classify_cycle_kind``'s best-effort label) is published on
+    every stage of a cycle, not just ``"received"``, so the frontend can
+    filter a whole cycle out of the selector as soon as any one of its
+    events arrives, regardless of which stage that happens to be.
     """
     event: dict[str, Any] = {
         "request_id": request_id,
@@ -214,6 +272,8 @@ def _publish_stage(
             }
             for span in spans
         ]
+    if kind is not None:
+        event["kind"] = kind
     bus.publish(event)
 
 
@@ -360,29 +420,199 @@ def _skip_reserved_anthropic_metadata(text: str) -> bool:
     return text.startswith(_ANTHROPIC_RESERVED_SYSTEM_PREFIX)
 
 
+#: Anthropic content-block types this module renders as display text; any
+#: other block type (``tool_use``, ``tool_result``, ``image``, ...) becomes
+#: a short bracketed placeholder instead of being silently dropped, so a
+#: turn with no text/thinking block still renders as *something* rather
+#: than a mysteriously empty pane (BRIEF SS5's four panes must show the
+#: actual message, not nothing).
+_TEXT_CONTENT_BLOCK_FIELDS: Final = {"text": "text", "thinking": "thinking"}
+
+
+def _extract_text_from_content_blocks(content: JSONValue) -> str:
+    """Render an Anthropic ``content`` value (plain string or block list) as display text.
+
+    A plain string is returned as-is -- the common shape in this codebase's
+    own tests and in a simple single-turn request. A list of blocks joins
+    every ``text``/``thinking`` block's own field, in order; see
+    ``_TEXT_CONTENT_BLOCK_FIELDS`` for how a non-text block renders instead.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        field = _TEXT_CONTENT_BLOCK_FIELDS.get(str(block_type))
+        field_value = block.get(field) if field is not None else None
+        if isinstance(field_value, str):
+            parts.append(field_value)
+        else:
+            parts.append(f"[{block_type}]" if block_type else "[content]")
+    return "\n".join(parts)
+
+
+def _extract_last_user_message_text(parsed: JSONValue) -> str:
+    """Return the last ``role == "user"`` message's display text from a request body.
+
+    Claude Code resends the full conversation history on every request; the
+    panel's "Input" pane is scoped to what the user actually typed *this
+    turn*, not the repeated history (mission-12's Intake Grill). Returns
+    ``""`` if ``parsed`` is not shaped like a Messages API request body (not
+    a dict, no ``messages`` list, or no ``user``-role message in it).
+    """
+    if not isinstance(parsed, dict):
+        return ""
+    messages = parsed.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _extract_text_from_content_blocks(message.get("content"))
+    return ""
+
+
+def _extract_response_text(parsed: JSONValue) -> str:
+    """Return a Messages API response body's display text (its ``content`` blocks)."""
+    if not isinstance(parsed, dict):
+        return ""
+    return _extract_text_from_content_blocks(parsed.get("content"))
+
+
+def _default_llm_client_for_display() -> LLMClient | None:
+    """Build the same env-gated ``LLMClient`` ``core.tokenizer``'s internal default would.
+
+    Built explicitly here, rather than letting ``tokenize()`` build and
+    close its own invisible one, so the *same instance* can be reused for
+    one extra, scoped ``detect()`` call this module makes purely for
+    display-span offsets (see ``_tokenize_body``). ``core.detector``'s
+    process-wide LLM response cache is keyed by ``(text, client.identity)``,
+    so reusing the instance is what makes that second call a cache hit
+    instead of a second network round trip.
+    """
+    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
+    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
+    if not base_url or not model:
+        return None
+    return LLMClient(base_url, model)
+
+
+#: Substring of Claude Code's own system prompt for its dedicated
+#: session-title-generation request (confirmed live 2026-09-08 by capturing
+#: raw traffic through a throwaway diagnostic proxy, bypassing this
+#: module's own extraction entirely, to rule out that we were the ones
+#: adding it). Best-effort, not a protocol guarantee -- the exact wording
+#: could change between Claude Code CLI versions -- but stable enough to be
+#: worth keying off rather than showing every session's title-generation
+#: request in the panel as if it were a real conversational turn.
+_TITLE_GENERATION_SYSTEM_MARKER: Final = "naming a coding session"
+
+#: Prefix Claude Code itself uses to wrap agent-loop-injected content
+#: (tool results, token-budget reminders, sub-agent instructions) that is
+#: not anything a human typed -- confirmed the same way as the marker
+#: above. A cycle whose extracted last-user-message text is entirely one
+#: of these carries no human-authored input to show.
+_INTERNAL_CONTINUATION_PREFIX: Final = "<system-reminder"
+
+
+def _extract_system_text(parsed: JSONValue) -> str:
+    """Join a Messages API request body's ``system`` field into plain text.
+
+    ``system`` is either a plain string or a list of blocks (mirroring
+    ``content``'s own two shapes) -- used only for ``_classify_cycle_kind``'s
+    heuristic, never displayed.
+    """
+    if not isinstance(parsed, dict):
+        return ""
+    system_value = parsed.get("system")
+    if isinstance(system_value, str):
+        return system_value
+    if not isinstance(system_value, list):
+        return ""
+    parts: list[str] = []
+    for block in system_value:
+        text = block.get("text") if isinstance(block, dict) else None
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _classify_cycle_kind(parsed: JSONValue, received_text: str) -> str:
+    """Best-effort label for what kind of request this cycle is.
+
+    Heuristic, not a protocol guarantee. ``"title_generation"`` and
+    ``"internal_continuation"`` are both real, legitimate Claude Code
+    requests -- classified so the panel's cycle selector can default to
+    hiding them (they carry no human-authored conversational content), not
+    because anything about them is wrong. ``"conversation"`` is the
+    default for everything else, including a request this heuristic fails
+    to recognize as one of the other two.
+    """
+    if _TITLE_GENERATION_SYSTEM_MARKER in _extract_system_text(parsed).lower():
+        return "title_generation"
+    if received_text.strip().lower().startswith(_INTERNAL_CONTINUATION_PREFIX):
+        return "internal_continuation"
+    return "conversation"
+
+
 def _tokenize_body(
     raw_body: bytes, session_id: str, audit_log: AuditLog
-) -> tuple[bytes, list[Span]]:
+) -> tuple[bytes, str, list[Span], str, str]:
     """Tokenize a JSON request body. Raises on any failure -- callers must fail closed.
 
-    Returns the tokenized body plus every span ``tokenize()`` found (before
-    substitution shifted any offsets), so the caller can publish the
-    "received" pipeline-stage event with detector-colored span metadata
-    without running a second, duplicate detection pass.
+    Returns ``(forward_body, received_text, received_spans, outbound_text, cycle_kind)``:
+    ``received_text`` is the last user message's display text *before*
+    substitution (``_extract_last_user_message_text``); ``received_spans``
+    is that same text's own spans, with offsets relative to ``received_text``
+    itself -- ``core/tokenizer.py``'s per-leaf ``span_sink`` has no leaf
+    identity attached, so those offsets cannot be reused against a shorter
+    display string without misaligning, hence one extra, scoped ``detect()``
+    call here instead (a cache hit, not a second LLM round trip, whenever
+    ``received_text`` is exactly a leaf ``tokenize()`` already scanned --
+    true whenever the message's content is a single string); ``outbound_text``
+    is the same message's text *after* substitution, for the "Outbound to
+    API" pane; ``cycle_kind`` is ``_classify_cycle_kind``'s label for the
+    whole cycle.
     """
     parsed = json.loads(raw_body)
-    spans: list[Span] = []
+    display_client = _default_llm_client_for_display()
     VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _vault_lock, Vault(VAULT_DB_PATH, session_id) as vault:
-        tokenized: JSONValue = tokenize(
-            parsed,
-            vault,
-            audit_log=audit_log,
-            adapter="gateway",
-            span_sink=spans,
-            skip=_skip_reserved_anthropic_metadata,
+    try:
+        with _vault_lock, Vault(VAULT_DB_PATH, session_id) as vault:
+            tokenized: JSONValue = tokenize(
+                parsed,
+                vault,
+                llm_client=display_client,
+                audit_log=audit_log,
+                adapter="gateway",
+                skip=_skip_reserved_anthropic_metadata,
+            )
+        received_text = _extract_last_user_message_text(parsed)
+        outbound_text = _extract_last_user_message_text(tokenized)
+        cycle_kind = _classify_cycle_kind(parsed, received_text)
+        received_spans = (
+            detect(
+                received_text,
+                use_regex=True,
+                use_llm=display_client is not None,
+                llm_client=display_client,
+            )
+            if received_text
+            else []
         )
-    return json.dumps(tokenized).encode(), spans
+    finally:
+        if display_client is not None:
+            display_client.close()
+    return (
+        json.dumps(tokenized).encode(),
+        received_text,
+        received_spans,
+        outbound_text,
+        cycle_kind,
+    )
 
 
 #: content-type prefix that routes a response through the SSE rewrite path
@@ -431,6 +661,35 @@ def _split_sse_event(raw_event: str) -> tuple[list[str], dict[str, Any] | None, 
             except json.JSONDecodeError:
                 return lines, None, -1
     return lines, None, -1
+
+
+def _extract_sse_display_text(raw_events: list[str]) -> str:
+    """Reconstruct the assistant's visible text from a list of raw SSE event strings.
+
+    Walks every ``content_block_delta`` event's text-bearing field
+    (``_TEXT_BEARING_DELTA_FIELDS``), in order -- the same reconstruction a
+    real streaming client performs -- instead of exposing the raw
+    ``event:``/``data:`` wire framing (``message_start``, `content_block_start``
+    envelope JSON, etc.) those events actually carry. Used for the pipeline
+    panel's "API response"/"Developer view" panes; the caller passes this
+    the pre-detokenization events for the tokenized display and the
+    post-detokenization events for the resolved display.
+    """
+    parts: list[str] = []
+    for raw_event in raw_events:
+        _, obj, _ = _split_sse_event(raw_event)
+        if not isinstance(obj, dict) or obj.get("type") != "content_block_delta":
+            continue
+        delta = obj.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        delta_type = delta.get("type")
+        if not isinstance(delta_type, str):
+            continue
+        field = _TEXT_BEARING_DELTA_FIELDS.get(delta_type)
+        if field is not None and isinstance(delta.get(field), str):
+            parts.append(delta[field])
+    return "".join(parts)
 
 
 class _SseResponseRewriter:
@@ -522,11 +781,14 @@ def _write_chunk(handler: BaseHTTPRequestHandler, data: bytes) -> None:
 def _relay_sse_response(
     handler: BaseHTTPRequestHandler, upstream: httpx.Response, vault: Vault
 ) -> tuple[str, str]:
-    """Relay an SSE response, returning ``(raw_text, rewritten_text)`` for the pipeline panel.
+    """Relay an SSE response, returning ``(raw_display, rewritten_display)`` for the pipeline panel.
 
-    Both are the whole stream joined back together -- not persisted anywhere,
-    only published on the in-memory pipeline-stage event bus after this
-    function returns (see the caller in ``GatewayHandler._handle``).
+    Both are the assistant's reconstructed visible text (``_extract_sse_display_text``),
+    not the raw ``event:``/``data:`` wire framing -- the wire bytes this
+    function actually writes to ``handler.wfile`` via ``_write_chunk`` are
+    unchanged by this; only what gets published on the in-memory
+    pipeline-stage event bus after this function returns (see the caller in
+    ``GatewayHandler._handle``) changes.
     """
     rewriter = _SseResponseRewriter(vault)
     pending = ""
@@ -550,7 +812,23 @@ def _relay_sse_response(
         out_events.append(pending)
         _write_chunk(handler, pending.encode())
     handler.wfile.write(b"0\r\n\r\n")
-    return "\n\n".join(raw_events), "\n\n".join(out_events)
+    return _extract_sse_display_text(raw_events), _extract_sse_display_text(out_events)
+
+
+def _extract_buffered_display_text(body: bytes, raw_text: str) -> str:
+    """Return a buffered response body's display text, falling back to ``raw_text``.
+
+    ``raw_text`` (the plain-decoded body) is the fallback for anything that
+    is not a JSON Messages API response shape (an error object, a ``ping``,
+    non-JSON) -- there is no structured content to extract there, so the
+    decoded bytes are the best available display text, same as before this
+    mission's extraction helpers existed.
+    """
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return raw_text
+    return _extract_response_text(parsed) or raw_text
 
 
 def _relay_buffered_response(
@@ -564,10 +842,12 @@ def _relay_buffered_response(
     # replies this gateway targets, and the byte-for-byte non-JSON case just
     # below could stream but is kept in the same function for one code path.
     #
-    # Returns ``(raw_text, rewritten_text)`` for the pipeline panel -- see
-    # ``_relay_sse_response``'s docstring.
+    # Returns ``(raw_display, rewritten_display)`` for the pipeline panel --
+    # see ``_relay_sse_response``'s docstring; the wire bytes actually
+    # written via `_write_chunk` below are unchanged by this mission.
     body = upstream.read()
     raw_text = _decode(body)
+    raw_display = _extract_buffered_display_text(body, raw_text)
     # Every token this codebase ever mints starts with the literal "PII_"
     # (core/tokenizer.py's _TOKEN_PATTERN) -- if that substring is absent,
     # nothing here could possibly resolve, so this skips opening the vault
@@ -575,20 +855,86 @@ def _relay_buffered_response(
     if b"PII_" not in body:
         _write_chunk(handler, body)
         handler.wfile.write(b"0\r\n\r\n")
-        return raw_text, raw_text
+        return raw_display, raw_display
     try:
         parsed = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         _write_chunk(handler, body)
         handler.wfile.write(b"0\r\n\r\n")
-        return raw_text, raw_text
+        return raw_display, raw_display
     VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with Vault(VAULT_DB_PATH, session_id) as vault:
         rewritten: JSONValue = detokenize_lenient(parsed, vault)
     out_bytes = json.dumps(rewritten).encode()
     _write_chunk(handler, out_bytes)
     handler.wfile.write(b"0\r\n\r\n")
-    return raw_text, _decode(out_bytes)
+    return raw_display, _extract_response_text(rewritten) or _decode(out_bytes)
+
+
+#: Every mode the comparison endpoint runs, in the order shown -- kept as a
+#: single source of truth rather than repeating the three literal strings.
+_COMPARISON_MODES: Final[tuple[eval_module.Mode, ...]] = ("regex", "llm", "union")
+
+
+def _serialize_metrics(metrics: eval_module.Metrics) -> dict[str, Any]:
+    return {
+        "support": metrics.support,
+        "true_positives": metrics.true_positives,
+        "false_positives": metrics.false_positives,
+        "recall": metrics.recall,
+        "precision": metrics.precision,
+    }
+
+
+def _serialize_report(report: eval_module.Report) -> dict[str, Any]:
+    """Aggregate-only serialization of a ``Report``.
+
+    Deliberately never includes ``Miss.value`` (the manifest's synthetic
+    PII value) -- the comparison tab shows recall/precision numbers, not
+    the underlying data, per the mission's Non-goals.
+    """
+    return {
+        "by_type": {name: _serialize_metrics(m) for name, m in report.by_type.items()},
+        "by_detector": {name: _serialize_metrics(m) for name, m in report.by_detector.items()},
+    }
+
+
+def _run_comparison_mode(mode: eval_module.Mode) -> dict[str, Any]:
+    """Run ``demo.eval.evaluate()`` for one mode, never raising.
+
+    Returns ``{"available": True, **_serialize_report(...)}`` on success, or
+    ``{"available": False, "reason": ...}`` on any failure -- a missing demo
+    database, unset LLM env vars (``eval_module.llm_client_from_env()``
+    raises ``SystemExit`` for that), or a real network failure talking to
+    the local LLM -- so one mode's failure never blocks the other two
+    (mission-12 AC6).
+    """
+    llm_client: LLMClient | None = None
+    try:
+        if mode != "regex":
+            llm_client = eval_module.llm_client_from_env()
+        report = eval_module.evaluate(mode=mode, llm_client=llm_client)
+        return {"available": True, **_serialize_report(report)}
+    except SystemExit as exc:
+        return {"available": False, "reason": str(exc)}
+    except Exception as exc:  # LM Studio unreachable, bad manifest, etc.
+        return {"available": False, "reason": str(exc)}
+    finally:
+        if llm_client is not None:
+            llm_client.close()
+
+
+def _read_metrics_comparison_cache() -> dict[str, Any]:
+    try:
+        cached: dict[str, Any] = json.loads(METRICS_COMPARISON_PATH.read_text(encoding="utf-8"))
+        return cached
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"available": False}
+
+
+def _write_metrics_comparison_cache(payload: dict[str, Any]) -> None:
+    METRICS_COMPARISON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    METRICS_COMPARISON_PATH.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def make_handler(
@@ -636,9 +982,20 @@ def make_handler(
                 raw_body = self.rfile.read(length) if length else b""
 
                 forward_body: bytes | None = None
+                #: Default for a request that never reaches ``_tokenize_body``'s
+                #: classification (empty body) or that fails before it gets
+                #: there -- treated as an ordinary conversational cycle rather
+                #: than guessed at from nothing.
+                cycle_kind = "conversation"
                 if raw_body:
                     try:
-                        forward_body, spans = _tokenize_body(raw_body, session_id, audit_log)
+                        (
+                            forward_body,
+                            received_text,
+                            received_spans,
+                            outbound_text,
+                            cycle_kind,
+                        ) = _tokenize_body(raw_body, session_id, audit_log)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         _publish_stage(pipeline_bus, request_id, "received", _decode(raw_body))
                         _write_error(
@@ -657,10 +1014,19 @@ def make_handler(
                         )
                         return
                     _publish_stage(
-                        pipeline_bus, request_id, "received", _decode(raw_body), spans=spans
+                        pipeline_bus,
+                        request_id,
+                        "received",
+                        received_text,
+                        spans=received_spans,
+                        kind=cycle_kind,
                     )
-                    _publish_stage(pipeline_bus, request_id, "tokenized", _decode(forward_body))
-                    _publish_stage(pipeline_bus, request_id, "forwarded", _decode(forward_body))
+                    _publish_stage(
+                        pipeline_bus, request_id, "tokenized", outbound_text, kind=cycle_kind
+                    )
+                    _publish_stage(
+                        pipeline_bus, request_id, "forwarded", outbound_text, kind=cycle_kind
+                    )
 
                 forward_headers = {
                     k: v
@@ -707,9 +1073,13 @@ def make_handler(
                             raw_text, out_text = _relay_sse_response(self, upstream, vault)
                     else:
                         raw_text, out_text = _relay_buffered_response(self, upstream, session_id)
-                    _publish_stage(pipeline_bus, request_id, "response_received", raw_text)
-                    _publish_stage(pipeline_bus, request_id, "detokenized", out_text)
-                    _publish_stage(pipeline_bus, request_id, "displayed", out_text)
+                    _publish_stage(
+                        pipeline_bus, request_id, "response_received", raw_text, kind=cycle_kind
+                    )
+                    _publish_stage(
+                        pipeline_bus, request_id, "detokenized", out_text, kind=cycle_kind
+                    )
+                    _publish_stage(pipeline_bus, request_id, "displayed", out_text, kind=cycle_kind)
             except Exception:
                 if not response_started:
                     _write_error(self, 502, "upstream request failed")
@@ -758,6 +1128,12 @@ def make_handler(
             if path == f"{_PANEL_PREFIX}/metrics" and self.command == "GET":
                 self._serve_metrics()
                 return True
+            if path == f"{_PANEL_PREFIX}/metrics/comparison" and self.command == "GET":
+                self._serve_metrics_comparison_get()
+                return True
+            if path == f"{_PANEL_PREFIX}/metrics/comparison" and self.command == "POST":
+                self._serve_metrics_comparison_post()
+                return True
             if path.startswith(f"{_PANEL_PREFIX}/"):
                 _write_json(self, 404, {"error": f"no panel route for {self.command} {path}"})
                 return True
@@ -784,8 +1160,10 @@ def make_handler(
 
         def _serve_pipeline_stream(self) -> None:
             _write_sse_headers(self)
-            subscriber = pipeline_bus.subscribe()
+            subscriber, backlog = pipeline_bus.subscribe()
             try:
+                for event in backlog:
+                    _write_chunk(self, f"data: {json.dumps(event)}\n\n".encode())
                 while True:
                     event = subscriber.get()
                     _write_chunk(self, f"data: {json.dumps(event)}\n\n".encode())
@@ -873,6 +1251,23 @@ def make_handler(
                     },
                 },
             )
+
+        def _serve_metrics_comparison_get(self) -> None:
+            _write_json(self, 200, _read_metrics_comparison_cache())
+
+        def _serve_metrics_comparison_post(self) -> None:
+            # Genuinely expensive (one real LLM call per manifest entry for
+            # the llm/union modes) -- only ever runs on this explicit POST,
+            # never automatically, per the mission's Intake Grill. Persisted
+            # so the result survives a gateway restart; the panel's default
+            # view is whatever this last wrote, not a fresh run every time.
+            payload = {
+                "available": True,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "modes": {mode: _run_comparison_mode(mode) for mode in _COMPARISON_MODES},
+            }
+            _write_metrics_comparison_cache(payload)
+            _write_json(self, 200, payload)
 
         def do_GET(self) -> None:
             if self._handle_panel():

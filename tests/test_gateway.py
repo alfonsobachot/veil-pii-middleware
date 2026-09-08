@@ -13,6 +13,7 @@ import base64
 import contextlib
 import json
 import os
+import queue
 import socket
 import threading
 import time
@@ -27,7 +28,7 @@ import pytest
 from veil_pii_middleware.adapters.gateway import server as gateway_server
 from veil_pii_middleware.core.vault import Vault
 from veil_pii_middleware.demo import eval as eval_module
-from veil_pii_middleware.demo.eval import Metrics, Report
+from veil_pii_middleware.demo.eval import Metrics, Miss, Report
 
 _TEST_KEY_B64 = base64.b64encode(os.urandom(32)).decode()
 VALID_EMAIL = "alice@example.com"
@@ -105,6 +106,15 @@ def _extract_text_deltas(sse_text: str, index: int = 0) -> str:
     return "".join(out)
 
 
+def _parse_sse_events(combined: str) -> list[dict[str, Any]]:
+    """Parse every ``data: {...}`` line out of a combined SSE text blob."""
+    events: list[dict[str, Any]] = []
+    for line in combined.splitlines():
+        if line.startswith("data:"):
+            events.append(json.loads(line[len("data:") :].strip()))
+    return events
+
+
 class _RecordingUpstream:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -172,6 +182,9 @@ def servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server
     monkeypatch.setenv("VEIL_VAULT_KEY", _TEST_KEY_B64)
     monkeypatch.setattr(gateway_server, "VAULT_DB_PATH", tmp_path / ".veil" / "vault.db")
     monkeypatch.setattr(gateway_server, "AUDIT_LOG_PATH", tmp_path / ".veil" / "audit.jsonl")
+    monkeypatch.setattr(
+        gateway_server, "METRICS_COMPARISON_PATH", tmp_path / ".veil" / "metrics_comparison.json"
+    )
 
     upstream_state = _RecordingUpstream()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _make_upstream_handler(upstream_state))
@@ -848,6 +861,39 @@ def _read_sse_chunks_until_idle(
     return chunks
 
 
+def _run_request_and_collect_pipeline_events(
+    servers: _Servers, body: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """POST ``body`` through the gateway, returning *this* request's own pipeline-stage events.
+
+    Mission-12's ring buffer means a subscriber connecting now may also
+    receive backlog from earlier, unrelated cycles this same test already
+    ran (e.g. to mint a token first) -- so this filters down to the events
+    sharing the request id of the very last event captured, which is always
+    this call's own cycle: the listener only goes idle, and this function
+    only returns, once every one of this request's stages (published right
+    up through the gateway finishing the response) has already arrived.
+    """
+    results: list[list[str]] = []
+
+    def _listen() -> None:
+        results.append(
+            _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        )
+
+    listener = threading.Thread(target=_listen, daemon=True)
+    listener.start()
+    time.sleep(0.3)  # let the stream subscribe before the write happens
+
+    _post(f"{servers.gateway_url}/v1/messages", json=body)
+
+    listener.join(timeout=10)
+    assert results and results[0], "expected SSE chunks from the pipeline stream"
+    events = _parse_sse_events("".join(results[0]))
+    own_request_id = events[-1]["request_id"]
+    return [event for event in events if event["request_id"] == own_request_id]
+
+
 class TestPipelineStream:
     def test_emits_every_documented_stage_never_persisted_to_the_audit_log(
         self, servers: _Servers, tmp_path: Path
@@ -989,3 +1035,441 @@ class TestMetricsEndpoint:
         assert data["available"] is True
         assert data["by_type"]["EMAIL"]["recall"] == 1.0
         assert data["by_type"]["EMAIL"]["precision"] == 1.0
+
+
+class TestCycleKindClassification:
+    """Mission-12 follow-up: label a cycle so the panel can hide non-conversational ones.
+
+    Found via a throwaway raw-capture proxy (bypassing this module's own
+    extraction entirely) against real Claude Code traffic: a session-
+    title-generation request and an agent-loop continuation turn (whose
+    only "new" content is a Claude-Code-injected `<system-reminder>` block)
+    are both real requests, not bugs -- but neither is something a human
+    typed, so the panel's cycle selector should default to hiding them.
+    """
+
+    def test_title_generation_request_is_classified(self, servers: _Servers) -> None:
+        body = {
+            "model": "claude-x",
+            "system": [
+                {"type": "text", "text": "You are a Claude agent."},
+                {
+                    "type": "text",
+                    "text": "You are naming a coding session so the user can pick it"
+                    " out of a long list of sessions. The title is...",
+                },
+            ],
+            "messages": [{"role": "user", "content": "<session>\nfoo\n</session>"}],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "title_generation", stage
+
+    def test_internal_continuation_turn_is_classified(self, servers: _Servers) -> None:
+        body = {
+            "model": "claude-x",
+            "messages": [
+                {"role": "user", "content": "the real question"},
+                {"role": "assistant", "content": "the real answer"},
+                {
+                    "role": "user",
+                    "content": "<system-reminder>\ntoken budget: 42\n</system-reminder>",
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "internal_continuation", stage
+
+    def test_an_ordinary_conversational_turn_is_classified_as_conversation(
+        self, servers: _Servers
+    ) -> None:
+        events = _run_request_and_collect_pipeline_events(
+            servers, {"messages": [{"role": "user", "content": "hello there"}]}
+        )
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "conversation", stage
+
+
+class TestMessageTextExtraction:
+    """Mission-12: panes must show the human message, not the raw JSON document.
+
+    ``core/tokenizer.py``'s ``Span`` offsets are per string-leaf, not per
+    whole-document -- these tests exist because the pre-mission-12 code
+    sliced them into the whole document text anyway, which is the concrete
+    reason the panel read as illegible garbage for any real payload.
+    """
+
+    def test_input_pane_shows_only_the_latest_user_turn_with_correctly_aligned_spans(
+        self, servers: _Servers
+    ) -> None:
+        last_turn = f"contact {VALID_EMAIL} please"
+        body = {
+            "model": "claude-x",
+            "system": "You are a careful assistant. " * 5,
+            "tools": [{"name": "get_weather", "description": "Get the weather for a city"}],
+            "messages": [
+                {"role": "user", "content": "hi there"},
+                {"role": "assistant", "content": "Hello! How can I help?"},
+                {"role": "user", "content": last_turn},
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        received = next(e for e in events if e["stage"] == "received")
+        assert received["text"] == last_turn
+        assert "careful assistant" not in received["text"]
+        assert "get_weather" not in received["text"]
+        assert "hi there" not in received["text"]
+
+        span = next(s for s in received["spans"] if s["entity_type"] == "EMAIL")
+        assert received["text"][span["start"] : span["end"]] == VALID_EMAIL
+
+    def test_naive_whole_document_offset_would_have_been_wrong(self, servers: _Servers) -> None:
+        """Regression guard for the actual bug being fixed.
+
+        The email's offset *within the whole raw JSON document* differs
+        from its offset within the extracted last-user-turn text alone,
+        proving this isn't a no-op for a payload where the two would
+        coincidentally agree.
+        """
+        last_turn = f"contact {VALID_EMAIL} please"
+        body = {
+            "model": "claude-x",
+            "system": "You are a careful assistant. " * 20,
+            "messages": [{"role": "user", "content": last_turn}],
+        }
+        whole_document_offset = json.dumps(body).index(VALID_EMAIL)
+        last_turn_offset = last_turn.index(VALID_EMAIL)
+        assert whole_document_offset != last_turn_offset  # the bug's precondition
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        received = next(e for e in events if e["stage"] == "received")
+        span = next(s for s in received["spans"] if s["entity_type"] == "EMAIL")
+        assert span["start"] == last_turn_offset
+        assert received["text"][span["start"] : span["end"]] == VALID_EMAIL
+
+    def test_non_text_last_turn_content_renders_a_placeholder_not_an_empty_pane(
+        self, servers: _Servers
+    ) -> None:
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "42"}],
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        received = next(e for e in events if e["stage"] == "received")
+        assert received["text"]
+        assert "[tool_result]" in received["text"]
+
+
+class TestResponseTextExtraction:
+    """Mission-12: the response panes reconstruct display text, never wire framing."""
+
+    def _mint_email_token(self, servers: _Servers) -> str:
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"my email is {VALID_EMAIL}"}]},
+        )
+        forwarded = json.loads(servers.upstream_state.requests[-1]["body"])
+        token = str(forwarded["messages"][0]["content"]).split()[-1].rstrip(".")
+        assert token == "PII_EMAIL_0001"
+        return token
+
+    def test_buffered_json_response_shows_only_reconstructed_text(self, servers: _Servers) -> None:
+        token = self._mint_email_token(servers)
+        servers.upstream_state.response_headers = {"Content-Type": "application/json"}
+        servers.upstream_state.response_body = json.dumps(
+            {
+                "id": "msg_123",
+                "role": "assistant",
+                "content": [{"type": "text", "text": f"Sure, contact {token}."}],
+                "stop_reason": "end_turn",
+            }
+        ).encode()
+
+        events = _run_request_and_collect_pipeline_events(servers, {"messages": []})
+
+        response_received = next(e for e in events if e["stage"] == "response_received")
+        assert response_received["text"] == f"Sure, contact {token}."
+        assert "msg_123" not in response_received["text"]
+        assert "stop_reason" not in response_received["text"]
+
+        displayed = next(e for e in events if e["stage"] == "displayed")
+        assert displayed["text"] == f"Sure, contact {VALID_EMAIL}."
+
+    def test_sse_response_shows_only_reconstructed_text_across_blocks(
+        self, servers: _Servers
+    ) -> None:
+        token = self._mint_email_token(servers)
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {"type": "message_start", "message": {"id": "msg_1"}},
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "hmm, "},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "let me check."},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "Sure, contact "},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": f"{token}."},
+                },
+                {"type": "content_block_stop", "index": 1},
+                {"type": "message_stop"},
+            ]
+        )
+
+        events = _run_request_and_collect_pipeline_events(servers, {"messages": []})
+
+        response_received = next(e for e in events if e["stage"] == "response_received")
+        assert response_received["text"] == f"hmm, let me check.Sure, contact {token}."
+        assert "content_block_start" not in response_received["text"]
+        assert "message_start" not in response_received["text"]
+        assert "event:" not in response_received["text"]
+
+        displayed = next(e for e in events if e["stage"] == "displayed")
+        assert displayed["text"] == f"hmm, let me check.Sure, contact {VALID_EMAIL}."
+
+
+class TestPipelineHistoryBuffer:
+    """Mission-12: a panel opened after cycles already ran must still see them."""
+
+    def test_late_subscriber_receives_already_completed_cycles_oldest_first(
+        self, servers: _Servers
+    ) -> None:
+        for i in range(3):
+            _post(
+                f"{servers.gateway_url}/v1/messages",
+                json={"messages": [{"role": "user", "content": f"turn {i}"}]},
+            )
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        events = _parse_sse_events("".join(chunks))
+
+        received_texts = [e["text"] for e in events if e["stage"] == "received"]
+        assert received_texts == ["turn 0", "turn 1", "turn 2"]
+
+    def test_ring_buffer_is_bounded_and_evicts_oldest_first(self, servers: _Servers) -> None:
+        total = gateway_server.PIPELINE_HISTORY_LIMIT + 2
+        for i in range(total):
+            _post(
+                f"{servers.gateway_url}/v1/messages",
+                json={"messages": [{"role": "user", "content": f"turn {i}"}]},
+            )
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        events = _parse_sse_events("".join(chunks))
+
+        received_texts = [e["text"] for e in events if e["stage"] == "received"]
+        assert len(received_texts) == gateway_server.PIPELINE_HISTORY_LIMIT
+        assert received_texts == [f"turn {i}" for i in range(2, total)]
+
+
+class TestPipelineEventBusConcurrency:
+    """Direct unit test of the ring buffer's lock discipline (no HTTP layer).
+
+    Exercises the exact race `mission.md`'s Scrutiny Validator calls out:
+    ``publish()``'s history/subscriber-snapshot and ``subscribe()``'s
+    backlog-snapshot/registration must be mutually exclusive, or an event
+    could be delivered to one subscriber twice (once via backlog, once
+    live). "Never dropped" is not asserted here -- a subscriber connecting
+    mid-burst legitimately misses events published before it existed; what
+    must never happen, for any cycle a given subscriber's snapshot *did*
+    observe, is seeing one of its stages more than once.
+    """
+
+    def test_subscribe_publish_race_never_duplicates_a_stage_for_one_subscriber(self) -> None:
+        bus = gateway_server.PipelineEventBus()
+        stages = gateway_server.PIPELINE_STAGES
+        num_cycles = 200
+
+        def _publish_cycles() -> None:
+            for i in range(num_cycles):
+                request_id = f"req-{i}"
+                for stage in stages:
+                    bus.publish({"request_id": request_id, "stage": stage, "text": ""})
+
+        collected: list[list[dict[str, Any]]] = []
+        collected_lock = threading.Lock()
+        stop = threading.Event()
+
+        def _subscribe_repeatedly() -> None:
+            while not stop.is_set():
+                subscriber, backlog = bus.subscribe()
+                live: list[dict[str, Any]] = []
+                try:
+                    while True:
+                        live.append(subscriber.get_nowait())
+                except queue.Empty:
+                    pass
+                bus.unsubscribe(subscriber)
+                with collected_lock:
+                    collected.append(backlog + live)
+
+        publisher = threading.Thread(target=_publish_cycles)
+        subscriber_thread = threading.Thread(target=_subscribe_repeatedly)
+        publisher.start()
+        subscriber_thread.start()
+        publisher.join(timeout=10)
+        stop.set()
+        subscriber_thread.join(timeout=10)
+
+        assert collected, "expected at least one subscribe snapshot during the publish burst"
+        for snapshot in collected:
+            by_request: dict[str, list[str]] = {}
+            for event in snapshot:
+                by_request.setdefault(event["request_id"], []).append(event["stage"])
+            for request_id, seen_stages in by_request.items():
+                assert len(seen_stages) == len(set(seen_stages)), (
+                    f"{request_id} delivered a duplicate stage to one subscriber: {seen_stages}"
+                )
+
+
+class TestMetricsComparisonEndpoint:
+    """Mission-12: the persisted regex/LLM/union comparison the Metrics tab shows."""
+
+    def test_cache_miss_before_any_run(self, servers: _Servers) -> None:
+        resp = _get(f"{servers.gateway_url}/veil-panel/metrics/comparison")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"available": False}
+
+    def test_post_persists_and_a_second_independent_handler_reads_it_back(
+        self, servers: _Servers, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_report = Report(
+            by_type={"EMAIL": Metrics(support=1, true_positives=1, false_positives=0)},
+            by_detector={"REGEX": Metrics(support=1, true_positives=1, false_positives=0)},
+            misses=[],
+        )
+        monkeypatch.setattr(eval_module, "evaluate", lambda *a, **k: fake_report)
+        monkeypatch.setattr(eval_module, "llm_client_from_env", lambda: _StubLLMClient())
+
+        resp = httpx.post(f"{servers.gateway_url}/veil-panel/metrics/comparison", timeout=10)
+
+        assert resp.status_code == 200
+        posted = resp.json()
+        assert posted["available"] is True
+        for mode in ("regex", "llm", "union"):
+            assert posted["modes"][mode]["available"] is True
+            assert posted["modes"][mode]["by_type"]["EMAIL"]["recall"] == 1.0
+
+        # Simulate a gateway restart: a second, independently-constructed
+        # handler pointed at the same (monkeypatched) cache path must read
+        # back the same persisted result, with no run of its own.
+        client2 = httpx.Client(timeout=httpx.Timeout(10.0))
+        handler_cls2 = gateway_server.make_handler(
+            gateway_server._new_session_id(), client2, "http://127.0.0.1:1"
+        )
+        gateway2 = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls2)
+        gateway2_thread = threading.Thread(target=gateway2.serve_forever, daemon=True)
+        gateway2_thread.start()
+        try:
+            resp2 = _get(
+                f"http://127.0.0.1:{gateway2.server_address[1]}/veil-panel/metrics/comparison"
+            )
+            assert resp2.status_code == 200
+            assert resp2.json() == posted
+        finally:
+            gateway2.shutdown()
+            gateway2_thread.join(timeout=5)
+            client2.close()
+
+    def test_llm_and_union_failing_still_returns_a_real_regex_result(
+        self, servers: _Servers, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        regex_report = Report(
+            by_type={"EMAIL": Metrics(support=3, true_positives=3, false_positives=0)},
+            by_detector={},
+            misses=[],
+        )
+        monkeypatch.setattr(eval_module, "evaluate", lambda *a, **k: regex_report)
+        # `llm_client_from_env()` is left un-mocked: with no VEIL_LLM_BASE_URL/
+        # VEIL_LLM_MODEL set (conftest strips them for every test), it raises
+        # `SystemExit` for both non-regex modes before `evaluate()` is even
+        # reached -- the realistic "LM Studio not configured" shape.
+
+        resp = httpx.post(f"{servers.gateway_url}/veil-panel/metrics/comparison", timeout=10)
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["modes"]["regex"]["available"] is True
+        assert data["modes"]["regex"]["by_type"]["EMAIL"]["recall"] == 1.0
+        assert data["modes"]["llm"]["available"] is False
+        assert "reason" in data["modes"]["llm"]
+        assert data["modes"]["union"]["available"] is False
+
+    def test_persisted_cache_holds_no_raw_manifest_value(
+        self, servers: _Servers, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        report_with_a_miss = Report(
+            by_type={"EMAIL": Metrics(support=1, true_positives=0, false_positives=0)},
+            by_detector={},
+            misses=[
+                Miss(
+                    table="customers",
+                    column="email",
+                    row_id=1,
+                    entity_type="EMAIL",
+                    value=VALID_EMAIL,
+                )
+            ],
+        )
+        monkeypatch.setattr(eval_module, "evaluate", lambda *a, **k: report_with_a_miss)
+
+        httpx.post(f"{servers.gateway_url}/veil-panel/metrics/comparison", timeout=10)
+
+        cached_text = gateway_server.METRICS_COMPARISON_PATH.read_text(encoding="utf-8")
+        assert VALID_EMAIL not in cached_text
+        assert '"value"' not in cached_text
+
+
+class _StubLLMClient:
+    """Stands in for `core.detector.LLMClient` in tests that never make a real call."""
+
+    def close(self) -> None:
+        pass
