@@ -103,8 +103,6 @@
       "Bash(rm -fr:*)",
       "Bash(git push --force:*)",
       "Bash(git push -f:*)",
-      "Bash(curl:*)",
-      "Bash(wget:*)",
       "Bash(sudo:*)"
     ],
 
