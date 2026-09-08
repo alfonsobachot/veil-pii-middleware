@@ -436,7 +436,18 @@ _SYSTEM_PROMPT: Final = (
     "input, so it can be located by an exact substring match. Treat an "
     "indirect reference that identifies a specific person (for example "
     '"the son of the Acme administrator") as a PERSON match on the phrase '
-    "that identifies them, not a separate category."
+    "that identifies them, not a separate category. A first-person "
+    'self-introduction -- "Soy Alfonso", "Me llamo Ana Garcia", "My name is '
+    'John Smith", "This is Maria speaking" -- names the speaker just as much '
+    "as a third-person mention names someone else: match the name in these "
+    "just as you would if someone else said it about them. Never skip a name "
+    "merely because the person speaking is naming themselves. Match only the "
+    'name itself, never a leading verb or introductory phrase -- in "Soy '
+    'Alfonso" the match is "Alfonso", not "Soy Alfonso". When a person has '
+    "multiple name parts (a given name plus one or more surnames), return "
+    "them together as ONE span covering the full name, never one span per "
+    'word -- in "Alfonso Garcia" the match is "Alfonso Garcia", not '
+    '"Alfonso" and "Garcia" separately.'
 )
 
 

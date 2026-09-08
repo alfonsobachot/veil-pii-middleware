@@ -693,3 +693,62 @@ class TestSkipPredicateForProtocolMetadata:
     def test_omitting_skip_scans_everything_as_before(self, vault: Vault) -> None:
         result = tokenize(VALID_EMAIL, vault)
         assert result == "PII_EMAIL_0001"
+
+
+class TestExcludePredicateForInterleavedMetadata:
+    """`exclude` carves specific ranges out of a leaf, unlike `skip`'s all-or-nothing.
+
+    Motivated by a live finding: Claude Code interleaves injected metadata
+    (e.g. a `<system-reminder>` block carrying the user's own account email)
+    with the human's own typed text in the very same leaf. `skip` cannot
+    exclude just the metadata without also skipping the real text next to
+    it in the same leaf -- `exclude` returns ranges within the leaf's own
+    text so only spans inside those ranges are dropped.
+    """
+
+    def test_span_inside_an_excluded_range_is_not_tokenized(self, vault: Vault) -> None:
+        prefix = "metadata: "
+        text = f"{prefix}{VALID_EMAIL}"
+
+        result = tokenize(text, vault, exclude=lambda t: [(0, len(prefix) + len(VALID_EMAIL))])
+
+        assert result == text
+
+    def test_a_span_outside_the_excluded_range_is_still_tokenized(self, vault: Vault) -> None:
+        other_email = "bob@example.com"
+        excluded = f"reminder: {VALID_EMAIL}"
+        text = f"{excluded}\ncontact {other_email}"
+
+        result = tokenize(text, vault, exclude=lambda t: [(0, len(excluded))])
+
+        assert VALID_EMAIL in result  # left untouched, inside the excluded range
+        assert "PII_EMAIL_0001" in result  # the second, non-excluded email still caught
+        assert other_email not in result
+
+    def test_excluded_span_produces_no_audit_entry(self, vault: Vault, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log = AuditLog(log_path)
+        text = f"reminder: {VALID_EMAIL}"
+
+        result = tokenize(
+            text,
+            vault,
+            exclude=lambda t: [(0, len(text))],
+            audit_log=log,
+            adapter="test",
+        )
+
+        assert result == text
+        assert not log_path.exists()
+
+    def test_excluded_span_is_absent_from_span_sink(self, vault: Vault) -> None:
+        spans: list[Span] = []
+        text = f"reminder: {VALID_EMAIL}"
+
+        tokenize(text, vault, exclude=lambda t: [(0, len(text))], span_sink=spans)
+
+        assert spans == []
+
+    def test_omitting_exclude_scans_everything_as_before(self, vault: Vault) -> None:
+        result = tokenize(VALID_EMAIL, vault)
+        assert result == "PII_EMAIL_0001"

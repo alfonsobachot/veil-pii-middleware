@@ -1003,6 +1003,68 @@ class TestVaultInspectorEndpoints:
         )
         assert resp.status_code == 400
 
+    def test_list_shows_every_session_not_just_the_most_recent(self, servers: _Servers) -> None:
+        """Live-reported regression: a gateway restart mints a fresh fallback
+        session id, and the vault inspector's default listing was scoped to
+        only that one -- silently hiding every earlier session's tokens even
+        though the rows are still in ``VAULT_DB_PATH``.
+        """
+        other_session_id = "other-22222222-2222-2222-2222-222222222222"
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+            session_id=HOOK_SESSION_ID,
+        )
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": "my dni is 12345678Z"}]},
+            session_id=other_session_id,
+        )
+
+        resp = _get(f"{servers.gateway_url}/veil-panel/vault", session_id=None)
+
+        assert resp.status_code == 200
+        data = resp.json()
+        seen_sessions = {m["session_id"] for m in data["mappings"]}
+        assert HOOK_SESSION_ID in seen_sessions
+        assert other_session_id in seen_sessions
+
+    def test_reveal_disambiguates_identically_named_tokens_across_sessions(
+        self, servers: _Servers
+    ) -> None:
+        """Two sessions each mint their own `PII_EMAIL_0001` -- for different
+        real values. Listing must tell them apart (via `session_id` per row)
+        and reveal must resolve each to its own value, not the other's.
+        """
+        other_session_id = "other-33333333-3333-3333-3333-333333333333"
+        other_email = "someone.else@example.com"
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+            session_id=HOOK_SESSION_ID,
+        )
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {other_email}"}]},
+            session_id=other_session_id,
+        )
+
+        listed = _get(f"{servers.gateway_url}/veil-panel/vault", session_id=None).json()
+        rows = [m for m in listed["mappings"] if m["token"] == "PII_EMAIL_0001"]
+        assert len(rows) == 2
+        assert {r["session_id"] for r in rows} == {HOOK_SESSION_ID, other_session_id}
+
+        for row, expected_value in (
+            (HOOK_SESSION_ID, VALID_EMAIL),
+            (other_session_id, other_email),
+        ):
+            resp = httpx.post(
+                f"{servers.gateway_url}/veil-panel/vault/reveal",
+                json={"token": "PII_EMAIL_0001", "session_id": row},
+                timeout=10,
+            )
+            assert resp.json()["value"] == expected_value
+
 
 class TestMetricsEndpoint:
     def test_reports_unavailable_when_demo_data_missing(
@@ -1152,6 +1214,58 @@ class TestCycleKindClassification:
         for stage in gateway_server.PIPELINE_STAGES:
             event = next(e for e in events if e["stage"] == stage)
             assert event["kind"] == "conversation", stage
+
+
+class TestExcludedMetadataNeverTokenized:
+    """Live-reported: Claude-Code-injected metadata must never be tokenized.
+
+    Two distinct findings from the same live-testing session: (1) a
+    `<system-reminder>` block interleaved with the human's own typed text in
+    one message leaf carries injected metadata (e.g. the user's own account
+    email) that isn't anything the human wrote -- but the real human text
+    right next to it in that same leaf must still be scanned normally; (2)
+    Anthropic's own fixed commit-trailer address
+    (`noreply@anthropic.com`) is Claude Code's own static tool-instruction
+    text, never a real person's address.
+    """
+
+    def test_email_inside_a_system_reminder_is_left_untouched(self, servers: _Servers) -> None:
+        real_email = "customer@example.com"
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"<system-reminder>\naccount email: {VALID_EMAIL}\n"
+                    f"</system-reminder>\ncontact {real_email}",
+                },
+            ],
+        }
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json=body)
+        assert resp.status_code == 200
+        forwarded = json.loads(servers.upstream_state.requests[-1]["body"])
+        forwarded_text = str(forwarded["messages"][0]["content"])
+
+        assert VALID_EMAIL in forwarded_text  # inside the reminder: untouched
+        assert real_email not in forwarded_text  # the human's own text: tokenized
+        assert "PII_EMAIL_0001" in forwarded_text
+
+    def test_anthropic_commit_trailer_address_is_never_tokenized(self, servers: _Servers) -> None:
+        body = {
+            "system": (
+                "Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n"
+                "Some other static tool instruction text."
+            ),
+            "messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}],
+        }
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json=body)
+        assert resp.status_code == 200
+        forwarded = json.loads(servers.upstream_state.requests[-1]["body"])
+
+        assert "noreply@anthropic.com" in str(forwarded["system"])
+        assert VALID_EMAIL not in str(forwarded["messages"])
+        assert "PII_EMAIL_0001" in str(forwarded["messages"])
 
 
 class TestMessageTextExtraction:

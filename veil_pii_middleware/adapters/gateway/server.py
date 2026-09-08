@@ -557,6 +557,38 @@ def _strip_injected_wrapper_tags(text: str) -> str:
     return re.sub(r"\n{2,}", "\n", stripped).strip()
 
 
+#: Anthropic's own reserved commit-trailer address (``Co-Authored-By: Claude
+#: ... <noreply@anthropic.com>``), part of Claude Code's own static tool
+#: instructions -- never a real person's address, so excluding this exact,
+#: fixed string from detection loses no real protection. A value-based
+#: exclusion (unlike a leaf-level skip) is safe here specifically because
+#: this string is permanently-fixed Anthropic infrastructure text, not
+#: something a real user's own PII could ever coincide with.
+_ANTHROPIC_COMMIT_TRAILER_EMAIL: Final = "noreply@anthropic.com"
+
+
+def _excluded_ranges(text: str) -> list[tuple[int, int]]:
+    """Ranges within one string leaf that must never be tokenized.
+
+    Passed as ``tokenize()``'s ``exclude`` callback (``core/tokenizer.py``):
+    unlike ``skip`` (all-or-nothing per leaf), this only carves out specific
+    known non-user substrings that can be *interleaved* with real,
+    human-authored content in the very same leaf -- exactly what a
+    `<system-reminder>` block prepended before the human's own typed text
+    is (the same wrapper set ``_strip_injected_wrapper_tags`` already
+    recognizes for *display*; here the same recognition also keeps its
+    contents, e.g. injected account/environment metadata, out of the
+    *substitution* pass) -- plus Anthropic's own fixed commit-trailer
+    address, wherever in a leaf it happens to appear.
+    """
+    ranges = [(m.start(), m.end()) for m in _INJECTED_WRAPPER_TAG_RE.finditer(text)]
+    start = text.find(_ANTHROPIC_COMMIT_TRAILER_EMAIL)
+    while start != -1:
+        ranges.append((start, start + len(_ANTHROPIC_COMMIT_TRAILER_EMAIL)))
+        start = text.find(_ANTHROPIC_COMMIT_TRAILER_EMAIL, start + 1)
+    return ranges
+
+
 def _extract_system_text(parsed: JSONValue) -> str:
     """Join a Messages API request body's ``system`` field into plain text.
 
@@ -646,6 +678,7 @@ def _tokenize_body(
                 audit_log=audit_log,
                 adapter="gateway",
                 skip=_skip_reserved_anthropic_metadata,
+                exclude=_excluded_ranges,
             )
         received_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(parsed))
         outbound_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(tokenized))
@@ -1230,21 +1263,35 @@ def make_handler(
                 pipeline_bus.unsubscribe(subscriber)
 
         def _serve_vault_list(self) -> None:
-            session_id = _query_param(self.path, "session_id") or self._default_session_id()
+            """Serve the vault inspector's listing.
+
+            With no ``?session_id=`` query param, lists mappings across
+            *every* session in ``VAULT_DB_PATH`` (``list_all_mappings()``) --
+            not just whichever session happens to be "current" -- so a
+            gateway restart (a fresh fallback session id every time) never
+            makes an earlier session's tokens silently disappear from the
+            panel. Pass an explicit ``?session_id=`` to scope to just one.
+            """
+            requested_session_id = _query_param(self.path, "session_id")
             VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            session_id = requested_session_id or self._default_session_id()
             with Vault(VAULT_DB_PATH, session_id) as vault:
-                mappings = vault.list_mappings()
+                mappings = (
+                    vault.list_mappings() if requested_session_id else vault.list_all_mappings()
+                )
             _write_json(
                 self,
                 200,
                 {
-                    "session_id": session_id,
+                    "session_id": requested_session_id or "",
+                    "default_session_id": self._default_session_id(),
                     "mappings": [
                         {
                             "token": m.token,
                             "entity_type": m.entity_type,
                             "ciphertext_b64": m.ciphertext_b64,
                             "created_at": m.created_at,
+                            "session_id": m.session_id,
                         }
                         for m in mappings
                     ],

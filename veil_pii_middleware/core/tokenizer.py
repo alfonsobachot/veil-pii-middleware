@@ -95,6 +95,7 @@ class _TokenizeContext:
     adapter: str | None
     span_sink: list[Span] | None
     skip: Callable[[str], bool] | None
+    exclude: Callable[[str], list[tuple[int, int]]] | None
 
 
 def tokenize(
@@ -106,6 +107,7 @@ def tokenize(
     adapter: str | None = None,
     span_sink: list[Span] | None = None,
     skip: Callable[[str], bool] | None = None,
+    exclude: Callable[[str], list[tuple[int, int]]] | None = None,
 ) -> JSONValue:
     """Replace every PII span ``detect()`` finds in ``value`` with a vault token.
 
@@ -144,12 +146,30 @@ def tokenize(
     metadata on its own and must keep scanning by default. The predicate
     itself carries no knowledge of any specific transport; only the caller
     supplying it does, keeping this module transport-agnostic.
+
+    ``exclude``, if supplied, is called once per string leaf (only when that
+    leaf was not already dropped entirely by ``skip``) and returns a list of
+    ``(start, end)`` character ranges within that leaf's *own* text; any
+    detected span overlapping one of these ranges is discarded before
+    substitution -- unlike ``skip``, the rest of the leaf is still scanned
+    and substituted normally. For excluding a known non-user substring that
+    is *embedded inside* otherwise-real content in the same leaf (e.g. a
+    transport-injected metadata block interleaved with the human's own
+    typed text) -- ``skip`` cannot do this because it is all-or-nothing per
+    leaf, and skipping the whole leaf would also stop scanning the real
+    content next to it. Same transport-agnostic contract as ``skip``: this
+    module has no opinion on what counts as excludable, only the caller does.
     """
     if audit_log is not None and not adapter:
         raise ValueError("adapter must be a non-empty string when audit_log is supplied")
     client = llm_client if llm_client is not None else _default_llm_client()
     context = _TokenizeContext(
-        llm_client=client, audit_log=audit_log, adapter=adapter, span_sink=span_sink, skip=skip
+        llm_client=client,
+        audit_log=audit_log,
+        adapter=adapter,
+        span_sink=span_sink,
+        skip=skip,
+        exclude=exclude,
     )
     try:
         return _tokenize(value, vault, context)
@@ -175,6 +195,16 @@ def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
     # of spans -- this is where the LLM layer's spans union in, gated by
     # whether llm_client is set (see tokenize()'s docstring).
     spans = detect(text, llm_client=context.llm_client)
+    if context.exclude is not None:
+        excluded_ranges = context.exclude(text)
+        if excluded_ranges:
+            spans = [
+                span
+                for span in spans
+                if not any(
+                    span.start < r_end and span.end > r_start for r_start, r_end in excluded_ranges
+                )
+            ]
     if context.span_sink is not None:
         context.span_sink.extend(sorted(spans, key=lambda s: s.start))
     # Right-to-left by start offset: substituting a token of a different

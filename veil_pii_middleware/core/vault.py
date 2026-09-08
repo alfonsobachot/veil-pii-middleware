@@ -49,6 +49,7 @@ class MappingInfo:
     entity_type: str
     ciphertext_b64: str
     created_at: int
+    session_id: str
 
 
 #: Environment variable carrying the master key: base64-encoded, 32 raw bytes
@@ -311,6 +312,40 @@ class Vault:
                 entity_type=str(row[1]),
                 ciphertext_b64=base64.b64encode(bytes(row[2])).decode(),
                 created_at=int(row[3]),
+                session_id=self._session_id,
+            )
+            for row in cur.fetchall()
+        ]
+
+    def list_all_mappings(self) -> list[MappingInfo]:
+        """Return every mapping in this ``db_path``, across every session, newest first.
+
+        Same read-only, never-decrypts contract as ``list_mappings()`` -- the
+        only difference is the ``WHERE session_id = ?`` filter is dropped.
+        The session scoping on ``mappings`` is an application convention
+        (token stability per session), not a database-level partition, so
+        any open connection to this ``db_path`` can already see every row;
+        this just doesn't filter them out. Exists because the observability
+        panel's vault inspector must show tokens minted under *any* session
+        that ever hit this gateway process's ``db_path`` -- not only
+        whichever ``session_id`` happens to be "current" (the gateway's
+        fallback id is a fresh UUID per process restart, so without this a
+        restart made every earlier session's tokens silently invisible in
+        the panel, even though the rows were still sitting in the file).
+        """
+        cur = self._conn.execute(
+            """
+            SELECT token, entity_type, ciphertext, created_at, session_id FROM mappings
+            ORDER BY created_at DESC, token DESC
+            """
+        )
+        return [
+            MappingInfo(
+                token=str(row[0]),
+                entity_type=str(row[1]),
+                ciphertext_b64=base64.b64encode(bytes(row[2])).decode(),
+                created_at=int(row[3]),
+                session_id=str(row[4]),
             )
             for row in cur.fetchall()
         ]

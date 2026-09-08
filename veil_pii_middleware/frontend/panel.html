@@ -18,11 +18,33 @@
     --ok: #4fd48a;
   }
   * { box-sizing: border-box; }
+  /* An author-defined `display` on an element (or, as happened here, on a
+     child selector like `#bottom`) beats the browser's built-in
+     `[hidden] { display: none }` default -- that's exactly the bug that
+     made the Inspect tab's content show up on the Live tab too, since
+     `#bottom`'s own `display: grid` won the cascade over `[hidden]`.
+     `!important` here is the standard fix: it always wins regardless of
+     what any other component-specific `display` rule declares, so `hidden`
+     can be trusted to actually hide, everywhere, without auditing every
+     rule that touches `display`. Toggle visibility via the `hidden` prop,
+     never `style.display`. */
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
     font: 13px/1.4 -apple-system, Segoe UI, sans-serif;
+  }
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  .tab-body {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
   }
   header {
     padding: 12px 16px;
@@ -47,11 +69,20 @@
   }
   .tab-btn.active { color: var(--text); border-color: var(--stage-active); background: var(--panel); }
 
+  #cycle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 16px;
+  }
   #cycle-selector {
     display: flex;
+    align-items: center;
     gap: 6px;
-    padding: 10px 16px 0;
     overflow-x: auto;
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .cycle-chip {
     font: inherit;
@@ -69,14 +100,28 @@
   .cycle-chip.selected { color: var(--text); border-color: var(--stage-active); }
   .cycle-chip.in-flight { border-style: dashed; }
   .cycle-chip.internal-kind { opacity: 0.6; font-style: italic; }
-  .cycle-empty { color: var(--muted); padding: 10px 16px 0; }
-  #show-internal-toggle { margin: 6px 16px 0; font-size: 12px; color: var(--muted); }
+  .cycle-empty { color: var(--muted); flex: 1 1 auto; }
+  #show-internal-toggle {
+    font: inherit;
+    padding: 4px 10px;
+    color: var(--muted);
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+  #show-internal-toggle.active { color: var(--text); border-color: var(--stage-active); }
 
+  #pipeline-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
   #pipeline {
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 16px 16px 4px;
+    padding: 4px 0;
+    margin-left: 16px;
     overflow-x: auto;
   }
   .stage-box {
@@ -94,28 +139,48 @@
     color: #fff;
   }
   .stage-box.pending { opacity: 0.4; }
+  .stage-number {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.15);
+    font-size: 10px;
+    font-weight: 700;
+  }
   .arrow { color: var(--muted); }
 
   #stage-controls {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 4px 16px 12px;
+    padding: 4px 0;
+    margin-right: 16px;
   }
-  #stage-caption { color: var(--muted); padding: 0 16px 12px; min-height: 1.2em; }
+  #stage-controls button {
+    padding: 8px 12px;
+  }
+  #stage-caption { color: var(--muted); padding: 0 16px 8px; min-height: 1.2em; }
 
   #panes {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
+    grid-template-rows: repeat(2, 1fr);
     gap: 12px;
     padding: 0 16px 16px;
+    flex: 1 1 auto;
+    min-height: 0;
   }
   .pane {
     background: var(--panel);
     border: 1px solid var(--panel-border);
     border-radius: 8px;
     padding: 10px 12px;
-    min-height: 140px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
   .pane h2 {
     font-size: 12px;
@@ -130,6 +195,8 @@
     margin: 0;
     font-family: ui-monospace, Consolas, monospace;
     font-size: 12px;
+    flex: 1 1 auto;
+    overflow-y: auto;
   }
   .pane-pending { color: var(--muted); font-style: italic; }
   .span-regex { background: color-mix(in srgb, var(--regex) 35%, transparent); border-radius: 2px; }
@@ -140,9 +207,11 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 12px;
-    padding: 0 16px 16px;
+    padding: 16px;
+    flex: 1 1 auto;
+    min-height: 0;
   }
-  #bottom table { display: block; max-height: 220px; overflow-y: auto; }
+  #bottom table { display: block; flex: 1 1 auto; overflow-y: auto; }
   #bottom thead, #bottom tbody tr { display: table; width: 100%; table-layout: fixed; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--panel-border); }
@@ -158,7 +227,7 @@
   }
   button:hover:not(:disabled) { border-color: var(--stage-active); }
   button:disabled { opacity: 0.4; cursor: default; }
-  .legend { display: flex; gap: 14px; color: var(--muted); padding: 0 16px 8px; }
+  .legend { display: flex; gap: 14px; color: var(--muted); padding: 0 16px; margin-top: 8px; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 
@@ -177,30 +246,40 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback } = React;
 
+// Every raw pipeline-stream stage the server publishes, in order -- used
+// wherever *all six* must be checked (e.g. `cycleIsComplete`), independent
+// of how they're grouped for display below.
 const STAGES = ["received", "tokenized", "forwarded", "response_received", "detokenized", "displayed"];
-const STAGE_LABEL = {
-  received: "Received",
-  tokenized: "Tokenized",
-  forwarded: "Forwarded upstream",
-  response_received: "Response received",
-  detokenized: "Detokenized",
-  displayed: "Displayed",
-};
-// One line per stage explaining what it does -- shown as the step-through
+
+// The diagram/step-through groups those six into four visual steps, one per
+// pane: `tokenized`/`forwarded` carry identical display text (substitution
+// happened; then it was actually sent), and so do `detokenized`/`displayed`
+// (resolved; then actually delivered) -- stepping "Next" onto the second
+// stage of a pair changed nothing you could see, which is confusing in a
+// walkthrough meant to teach the pipeline. Each group's `number` matches
+// its pane's own "N. <name>" heading (`Panes` below) so the connection
+// between a stage box and a pane is explicit, not left to guessing.
+const STAGE_GROUPS = [
+  { number: 1, label: "Received", stages: ["received"], paneKey: "input" },
+  { number: 2, label: "Tokenized & forwarded", stages: ["tokenized", "forwarded"], paneKey: "outbound" },
+  { number: 3, label: "Response received", stages: ["response_received"], paneKey: "response" },
+  { number: 4, label: "Detokenized & displayed", stages: ["detokenized", "displayed"], paneKey: "developer" },
+];
+
+// One line per group explaining what it does -- shown as the step-through
 // caption, since the real cycle happens far too fast to read live (BRIEF's
 // own "timebox this" warning, and the reason this walkthrough exists).
-const STAGE_EXPLANATION = {
-  received: "The gateway reads the raw request and scans it for PII spans (regex + LLM layers).",
-  tokenized: "Every detected span is replaced with a stable PII_<TYPE>_<NNNN> vault token.",
-  forwarded: "The tokenized body is sent to the real Anthropic API -- no raw PII ever leaves this machine.",
-  response_received: "The model's response arrives, potentially echoing a token back.",
-  detokenized: "Any token the model echoed is resolved back to its real value.",
-  displayed: "The fully-resolved response reaches the developer's terminal.",
-};
+const GROUP_EXPLANATION = [
+  "1. Received -> Input pane: the gateway reads the raw request and scans it for PII spans (regex + LLM layers).",
+  "2. Tokenized & forwarded -> Outbound to API pane: every detected span is replaced with a stable PII_<TYPE>_<NNNN> vault token, then the tokenized body is sent to the real Anthropic API -- no raw PII ever leaves this machine.",
+  "3. Response received -> API response pane: the model's response arrives, potentially echoing a token back.",
+  "4. Detokenized & displayed -> Developer view pane: any token the model echoed is resolved back to its real value, then the fully-resolved response reaches the developer's terminal.",
+];
 
-// Which stage index must have been reached before each pane has anything
-// to show -- mirrors which pipeline event first populates that pane's text.
-const PANE_STAGE_INDEX = { input: 0, outbound: 1, response: 3, developer: 4 };
+// Which group index must have been reached before each pane has anything
+// to show -- groups are declared in the same order as the panes they feed,
+// so this is just each pane's own index into STAGE_GROUPS.
+const PANE_STAGE_INDEX = Object.fromEntries(STAGE_GROUPS.map((g, i) => [g.paneKey, i]));
 
 const HISTORY_LIMIT = 20; // must match gateway_server.PIPELINE_HISTORY_LIMIT
 const PLAY_INTERVAL_MS = 900;
@@ -288,7 +367,7 @@ function cycleIsComplete(cycle) {
 
 function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount, showInternal, onToggleShowInternal }) {
   return (
-    <>
+    <div id="cycle-row">
       {order.length === 0 ? (
         <p className="cycle-empty">No requests observed yet -- run one through the gateway.</p>
       ) : (
@@ -314,30 +393,37 @@ function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount
         </div>
       )}
       {(hiddenCount > 0 || showInternal) && (
-        <button id="show-internal-toggle" onClick={onToggleShowInternal}>
-          {showInternal
-            ? "Hide session-title / internal-agent-loop cycles"
-            : `Show ${hiddenCount} hidden session-title / internal-agent-loop cycle${hiddenCount === 1 ? "" : "s"}`}
+        <button
+          id="show-internal-toggle"
+          className={showInternal ? "active" : ""}
+          title={
+            showInternal
+              ? "Hide session-title / internal-agent-loop cycles"
+              : `Show ${hiddenCount} hidden session-title / internal-agent-loop cycle${hiddenCount === 1 ? "" : "s"}`
+          }
+          onClick={onToggleShowInternal}
+        >
+          Show hidden
         </button>
       )}
-    </>
+    </div>
   );
 }
 
-function Pipeline({ viewedStage, stagesPresent }) {
+function Pipeline({ viewedGroupIndex, groupsPresent }) {
   return (
     <div id="pipeline">
-      {STAGES.map((stage, i) => (
-        <React.Fragment key={stage}>
+      {STAGE_GROUPS.map((group, i) => (
+        <React.Fragment key={group.paneKey}>
           {i > 0 && <span className="arrow">&#8594;</span>}
           <div
             className={
               "stage-box" +
-              (stage === viewedStage ? " active" : "") +
-              (stagesPresent.includes(stage) ? "" : " pending")
+              (i === viewedGroupIndex ? " active" : "") +
+              (groupsPresent[i] ? "" : " pending")
             }
           >
-            {STAGE_LABEL[stage]}
+            <span className="stage-number">{group.number}</span> {group.label}
           </div>
         </React.Fragment>
       ))}
@@ -345,20 +431,19 @@ function Pipeline({ viewedStage, stagesPresent }) {
   );
 }
 
-function StageControls({ viewedStageIndex, latestStageIndex, isComplete, isPlaying, onPrev, onNext, onPlayToggle, onJumpToLatest, pinnedToLatest }) {
+function StageControls({ viewedGroupIndex, latestGroupIndex, isComplete, isPlaying, onPrev, onNext, onPlayToggle }) {
   return (
     <div id="stage-controls">
-      <button onClick={onPrev} disabled={viewedStageIndex <= 0}>&#8592; Prev</button>
-      <button onClick={onNext} disabled={viewedStageIndex >= latestStageIndex}>Next &#8594;</button>
       <button onClick={onPlayToggle} disabled={!isComplete}>{isPlaying ? "Pause" : "Play ▶"}</button>
-      <button onClick={onJumpToLatest} disabled={pinnedToLatest}>Jump to latest</button>
+      <button onClick={onPrev} disabled={viewedGroupIndex <= 0}>&#8592; Prev</button>
+      <button onClick={onNext} disabled={viewedGroupIndex >= latestGroupIndex}>Next &#8594;</button>
     </div>
   );
 }
 
-function Panes({ cycle, viewedStageIndex }) {
+function Panes({ cycle, viewedGroupIndex }) {
   const stages = cycle ? cycle.stages : {};
-  const reached = (paneKey) => viewedStageIndex >= PANE_STAGE_INDEX[paneKey];
+  const reached = (paneKey) => viewedGroupIndex >= PANE_STAGE_INDEX[paneKey];
   const pending = <span className="pane-pending">not reached yet</span>;
   return (
     <div id="panes">
@@ -414,7 +499,7 @@ function AuditLogPane() {
 
   return (
     <div className="pane">
-      <h2>Audit log (live, no values -- {entries.length} of this session)</h2>
+      <h2>Audit log (live, no values — {entries.length} of this session)</h2>
       <table>
         <thead>
           <tr><th>Time</th><th>Adapter</th><th>Type</th><th>Detector</th><th>Token</th></tr>
@@ -435,9 +520,17 @@ function AuditLogPane() {
   );
 }
 
+// Keys the `revealed` map by session+token, not token alone -- two different
+// sessions legitimately mint the same token name (e.g. both have their own
+// PII_EMAIL_0001), so a bare-token key would leak one session's revealed
+// value onto another session's identically-named row.
+function revealKey(sessionId, token) {
+  return `${sessionId} ${token}`;
+}
+
 function VaultInspector() {
   const [mappings, setMappings] = useState([]);
-  const [sessionId, setSessionId] = useState("");
+  const [defaultSessionId, setDefaultSessionId] = useState("");
   const [revealed, setRevealed] = useState({});
 
   const refresh = useCallback(() => {
@@ -445,7 +538,7 @@ function VaultInspector() {
       .then((r) => r.json())
       .then((data) => {
         setMappings(data.mappings || []);
-        setSessionId(data.session_id || "");
+        setDefaultSessionId(data.default_session_id || "");
       })
       .catch(() => {});
   }, []);
@@ -456,39 +549,61 @@ function VaultInspector() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  const reveal = (token) => {
+  const reveal = (sessionId, token) => {
     fetch("/veil-panel/vault/reveal", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token, session_id: sessionId }),
     })
       .then((r) => r.json())
-      .then((data) => setRevealed((prev) => ({ ...prev, [token]: data.value ?? data.error })));
+      .then((data) =>
+        setRevealed((prev) => ({ ...prev, [revealKey(sessionId, token)]: data.value ?? data.error }))
+      );
   };
+
+  const hide = (sessionId, token) => {
+    setRevealed((prev) => {
+      const next = { ...prev };
+      delete next[revealKey(sessionId, token)];
+      return next;
+    });
+  };
+
+  const sessionCount = new Set(mappings.map((m) => m.session_id)).size;
 
   return (
     <div className="pane">
-      <h2>Vault inspector — session {sessionId || "(none yet)"}</h2>
+      <h2>
+        Vault inspector — {mappings.length} token{mappings.length === 1 ? "" : "s"} across{" "}
+        {sessionCount} session{sessionCount === 1 ? "" : "s"}
+      </h2>
       <table>
         <thead>
-          <tr><th>Token</th><th>Type</th><th>Ciphertext</th><th>Created</th><th></th></tr>
+          <tr><th>Token</th><th>Type</th><th>Session</th><th>Ciphertext</th><th>Created</th><th></th></tr>
         </thead>
         <tbody>
-          {mappings.map((m) => (
-            <tr key={m.token}>
-              <td>{m.token}</td>
-              <td>{m.entity_type}</td>
-              <td title={m.ciphertext_b64}>{m.ciphertext_b64.slice(0, 12)}&hellip;</td>
-              <td>{new Date(m.created_at * 1000).toLocaleTimeString()}</td>
-              <td>
-                {revealed[m.token] ? (
-                  <code>{revealed[m.token]}</code>
-                ) : (
-                  <button onClick={() => reveal(m.token)}>Reveal</button>
-                )}
-              </td>
-            </tr>
-          ))}
+          {mappings.map((m) => {
+            const key = revealKey(m.session_id, m.token);
+            return (
+              <tr key={key}>
+                <td>{m.token}</td>
+                <td>{m.entity_type}</td>
+                <td title={m.session_id}>{m.session_id.slice(0, 12)}&hellip;</td>
+                <td title={m.ciphertext_b64}>{m.ciphertext_b64.slice(0, 12)}&hellip;</td>
+                <td>{new Date(m.created_at * 1000).toLocaleTimeString()}</td>
+                <td>
+                  {revealed[key] !== undefined ? (
+                    <>
+                      <code>{revealed[key]}</code>{" "}
+                      <button onClick={() => hide(m.session_id, m.token)}>Hide</button>
+                    </>
+                  ) : (
+                    <button onClick={() => reveal(m.session_id, m.token)}>Reveal</button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -676,20 +791,26 @@ function LiveTab({ hidden }) {
   };
 
   const selectedCycle = selectedRequestId ? cycles[selectedRequestId] : null;
-  const stagesPresent = selectedCycle ? STAGES.filter((s) => selectedCycle.stages[s]) : [];
-  const latestStageIndex = stagesPresent.length - 1;
+  // A group counts as "present" once the first of its raw stages has
+  // arrived -- matches what `Panes`' `reached()` already gated on before
+  // grouping existed, so the pane still lights up as soon as it has
+  // something to show, not only once every stage in the group arrived.
+  const groupsPresent = STAGE_GROUPS.map(
+    (group) => !!selectedCycle && group.stages.some((s) => selectedCycle.stages[s])
+  );
+  const latestGroupIndex = groupsPresent.lastIndexOf(true);
   const isComplete = selectedCycle ? cycleIsComplete(selectedCycle) : false;
-  const viewedStageIndex = manualStageIndex !== null ? Math.min(manualStageIndex, latestStageIndex) : latestStageIndex;
-  const viewedStage = viewedStageIndex >= 0 ? STAGES[viewedStageIndex] : null;
+  const viewedGroupIndex =
+    manualStageIndex !== null ? Math.min(manualStageIndex, latestGroupIndex) : latestGroupIndex;
 
   useEffect(() => {
     if (!isPlaying) return;
     const id = setInterval(() => {
       setManualStageIndex((prevIndex) => {
         const next = (prevIndex ?? 0) + 1;
-        if (next >= STAGES.length) {
+        if (next >= STAGE_GROUPS.length) {
           setIsPlaying(false);
-          return STAGES.length - 1;
+          return STAGE_GROUPS.length - 1;
         }
         return next;
       });
@@ -699,11 +820,11 @@ function LiveTab({ hidden }) {
 
   const stepPrev = () => {
     setIsPlaying(false);
-    setManualStageIndex(Math.max(0, viewedStageIndex - 1));
+    setManualStageIndex(Math.max(0, viewedGroupIndex - 1));
   };
   const stepNext = () => {
     setIsPlaying(false);
-    setManualStageIndex(Math.min(latestStageIndex, viewedStageIndex + 1));
+    setManualStageIndex(Math.min(latestGroupIndex, viewedGroupIndex + 1));
   };
   const togglePlay = () => {
     if (isPlaying) {
@@ -713,18 +834,8 @@ function LiveTab({ hidden }) {
     setManualStageIndex(0);
     setIsPlaying(true);
   };
-  const jumpToLatest = () => {
-    const latestVisibleId = visibleOrder[visibleOrder.length - 1];
-    if (latestVisibleId) {
-      setSelectedRequestId(latestVisibleId);
-    }
-    setManualStageIndex(null);
-    setIsPlaying(false);
-    setPinnedToLatest(true);
-  };
-
   return (
-    <div hidden={hidden}>
+    <div hidden={hidden} className="tab-body">
       <CycleSelector
         order={visibleOrder}
         cycles={cycles}
@@ -734,20 +845,29 @@ function LiveTab({ hidden }) {
         showInternal={showInternal}
         onToggleShowInternal={() => setShowInternal((prev) => !prev)}
       />
-      <Pipeline viewedStage={viewedStage} stagesPresent={stagesPresent} />
-      <StageControls
-        viewedStageIndex={viewedStageIndex}
-        latestStageIndex={latestStageIndex}
-        isComplete={isComplete}
-        isPlaying={isPlaying}
-        onPrev={stepPrev}
-        onNext={stepNext}
-        onPlayToggle={togglePlay}
-        onJumpToLatest={jumpToLatest}
-        pinnedToLatest={pinnedToLatest}
-      />
-      <div id="stage-caption">{viewedStage ? STAGE_EXPLANATION[viewedStage] : "Select or run a request to begin."}</div>
-      <Panes cycle={selectedCycle} viewedStageIndex={viewedStageIndex} />
+      <div id="pipeline-row">
+        <Pipeline viewedGroupIndex={viewedGroupIndex} groupsPresent={groupsPresent} />
+        <StageControls
+          viewedGroupIndex={viewedGroupIndex}
+          latestGroupIndex={latestGroupIndex}
+          isComplete={isComplete}
+          isPlaying={isPlaying}
+          onPrev={stepPrev}
+          onNext={stepNext}
+          onPlayToggle={togglePlay}
+        />
+      </div>
+      <div id="stage-caption">
+        {viewedGroupIndex >= 0 ? GROUP_EXPLANATION[viewedGroupIndex] : "Select or run a request to begin."}
+      </div>
+      <Panes cycle={selectedCycle} viewedGroupIndex={viewedGroupIndex} />
+    </div>
+  );
+}
+
+function InspectTab({ hidden }) {
+  return (
+    <div hidden={hidden} className="tab-body">
       <div id="bottom">
         <AuditLogPane />
         <VaultInspector />
@@ -760,27 +880,32 @@ function App() {
   const [tab, setTab] = useState("live");
 
   return (
-    <div>
+    <div id="app">
       <header>
         <h1>veil — observability panel</h1>
         <span className="sub">
-          live session, local only -- the panes below show real request/response text for
-          inspection; the audit log itself never records a value, only a hash
+          live session
         </span>
         <div id="tabs">
           <button className={"tab-btn" + (tab === "live" ? " active" : "")} onClick={() => setTab("live")}>
             Live
+          </button>
+          <button className={"tab-btn" + (tab === "inspect" ? " active" : "")} onClick={() => setTab("inspect")}>
+            Inspect
           </button>
           <button className={"tab-btn" + (tab === "metrics" ? " active" : "")} onClick={() => setTab("metrics")}>
             Metrics
           </button>
         </div>
       </header>
-      <div className="legend">
-        <span><span className="swatch" style={{ background: "var(--regex)" }}></span> regex-detected span</span>
-        <span><span className="swatch" style={{ background: "var(--llm)" }}></span> LLM-detected span</span>
-      </div>
+      {tab === "live" && (
+        <div className="legend">
+          <span><span className="swatch" style={{ background: "var(--regex)" }}></span> regex-detected span</span>
+          <span><span className="swatch" style={{ background: "var(--llm)" }}></span> LLM-detected span</span>
+        </div>
+      )}
       <LiveTab hidden={tab !== "live"} />
+      <InspectTab hidden={tab !== "inspect"} />
       {tab === "metrics" && <MetricsTab />}
     </div>
   );
