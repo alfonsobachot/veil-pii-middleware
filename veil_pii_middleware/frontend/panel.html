@@ -12,6 +12,8 @@
     --muted: #8a90a0;
     --regex: #4fb0ff;
     --llm: #ff9f4f;
+    --token: #4fd48a;
+    --detoken: #c792ea;
     --stage-idle: #262a34;
     --stage-active: #3a7bd5;
     --danger: #ff5c5c;
@@ -224,7 +226,8 @@
   .pane-pending { color: var(--muted); font-style: italic; }
   .span-regex { background: color-mix(in srgb, var(--regex) 35%, transparent); border-radius: 2px; }
   .span-llm { background: color-mix(in srgb, var(--llm) 35%, transparent); border-radius: 2px; }
-  .token { text-decoration: underline dotted var(--muted); cursor: help; }
+  .span-token { background: color-mix(in srgb, var(--token) 35%, transparent); border-radius: 2px; cursor: help; }
+  .span-detoken { background: color-mix(in srgb, var(--detoken) 35%, transparent); border-radius: 2px; cursor: help; }
 
   #bottom {
     display: grid;
@@ -281,6 +284,9 @@ const STAGES = ["received", "tokenized", "forwarded", "response_received", "deto
 // publishes; `render` mirrors the pre-mission-13 `Panes` component's own
 // per-stage rendering so a stage's content looks the same, just reached by
 // expanding its row instead of by stepping a fixed pipeline diagram.
+// `render` optionally takes the same round's tokenized pre-image text (only
+// meaningful for "detokenized"/"displayed", to diff-highlight substituted
+// values -- see `renderDetokenizedText`); every other stage ignores it.
 const STAGE_TIMELINE = {
   received: { label: "Input received", render: (s) => renderSpannedText(s.text || "", s.spans) },
   tokenized: { label: "Tokenized", render: (s) => renderTokenizedText(s.text || "") },
@@ -289,8 +295,14 @@ const STAGE_TIMELINE = {
     label: "API response received",
     render: (s) => renderTokenizedText(s.text || ""),
   },
-  detokenized: { label: "Detokenized", render: (s) => s.text || "" },
-  displayed: { label: "Displayed to developer", render: (s) => s.text || "" },
+  detokenized: {
+    label: "Detokenized",
+    render: (s, sourceText) => renderDetokenizedText(s.text || "", sourceText),
+  },
+  displayed: {
+    label: "Displayed to developer",
+    render: (s, sourceText) => renderDetokenizedText(s.text || "", sourceText),
+  },
 };
 
 const HOOK_LABEL = { pre_tool_use: "PreToolUse", post_tool_use: "PostToolUse" };
@@ -315,7 +327,9 @@ const TOKEN_RE = /PII_([A-Z]+)_\d{4}/g;
 
 function renderTokenizedText(text) {
   // Splits on PII_<TYPE>_NNNN tokens so a hover can show the entity type
-  // parsed straight out of the token itself -- no extra data needed.
+  // parsed straight out of the token itself -- no extra data needed. Colored
+  // the same way as a tokenization-site marker (span-token), mirroring how
+  // regex/LLM detections are colored on the "received" stage.
   const parts = [];
   let last = 0;
   let match;
@@ -323,13 +337,77 @@ function renderTokenizedText(text) {
   while ((match = TOKEN_RE.exec(text)) !== null) {
     if (match.index > last) parts.push(text.slice(last, match.index));
     parts.push(
-      <span className="token" title={`entity type: ${match[1]}`} key={match.index}>
+      <span className="span-token" title={`tokenized: ${match[1]}`} key={match.index}>
         {match[0]}
       </span>
     );
     last = match.index + match[0].length;
   }
   parts.push(text.slice(last));
+  return parts;
+}
+
+// Detokenization never ships its own spans (core/tokenizer.py's substitution
+// is a plain regex replace -- see `_resolve_or_placeholder`), so the panel
+// reconstructs which regions of the detokenized text are substituted values
+// by diffing it against the same round's pre-image (the tokenized text one
+// stage earlier, still carrying PII_<TYPE>_NNNN tokens). Every literal
+// character *around* a token is untouched by detokenization, so each
+// literal run from the pre-image is used as an anchor to find where the
+// corresponding substituted value starts and ends in the result text.
+function renderDetokenizedText(resultText, sourceText) {
+  if (!sourceText) return resultText;
+  TOKEN_RE.lastIndex = 0;
+  const segments = [];
+  let last = 0;
+  let match;
+  while ((match = TOKEN_RE.exec(sourceText)) !== null) {
+    segments.push({ type: "literal", text: sourceText.slice(last, match.index) });
+    segments.push({ type: "token", text: match[0], entityType: match[1] });
+    last = match.index + match[0].length;
+  }
+  segments.push({ type: "literal", text: sourceText.slice(last) });
+  if (!segments.some((s) => s.type === "token")) return resultText;
+
+  const parts = [];
+  let rPos = 0;
+  let aligned = true;
+  for (let i = 0; i < segments.length && aligned; i++) {
+    const seg = segments[i];
+    if (seg.type === "literal") {
+      if (seg.text.length === 0) continue;
+      if (!resultText.startsWith(seg.text, rPos)) {
+        aligned = false; // detokenization altered the surrounding text more than expected
+        break;
+      }
+      parts.push(resultText.slice(rPos, rPos + seg.text.length));
+      rPos += seg.text.length;
+      continue;
+    }
+    // Find the next non-empty literal anchor to bound this substituted
+    // value; consecutive tokens with nothing between them fold into one
+    // highlighted run since there is no anchor to split them on.
+    let anchor = "";
+    for (let j = i + 1; j < segments.length; j++) {
+      if (segments[j].type === "literal" && segments[j].text.length > 0) {
+        anchor = segments[j].text;
+        break;
+      }
+    }
+    const end = anchor ? resultText.indexOf(anchor, rPos) : resultText.length;
+    if (end === -1) {
+      aligned = false;
+      break;
+    }
+    parts.push(
+      <span className="span-detoken" title={`detokenized: ${seg.entityType}`} key={`d${i}`}>
+        {resultText.slice(rPos, end)}
+      </span>
+    );
+    rPos = end;
+  }
+  if (!aligned) return resultText; // fall back to plain text rather than mismarking
+  if (rPos < resultText.length) parts.push(resultText.slice(rPos));
   return parts;
 }
 
@@ -480,6 +558,16 @@ function buildTimelineEntries(cycles, turnRequestId) {
     STAGES.forEach((stageName) => {
       const stageEvent = cycle.stages[stageName];
       if (!stageEvent) return;
+      // Both stages that resolve tokens back to real values share the same
+      // round's tokenized pre-image as their diff anchor: "response_received"
+      // is the last stage still carrying PII_<TYPE>_NNNN tokens before
+      // "detokenized" resolves them, and "displayed" is always that same
+      // resolved text (see server.py's out_text reuse), so it reuses the
+      // identical anchor rather than "detokenized" itself.
+      const sourceText =
+        stageName === "detokenized" || stageName === "displayed"
+          ? cycle.stages.response_received && cycle.stages.response_received.text
+          : undefined;
       entries.push({
         type: "stage",
         key: `${id}:${stageName}`,
@@ -488,6 +576,7 @@ function buildTimelineEntries(cycles, turnRequestId) {
         roundKind: cycle.kind,
         stage: stageName,
         stageEvent,
+        sourceText,
         timestamp: stageEvent.timestamp,
       });
     });
@@ -566,7 +655,9 @@ function TimelineRow({ entry, isOpen, onToggle }) {
         {info.label}
       </button>
       <span className="timeline-time">{entry.stageEvent.timestamp.slice(11, 19)}</span>
-      {isOpen && <pre className="timeline-detail">{info.render(entry.stageEvent)}</pre>}
+      {isOpen && (
+        <pre className="timeline-detail">{info.render(entry.stageEvent, entry.sourceText)}</pre>
+      )}
     </div>
   );
 }
@@ -649,7 +740,10 @@ function Panes({ firstCycle, lastCycle }) {
         <h2>4. Developer view</h2>
         <pre>
           {outputStages.displayed || outputStages.detokenized
-            ? (outputStages.displayed || outputStages.detokenized).text || ""
+            ? renderDetokenizedText(
+                (outputStages.displayed || outputStages.detokenized).text || "",
+                outputStages.response_received && outputStages.response_received.text
+              )
             : pending}
         </pre>
       </div>
@@ -1067,6 +1161,8 @@ function App() {
         <div className="legend">
           <span><span className="swatch" style={{ background: "var(--regex)" }}></span> regex-detected span</span>
           <span><span className="swatch" style={{ background: "var(--llm)" }}></span> LLM-detected span</span>
+          <span><span className="swatch" style={{ background: "var(--token)" }}></span> tokenized (substituted to token)</span>
+          <span><span className="swatch" style={{ background: "var(--detoken)" }}></span> detokenized (token resolved back)</span>
         </div>
       )}
       <LiveTab hidden={tab !== "live"} />
