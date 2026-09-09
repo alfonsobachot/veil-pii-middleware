@@ -188,6 +188,16 @@ def _tokenize(value: JSONValue, vault: Vault, context: _TokenizeContext) -> JSON
     return value
 
 
+def _drop_overlapping(spans: list[Span], ranges: list[tuple[int, int]]) -> list[Span]:
+    if not ranges:
+        return spans
+    return [
+        span
+        for span in spans
+        if not any(span.start < r_end and span.end > r_start for r_start, r_end in ranges)
+    ]
+
+
 def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
     if context.skip is not None and context.skip(text):
         return text
@@ -195,16 +205,27 @@ def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
     # of spans -- this is where the LLM layer's spans union in, gated by
     # whether llm_client is set (see tokenize()'s docstring).
     spans = detect(text, llm_client=context.llm_client)
+    # Claude Code resends the full conversation history (including old
+    # tool_result blocks a previous PostToolUse hook already tokenized) on
+    # every turn, so a leaf handed to tokenize() here is not always fresh,
+    # human/tool-authored content -- it can already contain a token this
+    # same session minted earlier. Found live (2026-09-09): the LLM layer,
+    # re-scanning that already-substituted text, occasionally mistook an
+    # existing token sitting right after a label (e.g. "NIF/DNI:
+    # PII_DNI_0001") for a fresh raw value and minted a *second* token whose
+    # vault-stored "real value" was just the first token's own string --
+    # detokenize()/detokenize_lenient() only run one substitution pass, so
+    # the outer layer resolved back to the inner token text instead of the
+    # real value, never the placeholder, so this went unnoticed as a
+    # resolution failure. Any span exactly overlapping an already-minted
+    # token's own text can never be genuine user/tool PII -- this format is
+    # reserved and only ever written by this module -- so it is dropped
+    # before substitution, the same way `exclude` drops known non-user
+    # ranges below.
+    already_tokenized_ranges = [(m.start(), m.end()) for m in _TOKEN_PATTERN.finditer(text)]
+    spans = _drop_overlapping(spans, already_tokenized_ranges)
     if context.exclude is not None:
-        excluded_ranges = context.exclude(text)
-        if excluded_ranges:
-            spans = [
-                span
-                for span in spans
-                if not any(
-                    span.start < r_end and span.end > r_start for r_start, r_end in excluded_ranges
-                )
-            ]
+        spans = _drop_overlapping(spans, context.exclude(text))
     if context.span_sink is not None:
         context.span_sink.extend(sorted(spans, key=lambda s: s.start))
     # Right-to-left by start offset: substituting a token of a different

@@ -451,6 +451,32 @@ _SYSTEM_PROMPT: Final = (
 )
 
 
+#: System prompt for ``LLMClient.confirm_person_candidates`` (mission
+#: follow-up, 2026-09-09). Deliberately a *separate*, much smaller task from
+#: ``_SYSTEM_PROMPT``'s full-block span extraction: live evidence
+#: (``.harness/handoff.md``) showed the main extraction call can correctly
+#: find every DNI/IBAN/phone/card in a dense block while still missing a
+#: person's name sitting in the same block, at temperature 0 -- so a retry
+#: of the *same* request would deterministically reproduce the same miss.
+#: Classifying a short, isolated fragment ("is this substring a person's
+#: name, yes or no") is a much easier task than extracting spans from a
+#: whole noisy document, and is only ever invoked for fragments a cheap
+#: structural regex already flagged as name-shaped and the main call left
+#: uncovered -- see ``_NAME_CANDIDATE_RE``/``_confirm_missed_person_candidates``.
+_PERSON_CONFIRMATION_SYSTEM_PROMPT: Final = (
+    "You will be given a numbered list of short text fragments pulled out of "
+    "a larger document. For each fragment, decide whether it is a PERSON's "
+    "full name -- a human being's given name plus one or more surnames -- as "
+    "opposed to a company name, place name, product name, department, or any "
+    "other proper noun that happens to be capitalized. Respond with ONLY a "
+    'JSON object of the exact shape {"persons": [<the numbers of every '
+    "fragment that IS a person's name>]} -- no prose, no markdown code "
+    "fences, no explanation, nothing before or after the JSON. Numbers only, "
+    'never the fragment text itself. If none of the fragments are a person\'s '
+    'name, respond with exactly {"persons": []}.'
+)
+
+
 class LLMDetectionError(Exception):
     """Raised when the LLM layer's response cannot be trusted as spans.
 
@@ -532,6 +558,46 @@ class LLMClient:
         if not isinstance(spans, list):
             raise LLMDetectionError(f"'spans' must be a list, got {type(spans).__name__}")
         return spans
+
+    def confirm_person_candidates(self, candidates: list[str]) -> set[int]:
+        """Ask which of ``candidates`` (1-indexed) is a person's full name.
+
+        A separate, deliberately tiny classification call -- see
+        ``_PERSON_CONFIRMATION_SYSTEM_PROMPT`` for why this is not just a
+        retry of ``complete_spans``. Returns the set of 1-based indices into
+        ``candidates`` the model confirmed as a person's name; never raises
+        for an out-of-range or non-integer entry in the response, those are
+        silently dropped, since a malformed *confirmation* is not a reason to
+        fail the whole detection pass (callers already treat this step as
+        best-effort). Raises ``LLMDetectionError`` (malformed response) or an
+        ``httpx`` exception (connection/timeout/non-2xx) exactly like
+        ``complete_spans`` on a failure that prevents reading the response at
+        all -- callers must catch and skip the confirmation step, never
+        propagate.
+        """
+        numbered = "\n".join(f"{i}. {candidate}" for i, candidate in enumerate(candidates, 1))
+        response = self._client.post(
+            "/v1/chat/completions",
+            json={
+                "model": self._model,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": _PERSON_CONFIRMATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": numbered},
+                ],
+            },
+        )
+        response.raise_for_status()
+        try:
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            persons = parsed["persons"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
+        if not isinstance(persons, list):
+            raise LLMDetectionError(f"'persons' must be a list, got {type(persons).__name__}")
+        return {i for i in persons if isinstance(i, int) and 1 <= i <= len(candidates)}
 
     def close(self) -> None:
         self._client.close()
@@ -636,9 +702,101 @@ def detect_llm(text: str, client: LLMClient) -> list[Span]:
     return found
 
 
+#: Cheap structural heuristic for "this might be a person's full name":
+#: 2 to 4 consecutive capitalized words. Has no idea what a name actually
+#: is -- most of what it matches in real text is a company, place, or
+#: department name, not a person (e.g. "Consultoria Guillen", "Calle
+#: Mayor") -- so it must never mint a span on its own; it only decides what
+#: is worth the one extra confirmation call ``_confirm_missed_person_candidates``
+#: makes. See that function and ``_PERSON_CONFIRMATION_SYSTEM_PROMPT`` for
+#: why a cheap-but-unreliable filter feeding an authoritative LLM check is
+#: safe here in a way a regex that minted PERSON tokens directly would not
+#: be.
+_NAME_WORD: Final = r"[A-ZÁÉÍÓÚÑÜ][a-záéíóúñü]+"
+_NAME_CANDIDATE_RE: Final = re.compile(rf"\b{_NAME_WORD}(?:\s{_NAME_WORD}){{1,3}}\b")
+
+#: Cache mirroring ``_llm_span_cache``, but for
+#: ``_confirm_missed_person_candidates``'s own confirmed spans -- keyed the
+#: same way (content hash + client identity) so a repeat ``detect()`` call
+#: for text this process has already classified (e.g. the gateway's own
+#: extra, scoped call for display-span offsets, right after the
+#: substitution pass already ran) is a cache hit, not a second confirmation
+#: round trip. Never caches a failure (see ``detect()``), same rationale as
+#: ``_llm_span_cache``.
+_person_confirmation_cache: dict[str, list[Span]] = {}
+
+
+def _confirm_missed_person_candidates(
+    text: str, spans: list[Span], client: LLMClient
+) -> list[Span]:
+    """Best-effort second pass for a person's name the main LLM call missed.
+
+    Live evidence (2026-09-09, ``.harness/handoff.md``) showed the main
+    ``detect_llm`` call can correctly find every DNI/IBAN/phone/card in a
+    dense block while still missing a person's name in that same block, at
+    temperature 0 -- so simply retrying ``detect_llm`` would deterministically
+    reproduce the same miss. This instead finds every ``_NAME_CANDIDATE_RE``
+    match not already covered by a span the main call(s) already returned,
+    and -- only if at least one such candidate exists -- makes one isolated
+    classification call (``LLMClient.confirm_person_candidates``) asking
+    which of those specific fragments is actually a person's name. Only a
+    fragment that call confirms becomes a real ``PERSON`` span; the
+    heuristic itself never does. Returns ``[]`` with no network call at all
+    when every candidate is already covered, the common case.
+
+    Any failure here (connection, timeout, malformed response) is the
+    caller's (``detect()``'s) responsibility to catch -- this function
+    raises rather than swallowing, so a caller can log and skip exactly like
+    the main LLM leg does.
+    """
+    key = _cache_key(text, client.identity)
+    cached = _person_confirmation_cache.get(key)
+    if cached is not None:
+        return cached
+
+    occurrences = [
+        (match.start(), match.end(), match.group(0))
+        for match in _NAME_CANDIDATE_RE.finditer(text)
+        if not any(match.start() < span.end and span.start < match.end() for span in spans)
+    ]
+    if not occurrences:
+        _person_confirmation_cache[key] = []
+        return []
+
+    # Ask about each distinct fragment once, in first-seen order, even if it
+    # recurs at several offsets -- one confirmation covers every occurrence.
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for _, _, value in occurrences:
+        if value not in seen:
+            seen.add(value)
+            candidates.append(value)
+
+    confirmed_indices = client.confirm_person_candidates(candidates)
+    confirmed_values = {candidates[i - 1] for i in confirmed_indices}
+    found = (
+        [
+            Span(
+                start=start,
+                end=end,
+                entity_type=EntityType.PERSON,
+                text=value,
+                detector=Detector.LLM,
+            )
+            for start, end, value in occurrences
+            if value in confirmed_values
+        ]
+        if confirmed_values
+        else []
+    )
+    _person_confirmation_cache[key] = found
+    return found
+
+
 def clear_llm_cache() -> None:
     """Drop every cached LLM result. Exposed for tests and process-lifetime resets."""
     _llm_span_cache.clear()
+    _person_confirmation_cache.clear()
 
 
 def detect(
@@ -657,6 +815,14 @@ def detect(
     failure on that leg -- connection refused, timeout, non-2xx, malformed
     JSON -- is caught here and logged (no PII/secret), falling back to
     whatever ``use_regex`` alone produced rather than propagating.
+
+    When the main LLM call succeeds, a second, best-effort step
+    (``_confirm_missed_person_candidates``) looks for a name-shaped fragment
+    it missed and, only for that narrow case, makes one further isolated
+    confirmation call before returning. A failure on that second step is
+    caught and logged the same way as the main LLM leg, falling back to
+    whatever was already found rather than propagating -- this step can only
+    ever add spans, never remove ones the main call already returned.
     """
     spans: list[Span] = []
     if use_regex:
@@ -670,4 +836,13 @@ def detect(
                 "falling back to regex-only spans for this block",
                 file=sys.stderr,
             )
+        else:
+            try:
+                spans.extend(_confirm_missed_person_candidates(text, spans, llm_client))
+            except Exception as exc:
+                print(
+                    f"veil detector: person-candidate confirmation failed "
+                    f"({type(exc).__name__}: {exc}), continuing without it",
+                    file=sys.stderr,
+                )
     return merge_spans(spans)
