@@ -15,16 +15,25 @@ queries and file reads keep operating on the real values.
 Users: developers who debug production incidents with Claude Code against
 systems that hold customer PII.
 
-Lifecycle stage: early skeleton. The package layout, lint/test configuration
-and this harness exist; no detection, vault or adapter logic is implemented
-yet. The design of record is `docs/private/BRIEF.md` (git-ignored).
+Lifecycle stage: feature-complete demo/portfolio project, through
+mission-13. Every core component (detector, vault, tokenizer, audit) and
+all three adapters (`/veil` command, hooks, gateway) are implemented and
+tested; the demo database/eval harness and the gateway's observability
+frontend are built out, including turn-grouping and live hook-progress
+visibility (mission-13). The design of record is `docs/private/BRIEF.md`
+(git-ignored); each mission's own scope, validation contract and evidence
+are archived at `docs/missions/mission-N/`. Remaining work is incremental
+polish and whatever a human decides to scope next, not foundational
+implementation.
 
 ## Stack
 
 Python, `pyproject.toml` with the Hatchling build backend, `pip` + `venv` for
-dependencies, `ruff` for lint and formatting, `pytest` for tests. No runtime
-dependencies yet; SQLite (vault and demo database) and a local LLM served by
-Ollama are planned.
+dependencies, `ruff` for lint and formatting, `pytest` for tests. Runtime
+dependencies: `cryptography` (vault AES-GCM) and `httpx` (gateway forwarding
+client). SQLite backs the vault and demo database; the LLM detection layer
+talks to any OpenAI-compatible chat-completions endpoint (LM Studio, Ollama,
+...) via `VEIL_LLM_BASE_URL`/`VEIL_LLM_MODEL`, never a hardcoded host.
 
 Runtime versions: `requires-python = ">=3.11"`; the local `.venv` runs Python
 3.12.10.

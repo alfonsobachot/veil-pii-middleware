@@ -397,3 +397,10 @@ instruction to leave it as-is. Re-verified live against a fourth real
 `claude -p --demo-db` session: one chip, panes show input/final-answer,
 expanding a "Tool round" sidebar row leaves the panes byte-for-byte
 unchanged, no "jump to latest" button rendered, zero console errors.
+
+Committed 2026-09-09 (commit `d8f51be`, no `Co-Authored-By` trailer per the
+user's own standing instruction) after human review; `README.md` §7 and
+its architecture diagram updated in the same commit to describe the
+turn-grouping, the sidebar's live hook progress, and the fixed four-pane
+semantics. Archived to `docs/missions/mission-13/` per the human's
+explicit request.
