@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import sys
 
+from veil_pii_middleware.adapters.hooks._panel_report import report
 from veil_pii_middleware.adapters.hooks._paths import AUDIT_LOG_PATH, VAULT_DB_PATH
 from veil_pii_middleware.adapters.hooks._scope import is_demo_db_command
 from veil_pii_middleware.core.audit import AuditLog
@@ -65,6 +66,10 @@ def main() -> int:
         print("post_tool_use: missing session_id", file=sys.stderr)
         return 1
 
+    # Best-effort only -- see adapters/hooks/_panel_report.py's own
+    # docstring. Never raises, never affects anything below.
+    report(session_id, "post_tool_use", "start", "Bash")
+
     try:
         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with Vault(VAULT_DB_PATH, session_id) as vault:
@@ -76,6 +81,7 @@ def main() -> int:
             )
     except Exception:
         print("post_tool_use: tokenization failed", file=sys.stderr)
+        report(session_id, "post_tool_use", "error", "Bash")
         return 1
 
     output: JSONValue = {
@@ -85,6 +91,7 @@ def main() -> int:
         }
     }
     sys.stdout.write(json.dumps(output))
+    report(session_id, "post_tool_use", "done", "Bash")
     return 0
 
 

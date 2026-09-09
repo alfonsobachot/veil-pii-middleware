@@ -110,68 +110,91 @@
   }
   #show-internal-toggle.active { color: var(--text); border-color: var(--stage-active); }
 
-  #pipeline-row {
+  /* mission-13 (revised): the four panels stay the main content -- one
+     scrolling Timeline sits in a left sidebar next to them, one entry per
+     turn stage/hook marker/round, click-to-focus which round the panels
+     show (see `#live-main`/`#panes` below). */
+  #live-body {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    flex: 1 1 auto;
+    min-height: 0;
     gap: 12px;
+    padding: 0 16px 16px;
   }
-  #pipeline {
+  #live-sidebar {
+    flex: 0 0 300px;
+    min-width: 0;
+    overflow-y: auto;
+    border-right: 1px solid var(--panel-border);
+    padding-right: 12px;
+  }
+  #live-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
     display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 0;
-    margin-left: 16px;
-    overflow-x: auto;
   }
-  .stage-box {
-    flex: 0 0 auto;
-    padding: 8px 12px;
-    border-radius: 6px;
-    background: var(--stage-idle);
-    border: 1px solid var(--panel-border);
-    white-space: nowrap;
-    transition: background 120ms ease, border-color 120ms ease;
+  #timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
-  .stage-box.active {
-    background: var(--stage-active);
-    border-color: var(--stage-active);
-    color: #fff;
-  }
-  .stage-box.pending { opacity: 0.4; }
-  .stage-number {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: rgba(255, 255, 255, 0.15);
-    font-size: 10px;
-    font-weight: 700;
-  }
-  .arrow { color: var(--muted); }
-
-  #stage-controls {
+  .timeline-empty { color: var(--muted); font-style: italic; }
+  .timeline-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 4px 0;
-    margin-right: 16px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
   }
-  #stage-controls button {
-    padding: 8px 12px;
+  .timeline-stage { flex-wrap: wrap; }
+  .timeline-toggle {
+    background: none;
+    border: none;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+    padding: 0;
+    flex: 1 1 auto;
+    text-align: left;
   }
-  #stage-caption { color: var(--muted); padding: 0 16px 8px; min-height: 1.2em; }
+  .timeline-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .timeline-detail {
+    flex-basis: 100%;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 6px 0 0;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  .timeline-hook { background: var(--stage-idle); }
+  .timeline-hook.in-progress { border-color: var(--stage-active); }
+  .timeline-label { flex: 1 1 auto; }
+  .timeline-waiting { color: var(--muted); font-style: italic; border-style: dashed; }
+  .timeline-spinner {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid var(--muted);
+    border-top-color: var(--stage-active);
+    animation: veil-spin 700ms linear infinite;
+    flex: 0 0 auto;
+  }
+  @keyframes veil-spin { to { transform: rotate(360deg); } }
 
   #panes {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
     grid-template-rows: repeat(2, 1fr);
     gap: 12px;
-    padding: 0 16px 16px;
     flex: 1 1 auto;
     min-height: 0;
+    min-width: 0;
   }
   .pane {
     background: var(--panel);
@@ -251,38 +274,29 @@ const { useState, useEffect, useRef, useCallback } = React;
 // of how they're grouped for display below.
 const STAGES = ["received", "tokenized", "forwarded", "response_received", "detokenized", "displayed"];
 
-// The diagram/step-through groups those six into four visual steps, one per
-// pane: `tokenized`/`forwarded` carry identical display text (substitution
-// happened; then it was actually sent), and so do `detokenized`/`displayed`
-// (resolved; then actually delivered) -- stepping "Next" onto the second
-// stage of a pair changed nothing you could see, which is confusing in a
-// walkthrough meant to teach the pipeline. Each group's `number` matches
-// its pane's own "N. <name>" heading (`Panes` below) so the connection
-// between a stage box and a pane is explicit, not left to guessing.
-const STAGE_GROUPS = [
-  { number: 1, label: "Received", stages: ["received"], paneKey: "input" },
-  { number: 2, label: "Tokenized & forwarded", stages: ["tokenized", "forwarded"], paneKey: "outbound" },
-  { number: 3, label: "Response received", stages: ["response_received"], paneKey: "response" },
-  { number: 4, label: "Detokenized & displayed", stages: ["detokenized", "displayed"], paneKey: "developer" },
-];
+// mission-13: a turn (one logical user request, however many gateway/tool
+// round-trips it took) renders as one scrolling Timeline instead of a fixed
+// six-box diagram for a single cycle -- see `buildTimelineEntries` below.
+// Per-stage label/renderer, keyed by the same raw stage name the server
+// publishes; `render` mirrors the pre-mission-13 `Panes` component's own
+// per-stage rendering so a stage's content looks the same, just reached by
+// expanding its row instead of by stepping a fixed pipeline diagram.
+const STAGE_TIMELINE = {
+  received: { label: "Input received", render: (s) => renderSpannedText(s.text || "", s.spans) },
+  tokenized: { label: "Tokenized", render: (s) => renderTokenizedText(s.text || "") },
+  forwarded: { label: "Forwarded to API", render: (s) => renderTokenizedText(s.text || "") },
+  response_received: {
+    label: "API response received",
+    render: (s) => renderTokenizedText(s.text || ""),
+  },
+  detokenized: { label: "Detokenized", render: (s) => s.text || "" },
+  displayed: { label: "Displayed to developer", render: (s) => s.text || "" },
+};
 
-// One line per group explaining what it does -- shown as the step-through
-// caption, since the real cycle happens far too fast to read live (BRIEF's
-// own "timebox this" warning, and the reason this walkthrough exists).
-const GROUP_EXPLANATION = [
-  "1. Received -> Input pane: the gateway reads the raw request and scans it for PII spans (regex + LLM layers).",
-  "2. Tokenized & forwarded -> Outbound to API pane: every detected span is replaced with a stable PII_<TYPE>_<NNNN> vault token, then the tokenized body is sent to the real Anthropic API -- no raw PII ever leaves this machine.",
-  "3. Response received -> API response pane: the model's response arrives, potentially echoing a token back.",
-  "4. Detokenized & displayed -> Developer view pane: any token the model echoed is resolved back to its real value, then the fully-resolved response reaches the developer's terminal.",
-];
-
-// Which group index must have been reached before each pane has anything
-// to show -- groups are declared in the same order as the panes they feed,
-// so this is just each pane's own index into STAGE_GROUPS.
-const PANE_STAGE_INDEX = Object.fromEntries(STAGE_GROUPS.map((g, i) => [g.paneKey, i]));
+const HOOK_LABEL = { pre_tool_use: "PreToolUse", post_tool_use: "PostToolUse" };
+const HOOK_PHASE_LABEL = { start: "started", done: "done", error: "failed" };
 
 const HISTORY_LIMIT = 20; // must match gateway_server.PIPELINE_HISTORY_LIMIT
-const PLAY_INTERVAL_MS = 900;
 
 // Cycle kinds gateway_server._classify_cycle_kind can tag a cycle with,
 // hidden from the selector by default: real Claude Code requests, but
@@ -290,9 +304,10 @@ const PLAY_INTERVAL_MS = 900;
 // an agent-loop continuation turn whose only "new" content is a
 // Claude-Code-injected <system-reminder> block). A "Show N hidden" toggle
 // reveals them for anyone who wants to inspect them anyway.
-const HIDDEN_KINDS = new Set(["title_generation", "internal_continuation"]);
+const HIDDEN_KINDS = new Set(["title_generation", "safety_check", "internal_continuation"]);
 const HIDDEN_KIND_LABEL = {
   title_generation: "session title request",
+  safety_check: "internal safety check",
   internal_continuation: "internal agent-loop turn",
 };
 
@@ -365,6 +380,34 @@ function cycleIsComplete(cycle) {
   return STAGES.every((stage) => cycle.stages[stage]);
 }
 
+// mission-13: a cycle is its own top-level turn (gets a chip) unless it is
+// a tool_result continuation whose parent turn is still around in `cycles`
+// -- the documented fallback for an orphaned continuation (no parent ever
+// seen, or the parent has since been evicted from the ring buffer) is to
+// keep showing it standalone rather than silently hide content nowhere
+// else in the panel shows.
+function isTopLevelCycle(cycle, cycles) {
+  if (!cycle) return false;
+  // mission-13 (revised after live testing): a cycle folds into another
+  // turn's timeline whenever it has a *resolvable* parent, regardless of
+  // its own kind -- not just a "tool_continuation" child, but also a
+  // same-text sibling "conversation" cycle the turn-tracking merged in
+  // (see gateway_server.PipelineEventBus's own "Turn tracking" docstring).
+  // An unresolvable parent (evicted, or none was ever open) is the
+  // documented orphan fallback: still its own visible chip.
+  if (!cycle.parentRequestId) return true;
+  return !cycles[cycle.parentRequestId];
+}
+
+// A turn (its own cycle plus any child cycles/hook events folded into it)
+// is still in flight while its last round hasn't completed all six stages,
+// or a hook step is currently between "start" and its "done"/"error".
+function isTurnInFlight(cycles, turnRequestId) {
+  return buildTimelineEntries(cycles, turnRequestId).some(
+    (entry) => entry.type === "waiting" || (entry.type === "hook" && entry.inProgress)
+  );
+}
+
 function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount, showInternal, onToggleShowInternal }) {
   return (
     <div id="cycle-row">
@@ -377,7 +420,7 @@ function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount
             if (!cycle) return null;
             const classes = ["cycle-chip"];
             if (requestId === selectedRequestId) classes.push("selected");
-            if (!cycleIsComplete(cycle)) classes.push("in-flight");
+            if (isTurnInFlight(cycles, requestId)) classes.push("in-flight");
             if (HIDDEN_KINDS.has(cycle.kind)) classes.push("internal-kind");
             return (
               <button
@@ -410,72 +453,203 @@ function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount
   );
 }
 
-function Pipeline({ viewedGroupIndex, groupsPresent }) {
+// mission-13: one logical user turn can now span several raw gateway
+// cycles (the turn's own, plus zero or more tool_continuation children
+// chained onto it) plus hook progress markers reported in between. This
+// builds one chronologically-sorted list mixing all three, replacing the
+// old fixed six-stage-diagram-for-one-cycle view.
+// The turn's own cycle plus every child cycle folded into it (a
+// tool_continuation, or a same-text sibling "conversation" the revised
+// mission-13 turn-tracking merges in) -- shared by `buildTimelineEntries`
+// and `LiveTab`'s own "which round do the four panes show" logic, so both
+// always agree on the same round order.
+function getRoundIds(cycles, turnRequestId) {
+  const childIds = Object.keys(cycles).filter(
+    (id) => id !== turnRequestId && cycles[id].parentRequestId === turnRequestId
+  );
+  return [turnRequestId, ...childIds];
+}
+
+function buildTimelineEntries(cycles, turnRequestId) {
+  const turn = cycles[turnRequestId];
+  if (!turn) return [];
+  const roundIds = getRoundIds(cycles, turnRequestId);
+  const entries = [];
+  roundIds.forEach((id, roundIndex) => {
+    const cycle = cycles[id];
+    STAGES.forEach((stageName) => {
+      const stageEvent = cycle.stages[stageName];
+      if (!stageEvent) return;
+      entries.push({
+        type: "stage",
+        key: `${id}:${stageName}`,
+        roundRequestId: id,
+        roundIndex,
+        roundKind: cycle.kind,
+        stage: stageName,
+        stageEvent,
+        timestamp: stageEvent.timestamp,
+      });
+    });
+    (cycle.hookEvents || []).forEach((hookEvent, i) => {
+      entries.push({
+        type: "hook",
+        key: `${id}:hook:${i}:${hookEvent.hook}:${hookEvent.phase}`,
+        roundRequestId: id,
+        roundIndex,
+        roundKind: cycle.kind,
+        hookEvent,
+        timestamp: hookEvent.timestamp,
+      });
+    });
+  });
+  entries.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+
+  // A hook "start" with no later "done"/"error" for the same (hook,
+  // tool_name) pair is still in flight -- this is what makes the actual
+  // local DB round-trip's duration visible live.
+  entries.forEach((entry, i) => {
+    if (entry.type !== "hook" || entry.hookEvent.phase !== "start") return;
+    const { hook, tool_name } = entry.hookEvent;
+    entry.inProgress = !entries
+      .slice(i + 1)
+      .some(
+        (e) =>
+          e.type === "hook" &&
+          e.hookEvent.hook === hook &&
+          e.hookEvent.tool_name === tool_name &&
+          e.hookEvent.phase !== "start"
+      );
+  });
+
+  const lastRoundId = roundIds[roundIds.length - 1];
+  if (!cycleIsComplete(cycles[lastRoundId])) {
+    entries.push({ type: "waiting", key: `${lastRoundId}:waiting` });
+  }
+  return entries;
+}
+
+function TimelineRow({ entry, isOpen, onToggle }) {
+  if (entry.type === "waiting") {
+    return (
+      <div className="timeline-row timeline-waiting">
+        <span className="timeline-spinner" /> Waiting for the next stage…
+      </div>
+    );
+  }
+  if (entry.type === "hook") {
+    const { hook, phase, tool_name, timestamp } = entry.hookEvent;
+    return (
+      <div className={"timeline-row timeline-hook" + (entry.inProgress ? " in-progress" : "")}>
+        {entry.inProgress && <span className="timeline-spinner" />}
+        <span className="timeline-label">
+          {(HOOK_LABEL[hook] || hook) + ": " + (HOOK_PHASE_LABEL[phase] || phase)} ({tool_name})
+        </span>
+        <span className="timeline-time">{timestamp.slice(11, 19)}</span>
+      </div>
+    );
+  }
+  const info = STAGE_TIMELINE[entry.stage];
+  // A round beyond the first is either a tool_result continuation or a
+  // same-text sibling conversation the turn-tracking merged in (mission-13,
+  // revised after live testing) -- label it honestly either way.
+  const roundPrefix =
+    entry.roundIndex === 0
+      ? ""
+      : entry.roundKind === "tool_continuation"
+        ? `Tool round ${entry.roundIndex}: `
+        : `Round ${entry.roundIndex} (repeated request): `;
   return (
-    <div id="pipeline">
-      {STAGE_GROUPS.map((group, i) => (
-        <React.Fragment key={group.paneKey}>
-          {i > 0 && <span className="arrow">&#8594;</span>}
-          <div
-            className={
-              "stage-box" +
-              (i === viewedGroupIndex ? " active" : "") +
-              (groupsPresent[i] ? "" : " pending")
-            }
-          >
-            <span className="stage-number">{group.number}</span> {group.label}
-          </div>
-        </React.Fragment>
+    <div className="timeline-row timeline-stage">
+      <button className="timeline-toggle" onClick={onToggle}>
+        {isOpen ? "▾" : "▸"} {roundPrefix}
+        {info.label}
+      </button>
+      <span className="timeline-time">{entry.stageEvent.timestamp.slice(11, 19)}</span>
+      {isOpen && <pre className="timeline-detail">{info.render(entry.stageEvent)}</pre>}
+    </div>
+  );
+}
+
+// Purely an inspection tool: expanding a row here shows that exact round's
+// raw request/response text inline, but never changes what the four main
+// panels show -- those always represent the *turn's* own boundary (its
+// original input, its final answer), not whichever round happens to be
+// expanded here. See `LiveTab`'s `firstRoundCycle`/`lastRoundCycle`.
+function Timeline({ turnRequestId, cycles }) {
+  const [expanded, setExpanded] = useState(() => new Set());
+  const toggle = (key) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
+  if (!turnRequestId) {
+    return <p className="timeline-empty">Select or run a request to begin.</p>;
+  }
+  const entries = buildTimelineEntries(cycles, turnRequestId);
+  if (entries.length === 0) {
+    return <p className="timeline-empty">Waiting for the first stage…</p>;
+  }
+  return (
+    <div id="timeline">
+      {entries.map((entry) => (
+        <TimelineRow
+          key={entry.key}
+          entry={entry}
+          isOpen={expanded.has(entry.key)}
+          onToggle={() => toggle(entry.key)}
+        />
       ))}
     </div>
   );
 }
 
-function StageControls({ viewedGroupIndex, latestGroupIndex, isComplete, isPlaying, onPrev, onNext, onPlayToggle }) {
-  return (
-    <div id="stage-controls">
-      <button onClick={onPlayToggle} disabled={!isComplete}>{isPlaying ? "Pause" : "Play ▶"}</button>
-      <button onClick={onPrev} disabled={viewedGroupIndex <= 0}>&#8592; Prev</button>
-      <button onClick={onNext} disabled={viewedGroupIndex >= latestGroupIndex}>Next &#8594;</button>
-    </div>
-  );
-}
-
-function Panes({ cycle, viewedGroupIndex }) {
-  const stages = cycle ? cycle.stages : {};
-  const reached = (paneKey) => viewedGroupIndex >= PANE_STAGE_INDEX[paneKey];
+// The four panels represent the *turn's* own boundary, not whichever round
+// is expanded in the sidebar (mission-13, second revision, per explicit
+// human request): panel 1/2 always come from the turn's own first round
+// (what the human actually typed, and that same text tokenized) and panel
+// 3/4 always come from the turn's latest completed round (the final answer
+// as the API sent it, and that same answer resolved for the developer to
+// read) -- fixed reference points a multi-tool-round turn still has exactly
+// one of each, regardless of how many intermediate rounds happened between.
+function Panes({ firstCycle, lastCycle }) {
+  const inputStages = firstCycle ? firstCycle.stages : {};
+  const outputStages = lastCycle ? lastCycle.stages : {};
   const pending = <span className="pane-pending">not reached yet</span>;
   return (
     <div id="panes">
       <div className="pane">
         <h2>1. Input</h2>
         <pre>
-          {reached("input") && stages.received
-            ? renderSpannedText(stages.received.text || "", stages.received.spans)
+          {inputStages.received
+            ? renderSpannedText(inputStages.received.text || "", inputStages.received.spans)
             : pending}
         </pre>
       </div>
       <div className="pane">
         <h2>2. Outbound to API</h2>
         <pre>
-          {reached("outbound") && (stages.forwarded || stages.tokenized)
-            ? renderTokenizedText((stages.forwarded || stages.tokenized).text || "")
+          {inputStages.forwarded || inputStages.tokenized
+            ? renderTokenizedText((inputStages.forwarded || inputStages.tokenized).text || "")
             : pending}
         </pre>
       </div>
       <div className="pane">
         <h2>3. API response</h2>
         <pre>
-          {reached("response") && stages.response_received
-            ? renderTokenizedText(stages.response_received.text || "")
+          {outputStages.response_received
+            ? renderTokenizedText(outputStages.response_received.text || "")
             : pending}
         </pre>
       </div>
       <div className="pane">
         <h2>4. Developer view</h2>
         <pre>
-          {reached("developer") && (stages.displayed || stages.detokenized)
-            ? (stages.displayed || stages.detokenized).text || ""
+          {outputStages.displayed || outputStages.detokenized
+            ? (outputStages.displayed || outputStages.detokenized).text || ""
             : pending}
         </pre>
       </div>
@@ -719,11 +893,16 @@ function MetricsTab() {
 
 function LiveTab({ hidden }) {
   const [cycles, setCycles] = useState({});
+  // mission-13 (revised after live testing): two independent, independently-
+  // capped orders, mirroring gateway_server.PipelineEventBus's own
+  // `_order`/`_aux_order` split -- a burst of hidden-kind cycles (Claude
+  // Code's own internal safety-classifier calls, observed live firing once
+  // per tool call) must never be able to push a real, still-relevant turn
+  // out of `order`'s own client-side HISTORY_LIMIT.
   const [order, setOrder] = useState([]);
+  const [auxOrder, setAuxOrder] = useState([]);
   const [selectedRequestId, setSelectedRequestId] = useState(null);
   const [pinnedToLatest, setPinnedToLatest] = useState(true);
-  const [manualStageIndex, setManualStageIndex] = useState(null);
-  const [isPlaying, setIsPlaying] = useState(false);
   const [showInternal, setShowInternal] = useState(false);
 
   const knownRequestIdsRef = useRef(new Set());
@@ -733,25 +912,40 @@ function LiveTab({ hidden }) {
   }, [pinnedToLatest]);
 
   useEventSource("/veil-panel/pipeline-stream", (event) => {
-    const { request_id, stage, text, spans, timestamp, kind } = event;
+    const { request_id, stage, text, spans, timestamp, kind, parent_request_id } = event;
     const isNewCycle = !knownRequestIdsRef.current.has(request_id);
     knownRequestIdsRef.current.add(request_id);
 
     setCycles((prev) => {
       const existing = prev[request_id];
-      const stages = { ...(existing ? existing.stages : {}), [stage]: { text, spans, timestamp } };
+      const stages = stage
+        ? { ...(existing ? existing.stages : {}), [stage]: { text, spans, timestamp } }
+        : existing
+          ? existing.stages
+          : {};
+      const hookEvents =
+        kind === "hook"
+          ? [...(existing ? existing.hookEvents || [] : []), { ...event }]
+          : existing
+            ? existing.hookEvents || []
+            : [];
       return {
         ...prev,
         [request_id]: {
           requestId: request_id,
           stages,
+          hookEvents,
           kind: kind || (existing ? existing.kind : undefined) || "conversation",
+          parentRequestId: parent_request_id || (existing ? existing.parentRequestId : null) || null,
           firstSeenAt: existing ? existing.firstSeenAt : timestamp,
         },
       };
     });
 
-    setOrder((prev) => {
+    if (kind === "hook") return; // rides along on an already-known request_id; never a new chip
+
+    const isAuxiliaryKind = HIDDEN_KINDS.has(kind || "conversation");
+    (isAuxiliaryKind ? setAuxOrder : setOrder)((prev) => {
       if (prev.includes(request_id)) return prev;
       const next = [...prev, request_id];
       if (next.length > HISTORY_LIMIT) {
@@ -763,77 +957,56 @@ function LiveTab({ hidden }) {
     });
 
     if (isNewCycle) {
-      // Pinning to "latest" only ever follows a real conversational
-      // cycle -- jumping the selection onto a hidden session-title/
-      // internal-agent-loop cycle would leave the panes pointed at
-      // something the selector doesn't even show.
-      const isHiddenKind = !showInternal && HIDDEN_KINDS.has(kind || "conversation");
-      if (pinnedToLatestRef.current && !isHiddenKind) {
+      // Pinning to "latest" only ever follows a cycle that would get its
+      // own chip: a real conversational turn, or an orphaned
+      // tool_continuation with no resolvable parent (mission-13's
+      // documented fallback) -- never a hidden session-title/internal-
+      // agent-loop cycle, and never a tool_continuation that is about to
+      // fold into an already-visible parent turn's timeline instead of
+      // becoming a chip of its own.
+      const isHiddenKind = !showInternal && isAuxiliaryKind;
+      // `knownRequestIdsRef` (a plain ref, updated synchronously above) is
+      // used here rather than `cycles` state -- a burst of backlog events
+      // is processed synchronously, faster than a state update's own
+      // render+effect round trip could keep a ref derived from `cycles` in
+      // sync, which previously caused a freshly-arrived child's parent to
+      // look not-yet-known even though its own "received" event had
+      // already been processed earlier in the very same burst.
+      // mission-13 (revised): the server only ever sets `parent_request_id`
+      // when this cycle really does fold into another turn -- a
+      // tool_continuation child, or a same-text sibling "conversation" the
+      // turn-tracking merged in -- so no `kind` check is needed here.
+      const isChildOfKnownParent =
+        parent_request_id && knownRequestIdsRef.current.has(parent_request_id);
+      if (pinnedToLatestRef.current && !isHiddenKind && !isChildOfKnownParent) {
         setSelectedRequestId(request_id);
       }
-      setManualStageIndex(null);
-      setIsPlaying(false);
     }
   });
 
-  const visibleOrder = showInternal
-    ? order
-    : order.filter((id) => !HIDDEN_KINDS.has(cycles[id] ? cycles[id].kind : "conversation"));
-  const hiddenCount = order.length - visibleOrder.length;
+  const visibleOrder = (showInternal ? [...order, ...auxOrder] : order).filter((id) =>
+    isTopLevelCycle(cycles[id], cycles)
+  );
+  const hiddenCount = auxOrder.length;
 
   const selectCycle = (requestId) => {
     setSelectedRequestId(requestId);
-    setManualStageIndex(null);
-    setIsPlaying(false);
     setPinnedToLatest(
       visibleOrder.length > 0 && requestId === visibleOrder[visibleOrder.length - 1]
     );
   };
 
-  const selectedCycle = selectedRequestId ? cycles[selectedRequestId] : null;
-  // A group counts as "present" once the first of its raw stages has
-  // arrived -- matches what `Panes`' `reached()` already gated on before
-  // grouping existed, so the pane still lights up as soon as it has
-  // something to show, not only once every stage in the group arrived.
-  const groupsPresent = STAGE_GROUPS.map(
-    (group) => !!selectedCycle && group.stages.some((s) => selectedCycle.stages[s])
-  );
-  const latestGroupIndex = groupsPresent.lastIndexOf(true);
-  const isComplete = selectedCycle ? cycleIsComplete(selectedCycle) : false;
-  const viewedGroupIndex =
-    manualStageIndex !== null ? Math.min(manualStageIndex, latestGroupIndex) : latestGroupIndex;
+  // The four panels' fixed reference points: the turn's own first round
+  // (the human's actual input) and its latest completed round (the final
+  // answer) -- never whichever round happens to be expanded in the
+  // sidebar. "Completed" here just means "has a response_received stage
+  // yet"; an in-flight last round simply leaves panel 3/4 at "not reached
+  // yet" until it does, same as before.
+  const roundIds = selectedRequestId ? getRoundIds(cycles, selectedRequestId) : [];
+  const firstRoundCycle = selectedRequestId ? cycles[selectedRequestId] : null;
+  const lastRoundCycle =
+    roundIds.length > 0 ? cycles[roundIds[roundIds.length - 1]] : null;
 
-  useEffect(() => {
-    if (!isPlaying) return;
-    const id = setInterval(() => {
-      setManualStageIndex((prevIndex) => {
-        const next = (prevIndex ?? 0) + 1;
-        if (next >= STAGE_GROUPS.length) {
-          setIsPlaying(false);
-          return STAGE_GROUPS.length - 1;
-        }
-        return next;
-      });
-    }, PLAY_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, [isPlaying]);
-
-  const stepPrev = () => {
-    setIsPlaying(false);
-    setManualStageIndex(Math.max(0, viewedGroupIndex - 1));
-  };
-  const stepNext = () => {
-    setIsPlaying(false);
-    setManualStageIndex(Math.min(latestGroupIndex, viewedGroupIndex + 1));
-  };
-  const togglePlay = () => {
-    if (isPlaying) {
-      setIsPlaying(false);
-      return;
-    }
-    setManualStageIndex(0);
-    setIsPlaying(true);
-  };
   return (
     <div hidden={hidden} className="tab-body">
       <CycleSelector
@@ -845,22 +1018,14 @@ function LiveTab({ hidden }) {
         showInternal={showInternal}
         onToggleShowInternal={() => setShowInternal((prev) => !prev)}
       />
-      <div id="pipeline-row">
-        <Pipeline viewedGroupIndex={viewedGroupIndex} groupsPresent={groupsPresent} />
-        <StageControls
-          viewedGroupIndex={viewedGroupIndex}
-          latestGroupIndex={latestGroupIndex}
-          isComplete={isComplete}
-          isPlaying={isPlaying}
-          onPrev={stepPrev}
-          onNext={stepNext}
-          onPlayToggle={togglePlay}
-        />
+      <div id="live-body">
+        <div id="live-sidebar">
+          <Timeline turnRequestId={selectedRequestId} cycles={cycles} />
+        </div>
+        <div id="live-main">
+          <Panes firstCycle={firstRoundCycle} lastCycle={lastRoundCycle} />
+        </div>
       </div>
-      <div id="stage-caption">
-        {viewedGroupIndex >= 0 ? GROUP_EXPLANATION[viewedGroupIndex] : "Select or run a request to begin."}
-      </div>
-      <Panes cycle={selectedCycle} viewedGroupIndex={viewedGroupIndex} />
     </div>
   );
 }

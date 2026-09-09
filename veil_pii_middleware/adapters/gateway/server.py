@@ -82,6 +82,19 @@ regex/LLM/union metrics *comparison* persisted to
 ``METRICS_COMPARISON_PATH`` (expensive to compute, so it only ever runs on
 an explicit POST, and survives a gateway restart). None of this adds
 authentication beyond the gateway's existing ``127.0.0.1``-only bind.
+
+Mission-13 additionally groups pipeline-stage events into *turns*: a
+tool_result-only continuation cycle (``_classify_cycle_kind``'s
+``"tool_continuation"``) is tagged with its parent conversation cycle's
+``request_id`` (``PipelineEventBus``'s per-session "open turn" tracking) so
+the frontend can render one logical user request -- however many tool
+round-trips it takes -- as a single screen instead of one chip per raw HTTP
+call. ``POST /veil-panel/hook-event`` lets the ``PreToolUse``/``PostToolUse``
+hooks (separate, short-lived processes) report best-effort live progress
+markers (a fixed ``hook``/``phase``/``tool_name`` shape, never a command
+string or tool output) into that same open turn, which is what makes the
+actual local DB round-trip's duration visible in the panel for the first
+time.
 """
 
 from __future__ import annotations
@@ -171,6 +184,30 @@ PIPELINE_STAGES: Final = (
 #: frontend's own cycle-selector cap; both sides must agree on this number.
 PIPELINE_HISTORY_LIMIT: Final = 20
 
+#: Cycle kinds that are real Claude Code requests but never human-authored
+#: conversation (mission-11/12/13's ``_classify_cycle_kind``) -- the
+#: panel hides them from the selector by default, and, as of mission-13's
+#: live-testing fix, they also get their *own* ``PIPELINE_HISTORY_LIMIT``-
+#: sized ring buffer (``PipelineEventBus._aux_order``) entirely separate
+#: from real turns' (``_order``). Found live: a single real conversation
+#: with several tool round-trips produced enough interleaved
+#: ``"safety_check"`` cycles (Claude Code's own harm classifier, one per
+#: tool call) to evict the real conversation's own cycle from a single
+#: shared 20-slot buffer before the panel ever connected -- see
+#: `.harness/handoff.md`. Must mirror the frontend's own ``HIDDEN_KINDS``
+#: constant exactly; both sides need to agree on what counts as noise.
+_AUXILIARY_CYCLE_KINDS: Final = frozenset(
+    {"title_generation", "safety_check", "internal_continuation"}
+)
+
+#: Allowed values for ``POST /veil-panel/hook-event``'s ``hook``/``phase``
+#: fields (mission-13) -- a fixed, small enum, not freeform text, so the
+#: schema stays structurally incapable of carrying a command string or tool
+#: output (see the mission's Non-goals on why this must be true by
+#: construction, not by convention).
+_ALLOWED_HOOK_NAMES: Final = frozenset({"pre_tool_use", "post_tool_use"})
+_ALLOWED_HOOK_PHASES: Final = frozenset({"start", "done", "error"})
+
 
 def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
@@ -196,19 +233,76 @@ class PipelineEventBus:
     either the backlog or a live ``put``, never both and never neither,
     regardless of how the two calls interleave across threads. Still purely
     in-memory: a process restart loses it, same as before this buffer.
+
+    **Two separate ring buffers, not one (mission-13, found live).** A
+    cycle whose kind is in ``_AUXILIARY_CYCLE_KINDS`` (hidden from the
+    selector by default) is evicted from its own ``_aux_order`` deque,
+    entirely independent of real turns' ``_order`` -- a single shared
+    20-slot buffer let a burst of Claude Code's own internal harm-classifier
+    calls (one per tool call, observed live during one ordinary demo-db
+    query) evict the *real* conversation cycle before a freshly-opened
+    panel ever got to see it, per ``.harness/handoff.md``.
+
+    **Turn tracking (mission-13, revised after live testing against a real
+    ``claude -p`` session).** A first cut keyed the session's "open turn" by
+    *the most recently seen ``"conversation"`` cycle*, full stop. Live
+    testing (see ``.harness/handoff.md``) showed that breaks two ways: (a)
+    Claude Code's own internal harm/safety-classifier request briefly read
+    as an ordinary ``"conversation"`` cycle before ``_classify_cycle_kind``
+    learned to recognize it, silently stealing the pointer between two
+    stages of the *real* turn and misattributing a hook event to the wrong
+    screen; (b) even correctly classified, the same real human turn can
+    legitimately produce *more than one* top-level ``"conversation"`` cycle
+    with byte-identical received text (observed live: two independent,
+    complete tool-calling round-trips for the same one-sentence prompt) --
+    a single "most recent wins" pointer would still split those across two
+    chips instead of folding them together.
+
+    Revised design: turns are keyed by ``(session_id, received_text)``, not
+    by session alone. The *first* ``"conversation"`` cycle seen for a given
+    key becomes that key's canonical turn id; every later
+    ``"conversation"`` cycle with the *same* key folds under that same turn
+    (gets a ``parent_request_id`` pointing at it, just like a
+    ``tool_continuation`` does) instead of becoming a new turn or stealing
+    the pointer. ``_open_turn_by_session`` still tracks one *canonical turn
+    id* per session for ``tool_continuation``/hook attachment, but it is
+    always resolved through the key map first, so a same-text sibling
+    cycle can never redirect it away from the original turn. A cycle
+    classified anything other than ``"conversation"`` never touches this
+    tracking at all. No ``parent_request_id`` at all means "no open turn
+    was found" -- the frontend's documented fallback (a standalone chip,
+    never silently dropped).
     """
 
     def __init__(self, maxsize: int = 500) -> None:
         self._maxsize = maxsize
         self._lock = threading.Lock()
         self._subscribers: set[queue.Queue[dict[str, Any]]] = set()
+        #: Real turns (``"conversation"``/``"tool_continuation"``, plus
+        #: anything an early failure never got to classify) -- see
+        #: ``_AUXILIARY_CYCLE_KINDS`` for why this is a *separate* budget
+        #: from ``_aux_order`` below, not one shared 20-slot buffer.
         self._order: deque[str] = deque(maxlen=PIPELINE_HISTORY_LIMIT)
+        #: ``title_generation``/``safety_check``/``internal_continuation``
+        #: cycles -- hidden from the selector by default, but still worth
+        #: keeping their own bounded history for the "Show hidden" toggle.
+        #: Its own ring buffer so a burst of these (observed live: Claude
+        #: Code's harm classifier fires roughly once per tool call) can
+        #: never evict a real, still-relevant turn from ``_order``.
+        self._aux_order: deque[str] = deque(maxlen=PIPELINE_HISTORY_LIMIT)
         self._history: dict[str, list[dict[str, Any]]] = {}
+        self._open_turn_by_session: dict[str, str] = {}
+        self._turn_id_by_key: dict[tuple[str, str], str] = {}
+        self._parent_of: dict[str, str | None] = {}
 
     def subscribe(self) -> tuple[queue.Queue[dict[str, Any]], list[dict[str, Any]]]:
         subscriber: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self._maxsize)
         with self._lock:
-            backlog = [event for request_id in self._order for event in self._history[request_id]]
+            backlog = [
+                event
+                for request_id in (*self._order, *self._aux_order)
+                for event in self._history[request_id]
+            ]
             self._subscribers.add(subscriber)
         return subscriber, backlog
 
@@ -216,15 +310,52 @@ class PipelineEventBus:
         with self._lock:
             self._subscribers.discard(subscriber)
 
-    def publish(self, event: dict[str, Any]) -> None:
+    def open_turn_for_session(self, session_id: str) -> str | None:
+        """Return the ``request_id`` of ``session_id``'s currently open turn, if any.
+
+        Used by ``/veil-panel/hook-event`` (mission-13) to attach a hook's
+        best-effort progress report to the right screen -- see the class
+        docstring's "Turn tracking" section.
+        """
+        with self._lock:
+            return self._open_turn_by_session.get(session_id)
+
+    def publish(self, event: dict[str, Any], session_id: str | None = None) -> None:
         with self._lock:
             request_id = event["request_id"]
             if request_id not in self._history:
-                if len(self._order) == self._order.maxlen:
-                    evicted = self._order.popleft()
+                kind = event.get("kind")
+                order = self._aux_order if kind in _AUXILIARY_CYCLE_KINDS else self._order
+                if len(order) == order.maxlen:
+                    evicted = order.popleft()
                     self._history.pop(evicted, None)
-                self._order.append(request_id)
+                    self._parent_of.pop(evicted, None)
+                order.append(request_id)
                 self._history[request_id] = []
+                if kind == "conversation" and session_id:
+                    key = (session_id, event.get("text", ""))
+                    # `_turn_id_by_key` is never pruned on eviction (unlike
+                    # `_parent_of`/`_open_turn_by_session`) -- a stale entry
+                    # only means a *very* old, already-evicted turn id is
+                    # still on record as "the" turn for that exact text,
+                    # which just falls through to the orphan fallback below
+                    # once that id is no longer in `_history`. Acceptable
+                    # for a demo-scale, single-session process.
+                    turn_id = self._turn_id_by_key.get(key)
+                    if turn_id is None or turn_id not in self._history:
+                        turn_id = request_id
+                        self._turn_id_by_key[key] = turn_id
+                        self._parent_of[request_id] = None
+                    else:
+                        self._parent_of[request_id] = turn_id
+                    self._open_turn_by_session[session_id] = turn_id
+                elif kind == "tool_continuation" and session_id:
+                    self._parent_of[request_id] = self._open_turn_by_session.get(session_id)
+                else:
+                    self._parent_of[request_id] = None
+            parent_request_id = self._parent_of.get(request_id)
+            if parent_request_id is not None:
+                event = {**event, "parent_request_id": parent_request_id}
             self._history[request_id].append(event)
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
@@ -245,6 +376,7 @@ def _publish_stage(
     *,
     spans: list[Span] | None = None,
     kind: str | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Publish one pipeline-stage event. ``spans`` is only meaningful for ``"received"``.
 
@@ -256,6 +388,10 @@ def _publish_stage(
     every stage of a cycle, not just ``"received"``, so the frontend can
     filter a whole cycle out of the selector as soon as any one of its
     events arrives, regardless of which stage that happens to be.
+
+    ``session_id`` feeds ``PipelineEventBus``'s turn-tracking (mission-13) --
+    only meaningful the first time a given ``request_id`` is published (see
+    ``PipelineEventBus.publish``), but harmless to pass on every call.
     """
     event: dict[str, Any] = {
         "request_id": request_id,
@@ -275,7 +411,7 @@ def _publish_stage(
         ]
     if kind is not None:
         event["kind"] = kind
-    bus.publish(event)
+    bus.publish(event, session_id=session_id)
 
 
 #: Directory containing the static, unbuilt observability panel page (BRIEF
@@ -456,24 +592,62 @@ def _extract_text_from_content_blocks(content: JSONValue) -> str:
     return "\n".join(parts)
 
 
+def _find_last_user_message_content(parsed: JSONValue) -> JSONValue:
+    """Return the last ``role == "user"`` message's raw ``content`` value.
+
+    Shared by ``_extract_last_user_message_text`` (mission-12) and
+    ``_last_user_content_has_text`` (mission-13, for ``_classify_cycle_kind``'s
+    ``tool_continuation`` distinction) so both walk the exact same message,
+    never two independently-drifting definitions of "the last user turn".
+    Returns ``None`` if ``parsed`` is not shaped like a Messages API request
+    body (not a dict, no ``messages`` list, or no ``user``-role message in
+    it) or that message has no ``content`` key.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    messages = parsed.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return message.get("content")
+    return None
+
+
 def _extract_last_user_message_text(parsed: JSONValue) -> str:
     """Return the last ``role == "user"`` message's display text from a request body.
 
     Claude Code resends the full conversation history on every request; the
     panel's "Input" pane is scoped to what the user actually typed *this
-    turn*, not the repeated history (mission-12's Intake Grill). Returns
-    ``""`` if ``parsed`` is not shaped like a Messages API request body (not
-    a dict, no ``messages`` list, or no ``user``-role message in it).
+    turn*, not the repeated history (mission-12's Intake Grill).
     """
-    if not isinstance(parsed, dict):
-        return ""
-    messages = parsed.get("messages")
-    if not isinstance(messages, list):
-        return ""
-    for message in reversed(messages):
-        if isinstance(message, dict) and message.get("role") == "user":
-            return _extract_text_from_content_blocks(message.get("content"))
-    return ""
+    return _extract_text_from_content_blocks(_find_last_user_message_content(parsed))
+
+
+def _last_user_content_has_text(parsed: JSONValue) -> bool:
+    """Whether the last user message contains any real ``text``/``thinking`` block.
+
+    ``False`` for a message whose content is entirely non-text blocks (e.g.
+    a bare ``tool_result`` continuation, or a lone ``tool_use`` echo) -- the
+    signal ``_classify_cycle_kind`` needs to tell a genuine tool_result
+    continuation apart from an ordinary conversational turn, since
+    ``_extract_text_from_content_blocks`` renders the former as the
+    non-empty placeholder ``"[tool_result]"`` (see mission-13's Intake
+    Grill: this is exactly why that placeholder used to be misread as real
+    conversational content).
+    """
+    content = _find_last_user_message_content(parsed)
+    if isinstance(content, str):
+        return bool(content)
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        field = _TEXT_CONTENT_BLOCK_FIELDS.get(str(block.get("type")))
+        if field is not None and isinstance(block.get(field), str):
+            return True
+    return False
 
 
 def _extract_response_text(parsed: JSONValue) -> str:
@@ -510,6 +684,21 @@ def _default_llm_client_for_display() -> LLMClient | None:
 #: worth keying off rather than showing every session's title-generation
 #: request in the panel as if it were a real conversational turn.
 _TITLE_GENERATION_SYSTEM_MARKER: Final = "naming a coding session"
+
+#: Substring of Claude Code's own internal harm/safety-classifier request
+#: (mission-13, confirmed live 2026-09-09 by capturing a real `claude -p
+#: --demo-db` session's raw traffic): the *last user message* itself --
+#: not the system prompt, unlike the title-generation marker above -- wraps
+#: a JSON summary of the transcript in `<transcript>...</transcript>` and
+#: asks the model to grade harm as `<severity>N</severity>`. Checked on
+#: `stripped_received_text` because the trailing instruction text sits
+#: *outside* the `<transcript>` tag, so stripping known wrapper tags alone
+#: does not empty this message the way it does for `<system-reminder>`
+#: etc. -- without this marker, this cycle read as an ordinary
+#: `"conversation"` and, worse, kept stealing mission-13's turn-tracking
+#: away from the real conversation between two of its own stages (see
+#: `.harness/handoff.md`).
+_SAFETY_CLASSIFIER_MARKER: Final = "respond with <severity>"
 
 #: Tag names Claude Code itself wraps around non-human-authored content
 #: within an otherwise-ordinary user turn -- confirmed the same way as the
@@ -611,16 +800,20 @@ def _extract_system_text(parsed: JSONValue) -> str:
     return "\n".join(parts)
 
 
-def _classify_cycle_kind(parsed: JSONValue, stripped_received_text: str) -> str:
+def _classify_cycle_kind(
+    parsed: JSONValue, stripped_received_text: str, has_real_text: bool
+) -> str:
     """Best-effort label for what kind of request this cycle is.
 
-    Heuristic, not a protocol guarantee. ``"title_generation"`` and
-    ``"internal_continuation"`` are both real, legitimate Claude Code
-    requests -- classified so the panel's cycle selector can default to
-    hiding them (they carry no human-authored conversational content), not
-    because anything about them is wrong. ``"conversation"`` is the
-    default for everything else, including a request this heuristic fails
-    to recognize as one of the other two.
+    Heuristic, not a protocol guarantee. ``"title_generation"``,
+    ``"safety_check"``, ``"internal_continuation"`` and
+    ``"tool_continuation"`` are all real, legitimate Claude Code requests --
+    classified so the panel's cycle selector can default to hiding the
+    first three (they carry no human-authored conversational content) and
+    fold the fourth into its parent turn's screen (mission-13) instead of
+    giving it a chip of its own, not because anything about any of them is
+    wrong. ``"conversation"`` is the default for everything else, including
+    a request this heuristic fails to recognize as one of the other four.
 
     ``stripped_received_text`` must already have gone through
     ``_strip_injected_wrapper_tags`` -- classifying on the *raw* text would
@@ -631,11 +824,22 @@ def _classify_cycle_kind(parsed: JSONValue, stripped_received_text: str) -> str:
     fires on the common case where Claude Code prepends a reminder block
     *before* real human-authored content, not just on a turn that is
     entirely reminder content.
+
+    ``has_real_text`` (``_last_user_content_has_text``) is what tells a
+    pure tool_result continuation apart from an ordinary turn: the former's
+    ``stripped_received_text`` is the non-empty placeholder
+    ``"[tool_result]"`` (so it fails the ``internal_continuation`` check
+    above it), but contains no actual human/model-authored text or
+    thinking block at all.
     """
     if _TITLE_GENERATION_SYSTEM_MARKER in _extract_system_text(parsed).lower():
         return "title_generation"
+    if _SAFETY_CLASSIFIER_MARKER in stripped_received_text.lower():
+        return "safety_check"
     if not stripped_received_text:
         return "internal_continuation"
+    if not has_real_text:
+        return "tool_continuation"
     return "conversation"
 
 
@@ -682,7 +886,9 @@ def _tokenize_body(
             )
         received_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(parsed))
         outbound_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(tokenized))
-        cycle_kind = _classify_cycle_kind(parsed, received_text)
+        cycle_kind = _classify_cycle_kind(
+            parsed, received_text, _last_user_content_has_text(parsed)
+        )
         received_spans = (
             detect(
                 received_text,
@@ -1087,7 +1293,13 @@ def make_handler(
                             cycle_kind,
                         ) = _tokenize_body(raw_body, session_id, audit_log)
                     except (json.JSONDecodeError, UnicodeDecodeError):
-                        _publish_stage(pipeline_bus, request_id, "received", _decode(raw_body))
+                        _publish_stage(
+                            pipeline_bus,
+                            request_id,
+                            "received",
+                            _decode(raw_body),
+                            session_id=session_id,
+                        )
                         _write_error(
                             self,
                             400,
@@ -1096,7 +1308,13 @@ def make_handler(
                         )
                         return
                     except Exception:
-                        _publish_stage(pipeline_bus, request_id, "received", _decode(raw_body))
+                        _publish_stage(
+                            pipeline_bus,
+                            request_id,
+                            "received",
+                            _decode(raw_body),
+                            session_id=session_id,
+                        )
                         _write_error(
                             self,
                             500,
@@ -1110,12 +1328,23 @@ def make_handler(
                         received_text,
                         spans=received_spans,
                         kind=cycle_kind,
+                        session_id=session_id,
                     )
                     _publish_stage(
-                        pipeline_bus, request_id, "tokenized", outbound_text, kind=cycle_kind
+                        pipeline_bus,
+                        request_id,
+                        "tokenized",
+                        outbound_text,
+                        kind=cycle_kind,
+                        session_id=session_id,
                     )
                     _publish_stage(
-                        pipeline_bus, request_id, "forwarded", outbound_text, kind=cycle_kind
+                        pipeline_bus,
+                        request_id,
+                        "forwarded",
+                        outbound_text,
+                        kind=cycle_kind,
+                        session_id=session_id,
                     )
 
                 forward_headers = {
@@ -1164,12 +1393,29 @@ def make_handler(
                     else:
                         raw_text, out_text = _relay_buffered_response(self, upstream, session_id)
                     _publish_stage(
-                        pipeline_bus, request_id, "response_received", raw_text, kind=cycle_kind
+                        pipeline_bus,
+                        request_id,
+                        "response_received",
+                        raw_text,
+                        kind=cycle_kind,
+                        session_id=session_id,
                     )
                     _publish_stage(
-                        pipeline_bus, request_id, "detokenized", out_text, kind=cycle_kind
+                        pipeline_bus,
+                        request_id,
+                        "detokenized",
+                        out_text,
+                        kind=cycle_kind,
+                        session_id=session_id,
                     )
-                    _publish_stage(pipeline_bus, request_id, "displayed", out_text, kind=cycle_kind)
+                    _publish_stage(
+                        pipeline_bus,
+                        request_id,
+                        "displayed",
+                        out_text,
+                        kind=cycle_kind,
+                        session_id=session_id,
+                    )
             except Exception:
                 if not response_started:
                     _write_error(self, 502, "upstream request failed")
@@ -1223,6 +1469,9 @@ def make_handler(
                 return True
             if path == f"{_PANEL_PREFIX}/metrics/comparison" and self.command == "POST":
                 self._serve_metrics_comparison_post()
+                return True
+            if path == f"{_PANEL_PREFIX}/hook-event" and self.command == "POST":
+                self._serve_hook_event()
                 return True
             if path.startswith(f"{_PANEL_PREFIX}/"):
                 _write_json(self, 404, {"error": f"no panel route for {self.command} {path}"})
@@ -1372,6 +1621,61 @@ def make_handler(
             }
             _write_metrics_comparison_cache(payload)
             _write_json(self, 200, payload)
+
+        def _serve_hook_event(self) -> None:
+            """Best-effort ingress for a hook's own live progress report (mission-13).
+
+            Request schema is deliberately minimal --
+            ``session_id``/``hook``/``phase``/``tool_name``, all short
+            fixed-shape strings -- and structurally incapable of carrying a
+            command string, a tool response, or any tokenized/detokenized
+            value: there is no field for one, and any extra field in the
+            request body is ignored outright, never stored or forwarded, so
+            a caller cannot smuggle sensitive text through by adding a field
+            this schema does not expect.
+
+            Always responds ``204`` regardless of outcome (unrecognized
+            session, no open turn for it, malformed body) -- the reporting
+            hook never inspects the response, matching its own best-effort
+            contract (``adapters/hooks/_panel_report.py``).
+            """
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if length else b""
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            try:
+                payload = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                return
+            if not isinstance(payload, dict):
+                return
+            session_id = payload.get("session_id")
+            hook = payload.get("hook")
+            phase = payload.get("phase")
+            tool_name = payload.get("tool_name")
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or hook not in _ALLOWED_HOOK_NAMES
+                or phase not in _ALLOWED_HOOK_PHASES
+                or not isinstance(tool_name, str)
+                or not tool_name
+            ):
+                return
+            turn_request_id = pipeline_bus.open_turn_for_session(session_id)
+            if turn_request_id is None:
+                return
+            pipeline_bus.publish(
+                {
+                    "request_id": turn_request_id,
+                    "kind": "hook",
+                    "hook": hook,
+                    "phase": phase,
+                    "tool_name": tool_name,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
 
         def do_GET(self) -> None:
             if self._handle_panel():

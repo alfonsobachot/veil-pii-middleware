@@ -1215,6 +1215,35 @@ class TestCycleKindClassification:
             event = next(e for e in events if e["stage"] == stage)
             assert event["kind"] == "conversation", stage
 
+    def test_internal_safety_classifier_request_is_classified(self, servers: _Servers) -> None:
+        """Mission-13, found live against a real ``claude -p --demo-db`` session.
+
+        Claude Code's own harm/safety classifier wraps a JSON transcript
+        summary in ``<transcript>...</transcript>`` as the *last user
+        message* and asks for a bare ``<severity>N</severity>`` reply --
+        the instruction text sits *outside* the tag, so stripping known
+        wrapper tags alone does not empty this message the way it does for
+        ``<system-reminder>``. Before this fix it read as an ordinary
+        ``"conversation"`` and stole mission-13's turn-tracking pointer
+        away from the real conversation (see ``.harness/handoff.md``).
+        """
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": '<transcript>\n{"user":"query the database"}\n</transcript>\n'
+                    "Stage 1 does NOT apply user intent. Respond with"
+                    " <severity>N</severity> ONLY. No other text.",
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "safety_check", stage
+
 
 class TestExcludedMetadataNeverTokenized:
     """Live-reported: Claude-Code-injected metadata must never be tokenized.
@@ -1505,6 +1534,41 @@ class TestPipelineHistoryBuffer:
         assert len(received_texts) == gateway_server.PIPELINE_HISTORY_LIMIT
         assert received_texts == [f"turn {i}" for i in range(2, total)]
 
+    def test_auxiliary_kind_burst_never_evicts_a_real_turn(self) -> None:
+        """Mission-13, found live: a single real conversation with several
+
+        tool round-trips produced enough interleaved ``"safety_check"``
+        cycles (Claude Code's own harm classifier, observed firing roughly
+        once per tool call) to evict the real conversation cycle from a
+        single shared 20-slot ring buffer before the panel ever connected
+        -- see ``.harness/handoff.md``. ``"safety_check"``/``"title_generation"``/
+        ``"internal_continuation"`` now evict from their own separate
+        buffer, so a real ``"conversation"`` cycle published once, however
+        many auxiliary-kind cycles follow it, must always survive.
+        """
+        bus = gateway_server.PipelineEventBus()
+        bus.publish(
+            {
+                "request_id": "real",
+                "stage": "received",
+                "text": "real turn",
+                "kind": "conversation",
+            },
+            session_id="s1",
+        )
+        for i in range(gateway_server.PIPELINE_HISTORY_LIMIT * 2):
+            bus.publish(
+                {
+                    "request_id": f"noise-{i}",
+                    "stage": "received",
+                    "text": "",
+                    "kind": "safety_check",
+                }
+            )
+
+        _, backlog = bus.subscribe()
+        assert any(e["request_id"] == "real" for e in backlog)
+
 
 class TestPipelineEventBusConcurrency:
     """Direct unit test of the ring buffer's lock discipline (no HTTP layer).
@@ -1663,6 +1727,295 @@ class TestMetricsComparisonEndpoint:
         cached_text = gateway_server.METRICS_COMPARISON_PATH.read_text(encoding="utf-8")
         assert VALID_EMAIL not in cached_text
         assert '"value"' not in cached_text
+
+
+class TestToolContinuationClassification:
+    """Mission-13: a pure tool_result continuation must not read as a fresh conversation.
+
+    ``_extract_last_user_message_text`` renders a bare ``tool_result`` block
+    as the non-empty placeholder ``"[tool_result]"`` -- non-empty enough to
+    fail the existing ``internal_continuation`` check, which is exactly why
+    this used to be misclassified as an ordinary ``"conversation"`` and
+    given its own chip in the panel's selector.
+    """
+
+    def test_pure_tool_result_message_is_tool_continuation(self, servers: _Servers) -> None:
+        body = {
+            "messages": [
+                {"role": "user", "content": "run the query"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "rows..."}],
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "tool_continuation", stage
+
+    def test_real_text_alongside_a_tool_result_stays_conversation(self, servers: _Servers) -> None:
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "rows..."},
+                        {"type": "text", "text": "also, here is a follow-up question"},
+                    ],
+                },
+            ],
+        }
+
+        events = _run_request_and_collect_pipeline_events(servers, body)
+
+        for stage in gateway_server.PIPELINE_STAGES:
+            event = next(e for e in events if e["stage"] == stage)
+            assert event["kind"] == "conversation", stage
+
+
+class TestTurnTracking:
+    """Mission-13: ``PipelineEventBus`` attaches a tool_continuation cycle to its open turn.
+
+    Direct unit tests of ``PipelineEventBus`` itself (no HTTP layer,
+    matching ``TestPipelineEventBusConcurrency``'s existing pattern) --
+    this is pure bus bookkeeping, independent of how a cycle's ``kind`` was
+    ever decided.
+    """
+
+    def test_tool_continuation_attaches_to_the_open_turn(self) -> None:
+        bus = gateway_server.PipelineEventBus()
+        bus.publish(
+            {"request_id": "r1", "stage": "received", "text": "", "kind": "conversation"},
+            session_id="s1",
+        )
+        bus.publish(
+            {"request_id": "r2", "stage": "received", "text": "", "kind": "tool_continuation"},
+            session_id="s1",
+        )
+
+        _, backlog = bus.subscribe()
+        r2_events = [e for e in backlog if e["request_id"] == "r2"]
+        assert r2_events and all(e["parent_request_id"] == "r1" for e in r2_events)
+
+    def test_a_later_conversation_cycle_with_different_text_supersedes_the_open_turn(
+        self,
+    ) -> None:
+        """A genuinely new turn (different text) opens its own turn, not a merge."""
+        bus = gateway_server.PipelineEventBus()
+        bus.publish(
+            {
+                "request_id": "rA",
+                "stage": "received",
+                "text": "first question",
+                "kind": "conversation",
+            },
+            session_id="s1",
+        )
+        bus.publish(
+            {
+                "request_id": "rB",
+                "stage": "received",
+                "text": "second question",
+                "kind": "conversation",
+            },
+            session_id="s1",
+        )
+        bus.publish(
+            {"request_id": "rC", "stage": "received", "text": "", "kind": "tool_continuation"},
+            session_id="s1",
+        )
+
+        _, backlog = bus.subscribe()
+        rb_events = [e for e in backlog if e["request_id"] == "rB"]
+        rc_events = [e for e in backlog if e["request_id"] == "rC"]
+        assert rb_events and all("parent_request_id" not in e for e in rb_events)
+        assert rc_events and all(e["parent_request_id"] == "rB" for e in rc_events)
+
+    def test_same_text_conversation_cycles_merge_under_one_turn(self) -> None:
+        """Mission-13 (revised after live testing): two real, independent
+
+        gateway round-trips with byte-identical received text -- observed
+        live against a real ``claude -p`` session, see
+        ``.harness/handoff.md`` -- must fold into the *same* turn rather
+        than opening a second one and splitting a single logical request
+        across two chips.
+        """
+        bus = gateway_server.PipelineEventBus()
+        bus.publish(
+            {
+                "request_id": "rA",
+                "stage": "received",
+                "text": "same question",
+                "kind": "conversation",
+            },
+            session_id="s1",
+        )
+        bus.publish(
+            {
+                "request_id": "rB",
+                "stage": "received",
+                "text": "same question",
+                "kind": "conversation",
+            },
+            session_id="s1",
+        )
+        bus.publish(
+            {"request_id": "rC", "stage": "received", "text": "", "kind": "tool_continuation"},
+            session_id="s1",
+        )
+
+        _, backlog = bus.subscribe()
+        ra_events = [e for e in backlog if e["request_id"] == "rA"]
+        rb_events = [e for e in backlog if e["request_id"] == "rB"]
+        rc_events = [e for e in backlog if e["request_id"] == "rC"]
+        assert ra_events and all("parent_request_id" not in e for e in ra_events)
+        assert rb_events and all(e["parent_request_id"] == "rA" for e in rb_events)
+        # A tool_continuation published after both still attaches to the
+        # *original* canonical turn (rA), never to the merged sibling (rB).
+        assert rc_events and all(e["parent_request_id"] == "rA" for e in rc_events)
+
+    def test_tool_continuation_with_no_open_turn_carries_no_parent(self) -> None:
+        bus = gateway_server.PipelineEventBus()
+        bus.publish(
+            {"request_id": "r1", "stage": "received", "text": "", "kind": "tool_continuation"},
+            session_id="s-never-opened",
+        )
+
+        _, backlog = bus.subscribe()
+        assert backlog and all("parent_request_id" not in e for e in backlog)
+
+    def test_open_turn_for_session_reflects_the_latest_conversation_cycle(self) -> None:
+        bus = gateway_server.PipelineEventBus()
+        assert bus.open_turn_for_session("s1") is None
+
+        bus.publish(
+            {"request_id": "r1", "stage": "received", "text": "", "kind": "conversation"},
+            session_id="s1",
+        )
+        assert bus.open_turn_for_session("s1") == "r1"
+
+
+class TestHookEventEndpoint:
+    """Mission-13: best-effort ingress for a hook's own live progress report."""
+
+    def test_known_open_turn_publishes_a_hook_event(self, servers: _Servers) -> None:
+        conversation_events = _run_request_and_collect_pipeline_events(
+            servers, {"messages": [{"role": "user", "content": "run the query"}]}
+        )
+        turn_request_id = conversation_events[-1]["request_id"]
+
+        resp = _post(
+            f"{servers.gateway_url}/veil-panel/hook-event",
+            json={
+                "session_id": HOOK_SESSION_ID,
+                "hook": "pre_tool_use",
+                "phase": "start",
+                "tool_name": "Bash",
+            },
+        )
+        assert resp.status_code == 204
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        events = _parse_sse_events("".join(chunks))
+        hook_events = [
+            e for e in events if e["request_id"] == turn_request_id and e.get("kind") == "hook"
+        ]
+        assert len(hook_events) == 1
+        assert hook_events[0]["hook"] == "pre_tool_use"
+        assert hook_events[0]["phase"] == "start"
+        assert hook_events[0]["tool_name"] == "Bash"
+        assert set(hook_events[0]) == {
+            "request_id",
+            "kind",
+            "hook",
+            "phase",
+            "tool_name",
+            "timestamp",
+        }
+
+    def test_no_open_turn_publishes_nothing(self, servers: _Servers) -> None:
+        resp = _post(
+            f"{servers.gateway_url}/veil-panel/hook-event",
+            json={
+                "session_id": "session-with-no-turn-ever-opened",
+                "hook": "pre_tool_use",
+                "phase": "start",
+                "tool_name": "Bash",
+            },
+        )
+        assert resp.status_code == 204
+
+        chunks = _read_sse_chunks_until_idle(
+            f"{servers.gateway_url}/veil-panel/pipeline-stream",
+            idle_timeout=0.5,
+            overall_timeout=2.0,
+        )
+        events = _parse_sse_events("".join(chunks))
+        assert not any(e.get("kind") == "hook" for e in events)
+
+    @pytest.mark.parametrize(
+        "raw_body",
+        [
+            b"not json",
+            b"[1, 2, 3]",
+            json.dumps(
+                {"session_id": HOOK_SESSION_ID, "hook": "pre_tool_use", "phase": "start"}
+            ).encode(),
+            json.dumps(
+                {
+                    "session_id": HOOK_SESSION_ID,
+                    "hook": "not_a_real_hook",
+                    "phase": "start",
+                    "tool_name": "Bash",
+                }
+            ).encode(),
+        ],
+    )
+    def test_malformed_body_responds_204_never_500(
+        self, servers: _Servers, raw_body: bytes
+    ) -> None:
+        resp = httpx.post(
+            f"{servers.gateway_url}/veil-panel/hook-event",
+            content=raw_body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        assert resp.status_code == 204
+
+    def test_extra_field_is_ignored_not_forwarded(self, servers: _Servers) -> None:
+        conversation_events = _run_request_and_collect_pipeline_events(
+            servers, {"messages": [{"role": "user", "content": "run the query"}]}
+        )
+        turn_request_id = conversation_events[-1]["request_id"]
+
+        _post(
+            f"{servers.gateway_url}/veil-panel/hook-event",
+            json={
+                "session_id": HOOK_SESSION_ID,
+                "hook": "pre_tool_use",
+                "phase": "start",
+                "tool_name": "Bash",
+                "command": (
+                    "sqlite3 demo/veil_demo.db \"select * from users where dni='12345678A'\""
+                ),
+            },
+        )
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        events = _parse_sse_events("".join(chunks))
+        hook_events = [
+            e for e in events if e["request_id"] == turn_request_id and e.get("kind") == "hook"
+        ]
+        assert len(hook_events) == 1
+        assert "command" not in hook_events[0]
+        assert "12345678A" not in json.dumps(hook_events[0])
 
 
 class _StubLLMClient:

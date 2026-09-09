@@ -2,36 +2,33 @@
 
 ## Objective
 
-Follow-up to mission-11 (audit log + observability panel), reported after
-live use of the real gateway (LLM + API) flow. Three problems, all in the
-observability surface only — no change to detection, vault, or
-tokenization/substitution logic:
+Redesign the observability panel's grouping so that one *logical* user
+request (a prompt, plus however many tool round-trips it takes to answer
+it) renders as one screen, instead of one chip per raw gateway HTTP call.
+Reported live by the human: a demo-db query produces several chips today
+(the real turn, plus one more per tool_result continuation the gateway
+never distinguishes from an ordinary conversational turn), most of which
+carry no useful standalone content.
 
-1. The four panes render the *entire raw* request/response JSON (system
-   prompt, tools, metadata, full conversation history) instead of BRIEF
-   §5's actual spec ("the user's text ... the same text, tokenized ...").
-   This is a bug against BRIEF's own design, not new scope: `_publish_stage`
-   calls in `adapters/gateway/server.py::GatewayHandler._handle` pass
-   `_decode(raw_body)`/`_decode(forward_body)`/the whole joined SSE stream
-   text verbatim. A side effect of the same bug: `Span.start`/`Span.end` are
-   offsets into one string *leaf* (`core/tokenizer.py::_tokenize_text`), but
-   the frontend slices them into the *whole document* text — spans land on
-   effectively random characters near the front of the payload for any
-   real (multi-field) request, which is the concrete reason the panes read
-   as illegible garbage.
-2. `PipelineEventBus` (in-memory pub/sub) delivers only events published
-   *after* a subscriber connects. Opening the panel against an
-   already-running gateway shows nothing for cycles that already completed
-   in that same process's lifetime — accepted as fine across a *restart*
-   (mission-11's Intake Grill), but not within one running process.
-3. New, scope-expanding asks from this mission's own Intake Grill: (a) a
-   selector so a new request cycle does not overwrite the one you are
-   looking at; (b) the metrics pane becomes its own detailed tab comparing
-   regex/LLM/unified, expensive enough (real LLM calls) that its result
-   must be cached to disk and reused across gateway restarts, refreshed only
-   on an explicit action; (c) an interactive step-through of a *completed*
-   cycle's six pipeline stages (manual prev/next and an auto-play), because
-   the real live timing is too fast to watch meaningfully.
+Two parts:
+
+1. **Grouping (bug fix against the panel's own intent, not new scope).**
+   `_classify_cycle_kind` mislabels a pure tool_result continuation as
+   `"conversation"` because `_extract_last_user_message_text` renders it as
+   the non-empty placeholder `"[tool_result]"`, so today's existing
+   `internal_continuation`/`title_generation` hiding never catches it. Fix:
+   a new `"tool_continuation"` kind, folded into the parent turn's screen
+   as an additional timeline step rather than hidden outright or given its
+   own chip.
+2. **Live hook visibility (new scope, explicitly requested).** The
+   PreToolUse/PostToolUse hooks that detokenize a demo-db command before it
+   runs and re-tokenize its result never report anything to the panel today
+   — confirmed by grep, zero references to pipeline/panel/cycle anywhere
+   under `adapters/hooks/`. The human wants exactly this activity visible,
+   live, inside the same screen as the turn that triggered it, specifically
+   because the gap between "hook fires" and "hook finishes" is where the
+   actual (sometimes slow) DB round-trip happens and today that time is
+   invisible.
 
 ## Routing
 
@@ -44,238 +41,245 @@ Validation plan: .harness/validation.md
 
 | Question | Answer |
 |---|---|
-| Is showing only the human-readable message (vs. the full raw JSON) a bug fix against BRIEF §5's original spec, or something broader (e.g. keep raw JSON available, collapsed)? | Bug fix: each pane shows only the human message. No new "raw JSON, collapsible" affordance. |
-| Where should message-text extraction happen — server (gateway/server.py, which already has the parsed JSON) or frontend (JS re-parsing the Messages API shape)? | Server. The frontend receives plain display text and detector spans already relative to that text; it does not need to understand the Anthropic Messages API shape at all. |
-| Claude Code resends the full conversation history every request. What should pane 1 ("Input") show? | Superseded by the user's own follow-up: instead of picking "last turn only" vs "whole history" once, the panel gets a selector across cycles (see below) — each cycle's pane 1 shows that one request's latest user turn only (the newest content, not the repeated history), scoped per-cycle rather than per-pane. |
-| The pipeline-stream is purely in-memory; what should happen for cycles that completed before the panel connected? | Bounded in-memory ring buffer of the last N cycles, replayed to a new SSE subscriber the moment it connects, then live events continue. Still lost on process restart — consistent with mission-11's existing non-persistence decision for this stream. |
-| When a new request cycle starts while you are looking at an older one, what happens? | You are not pulled away. The new cycle is added to the selector as the newest entry; your current selection changes only if you were already viewing "the latest" (auto-follow), not if you had explicitly picked an older one. |
-| How many cycles to buffer (both for replay-on-connect and for the selector)? | 20 (same order of magnitude as the existing `MAX_AUDIT_ROWS=50` convention). |
-| The metrics tab compares regex/LLM/unified; LLM/unified modes call the local LLM once per manifest entry — slow, and can fail if LM Studio is not running. How should that comparison be triggered, and what should persist? | Explicit "Run comparison" action (never automatic). Result is cached to disk (`.veil/`, git-ignored, like the vault/audit files), not just in-memory for the session — the panel's default view on open is *the last comparison that was ever run*, surviving a gateway restart, because rerunning it is expensive. |
-| For the interactive step-through of a completed cycle's pipeline stages, is manual (prev/next) enough, or is an auto-play needed too, given real-time is too fast to watch? | Both. Manual prev/next at any time; a "Play" button auto-advances through all six stages with a fixed per-stage pause, for a completed cycle only (a still-in-flight cycle only has the stages it has reached so far, so `Play` is disabled until all six have arrived). |
+| Hooks and the gateway share only Claude Code's `session_id`, never a request/turn id. What correlation criterion should attach a hook's event to the right screen? | Most-recently-opened turn per `session_id`: the gateway tracks, per session, the `request_id` of the latest cycle classified `"conversation"`; every hook event and every `"tool_continuation"` cycle for that session attaches to it until the next real `"conversation"` cycle supersedes it. Real usage is sequential (one thing in flight per session at a time), so this is safe in practice. |
+| What happens to a hook event that fires with no open turn for its session (panel never opened this process's lifetime, or a demo-db command run by hand outside a real conversation)? | Dropped silently — never published to the pipeline-stream bus. This is ephemeral, best-effort observability, not the audit trail; `.veil/audit.jsonl` already records every token this hook mints regardless, so nothing durable is lost. |
+| The new HTTP call *from* a hook *to* the gateway must never compromise `PreToolUse`'s fail-closed guarantee. What's the contract? | Strictly best-effort: a short, fixed timeout (200ms), wrapped in a blanket `try/except Exception: pass`. It can never change a hook's exit code, block/allow decision, stdout payload, or wall-clock behavior beyond that bounded timeout — identical to today whenever the gateway is unreachable or not running at all (the common case for anyone using hooks without the gateway). |
+| How should live progress render inside one screen while a DB round-trip is slow? | A vertical timeline of steps, each moving pending → in-progress → done live as events arrive (spinner on the active step), not a single aggregate progress bar. Concretely: prompt received/tokenized → sent to model → model requests a tool → PreToolUse start/done → *(the gap here is the real DB execution time, now visible for the first time)* → PostToolUse start/done → result sent back to model → final response. |
+| Once tool_continuation cycles stop being their own chips, is their raw tokenized/detokenized text still inspectable for debugging? | Yes — each step in the timeline that corresponds to a real gateway cycle (not a hook marker) stays expandable inline, reusing the existing per-stage pane rendering; nothing that was visible today becomes invisible, it just moves from "its own chip" to "an expandable row inside the parent turn's timeline". |
+| This touches `adapters/hooks/` (a fail-closed surface) in addition to `adapters/gateway/server.py` and `frontend/panel.html`. Confirm the execution lane. | `agent-with-checkpoint`, human review before merge — same lane as mission-11/mission-12, the precedent for this exact panel. |
 
 Evidence gathered before asking (no re-reading needed once the grill
-started): `adapters/gateway/server.py` read in full this session — the
-`_publish_stage` call sites in `_handle`, `PipelineEventBus.subscribe`/
-`publish`, `_tokenize_body`, `_relay_sse_response`/`_relay_buffered_response`
-and their `(raw_text, rewritten_text)` return contracts, `_TEXT_BEARING_DELTA_FIELDS`,
-`_split_sse_event`; `frontend/panel.html` read in full — `Panes`,
-`renderSpannedText`/`renderTokenizedText`, `useEventSource`, `AuditLogPane`,
-`VaultInspector`, `Metrics`, `App`'s flat per-stage `texts` state (the thing
-that "overwrites the last message" per the user's own diagnosis);
-`core/tokenizer.py::_tokenize_text`/`tokenize` confirming `Span` offsets are
-per-leaf, not per-document, and that `context.span_sink` accumulates spans
-from every leaf in tree-walk order with no leaf identity attached (why
-per-cycle re-extraction, not post-hoc filtering of the existing span list,
-is the only safe fix); `core/detector.py` confirming `LLMClient`/`detect()`
-cache LLM results process-wide keyed by `(text, client.identity)`
-(`_llm_span_cache`), so re-running `detect()` on the exact same leaf text
-already scanned by `tokenize()` is a guaranteed cache hit, not a second LLM
-call, provided the *same* `LLMClient` instance is reused across both calls;
-`demo/eval.py::evaluate()` already accepts `mode: Literal["regex","llm","union"]`
-plus `llm_client` (mission-11 item 16) — no core/demo signature change
-needed for the comparison tab, only a new gateway endpoint that calls it
-three times and persists the result; `.gitignore` already excludes `.veil/`.
+started, all from this session's own exploration before the grill):
+`adapters/gateway/server.py` — `_classify_cycle_kind`, `_extract_last_user_message_text`,
+`_extract_text_from_content_blocks` (the `_TEXT_CONTENT_BLOCK_FIELDS`
+placeholder mechanism is exactly why `"[tool_result]"` reads as non-empty
+today), `_tokenize_body`'s call site, `PipelineEventBus.publish`/`subscribe`'s
+existing lock discipline, `_DEFAULT_PORT = 8787`; `adapters/hooks/pre_tool_use.py`
+and `post_tool_use.py` in full — both read `session_id` straight from the
+hook payload already (the same real Claude Code session id the gateway's
+`X-Claude-Code-Session-Id` reconciliation already keys the vault by, per
+BRIEF §6's mission-8-follow-up fix), both already fail closed / degrade
+independently of any new call this mission adds; `adapters/hooks/_scope.py`'s
+`is_demo_db_command` gate (both hooks already no-op immediately for any
+non-demo-db tool call, so the new reporting call only ever fires on the
+in-scope path); `scripts/run-gateway.sh`'s `127.0.0.1`-only bind and its
+`VEIL_VAULT_KEY`/`VEIL_LLM_BASE_URL`-style env var convention (the new
+`VEIL_GATEWAY_URL` env var for hooks follows the same pattern); `pyproject.toml`
+confirming `httpx` is already an unconditional runtime dependency, so hooks
+gain no new dependency by using it; `frontend/panel.html`'s existing
+`HIDDEN_KINDS`/`cyclePreview`/`CycleSelector` (the toggle-and-hide pattern
+this mission extends rather than replaces).
 
 ## Scope
 
 - `veil_pii_middleware/adapters/gateway/server.py`:
-  - New pure-extraction helpers (no detection, no substitution — this stays
-    firmly in the adapter, not `core/`): `_extract_text_from_content_blocks`
-    (handles both a plain string `content` and a list of content blocks,
-    joining `text`/`thinking` blocks and substituting a short bracketed
-    placeholder like `[tool_use]` for any other block type so a turn that is
-    e.g. a bare tool_result never renders as a mysteriously empty pane),
-    `_extract_last_user_message_text` (walks a request body's `messages`
-    array backwards for the last `role == "user"` message), `_extract_response_text`
-    (same block-joining over a Messages API response's `content`), and an SSE
-    variant that walks a list of raw SSE event strings collecting
-    `content_block_delta` text/thinking deltas in order (reusing the already-
-    parsed `_split_sse_event`/`_TEXT_BEARING_DELTA_FIELDS`).
-  - `_tokenize_body` builds its own `LLMClient` (via the same
-    `LLM_BASE_URL_ENV_VAR`/`LLM_MODEL_ENV_VAR` env gating `tokenizer._default_llm_client`
-    already uses) and passes it into `tokenize()` explicitly, instead of
-    letting `tokenize()` build+close an invisible one — needed so the same
-    client can be reused for one extra `detect()` call, scoped to only the
-    extracted last-user-message text, to get spans whose offsets are
-    correctly relative to that exact display text (not the whole document).
-    Closed in a `finally` in `_tokenize_body` itself. Returns the tokenized
-    body bytes plus `(received_text, received_spans, outbound_text)` in
-    place of today's single flat `spans` list.
-  - `_relay_buffered_response`/`_relay_sse_response` return
-    `(raw_display_text, rewritten_display_text)` extracted via the helpers
-    above, instead of the full joined raw/rewritten stream text. The actual
-    bytes written to the real client via `_write_chunk` are unchanged byte-
-    for-byte — only the pipeline-stream's own side-channel text changes.
-  - `_handle`'s `_publish_stage` calls pass these new display texts/spans
-    instead of `_decode(raw_body)`/`_decode(forward_body)`/the full relay
-    text. The two early-failure branches (invalid JSON, tokenize exception)
-    keep falling back to the raw decoded body — there is no structured
-    message to extract when parsing itself failed.
-  - `PipelineEventBus` gains a bounded ring buffer (`collections.deque(maxlen=20)`
-    of request ids in first-seen order, plus a dict of that request id's
-    events so far) updated inside `publish`'s existing lock. `subscribe()`
-    now returns `(queue, backlog_events)`: the backlog is a snapshot (under
-    the same lock used by `publish`, so no event is ever delivered twice or
-    dropped across the subscribe/publish race) of every buffered event for
-    every currently-buffered request id, oldest cycle first; `_serve_pipeline_stream`
-    writes the backlog as SSE chunks before entering its existing blocking
-    live loop.
-  - New endpoints for the metrics comparison tab:
-    - `GET /veil-panel/metrics/comparison` — returns the persisted
-      `.veil/metrics_comparison.json` cache (`{"available": false}` if it
-      has never been run).
-    - `POST /veil-panel/metrics/comparison` — runs `demo.eval.evaluate()` for
-      `mode="regex"`, `"llm"`, `"union"` (each independently wrapped so one
-      mode's failure, e.g. LM Studio unreachable, does not block the
-      others), serializes `by_type`/`by_detector` per mode, writes the
-      result plus an ISO timestamp to `.veil/metrics_comparison.json`
-      (git-ignored, matching `VAULT_DB_PATH`'s convention), and returns it.
-      `demo/eval.py`'s private `_llm_client_from_env` is promoted to a
-      public `llm_client_from_env` (added to `__all__`) so the gateway can
-      build the same kind of client `main()` already does, instead of
-      duplicating that env-reading logic a third time.
-  - The existing `GET /veil-panel/metrics` (quick regex-only report) is
-    unchanged — it remains the fast, always-fresh summary; the new
-    comparison endpoints are additive.
-- `veil_pii_middleware/demo/eval.py`: rename `_llm_client_from_env` to
-  `llm_client_from_env`, export it in `__all__`; `main()` updates its one
-  call site. No behavior change.
+  - Refactor `_extract_last_user_message_text` to share a new
+    `_find_last_user_message_content(parsed) -> JSONValue | None` helper
+    with a new `_last_user_content_has_text(content) -> bool` (true iff at
+    least one content block's type is a key of `_TEXT_CONTENT_BLOCK_FIELDS`
+    with a real string value — i.e. the message contains actual
+    human/model-authored text or thinking, not only placeholder-rendered
+    blocks like `tool_use`/`tool_result`/`image`).
+  - `_classify_cycle_kind` gains a `has_real_text: bool` parameter and a new
+    branch: `title_generation` (unchanged) → empty stripped text →
+    `internal_continuation` (unchanged) → `not has_real_text` →
+    **`"tool_continuation"`** (new) → else `"conversation"` (unchanged).
+  - New in-memory state on the handler/bus: `_open_turn_by_session:
+    dict[str, str]` (session_id → request_id), guarded by the existing
+    `PipelineEventBus` lock. Updated only when a `"received"` stage event's
+    `kind == "conversation"` (opens/replaces the turn for that session).
+    When a `"received"` event's `kind == "tool_continuation"`, the event
+    gains a `parent_request_id` field looked up from this map at publish
+    time (omitted/`None` if no turn is open for that session — the
+    frontend's documented fallback, see Non-goals).
+  - New endpoint `POST /veil-panel/hook-event`. Request body:
+    `{"session_id": str, "hook": "pre_tool_use" | "post_tool_use", "phase":
+    "start" | "done" | "error", "tool_name": str}` — **no command text, no
+    tool output, no tokenized or detokenized value of any kind accepted or
+    stored; the schema has no field capable of carrying one.** Looks up
+    `_open_turn_by_session[session_id]`; if present, publishes a
+    `kind="hook"` event tagged with that `request_id` (same `PipelineEventBus.publish`
+    used for ordinary stages, distinguished by `kind`); if absent, does
+    nothing. Always responds `204` — the hook does not read the response
+    body, and a malformed/unrecognized payload is also swallowed into a
+    no-op `204` (best-effort on both ends, not a new source of hook
+    breakage). No new auth beyond the existing `127.0.0.1`-only bind.
+- `veil_pii_middleware/adapters/hooks/_panel_report.py` (new, shared by
+  both hook scripts, mirroring `_paths.py`/`_scope.py`'s existing
+  one-small-thing-in-one-place convention): `report(session_id: str, hook:
+  str, phase: str, tool_name: str) -> None`. Reads `VEIL_GATEWAY_URL` env
+  var (default `http://127.0.0.1:8787`, matching `run-gateway.sh`'s own
+  default port) once per call; POSTs the fixed-shape JSON body above via
+  `httpx` with a `timeout=0.2` (connect+read combined); the entire call is
+  wrapped in a blanket `except Exception: pass` (unreachable host,
+  timeout, DNS failure, non-2xx response — all swallowed identically).
+  Never raises, never returns a value the caller could branch on
+  incorrectly as a success/failure signal — callers do not check anything
+  after calling it.
+  - `pre_tool_use.py`: calls `report(session_id, "pre_tool_use", "start",
+    "Bash")` immediately after the existing `is_demo_db_command`/`session_id`
+    checks pass (before the `Vault`/`detokenize()` call), and
+    `report(..., "done", "Bash")` right before its existing successful
+    `return 0`, or `report(..., "error", "Bash")` on its existing fail-closed
+    `return 2` paths that occur *after* the start report was sent. No
+    change to any existing control flow, return value, or stderr message —
+    purely additive calls at existing branch points.
+  - `post_tool_use.py`: same pattern around its `tokenize()` call — `"start"`
+    before, `"done"` before its successful `return 0`, `"error"` on its
+    existing `return 1` paths after the start report was sent.
 - `veil_pii_middleware/frontend/panel.html`:
-  - Top-level tabs: "Live" (default) and "Metrics". The old inline `Metrics`
-    pane moves entirely into the new "Metrics" tab and gains the
-    regex/LLM/unified comparison table (by entity type and by detector),
-    an explicit "Run comparison" button, a "last run at <time>" label
-    sourced from `GET .../comparison` on load, and per-mode
-    loading/error states from `POST .../comparison`.
-  - "Live" tab: a cycle selector (one entry per buffered/live `request_id`,
-    newest last, labeled by a short id fragment + timestamp + a truncated
-    preview of that cycle's input text) replaces the old flat per-stage
-    `texts` state that a new request silently overwrote. Selecting an older
-    cycle does not move when a new one arrives (pin-to-latest only follows
-    while the latest cycle is the one selected); the four panes render the
-    *selected* cycle's stages.
-  - The pipeline flow diagram gains prev/next controls and a play/pause
-    auto-play (fixed per-stage delay) that step a per-cycle "viewed stage"
-    index, highlighting the corresponding stage box and showing a short
-    canned one-line explanation of what that stage does; the four panes
-    progressively reveal only up through the viewed stage. `Play` is
-    disabled until the selected cycle has all six stages. A still-in-flight
-    live cycle keeps auto-advancing its viewed index as real events arrive
-    (matching today's live-highlight behavior) unless the user has manually
-    stepped it, in which case it stays put until they return to "latest".
-  - Both the selector list and the per-cycle stage map are capped
-    client-side at the same 20-cycle bound the server buffers, so a
-    long-running session cannot grow this state unboundedly.
-- Tests: extended `tests/test_gateway.py` — message-text extraction (last
-  user turn only, non-text content blocks placeholder-rendered, SSE
-  text/thinking delta reconstruction), span offsets now correctly relative
-  to the extracted display text (a multi-field payload where the naive
-  whole-document offset would land on the wrong characters), the pipeline
-  ring buffer (a late-connecting subscriber receives already-completed
-  cycles, oldest first, still bounded at 20, still never persisted to the
-  audit log), and the two new metrics-comparison endpoints (cache miss vs.
-  hit, one mode failing does not block the others, the persisted file
-  survives across two separate `make_handler` instances the way the vault/
-  audit files already do). `tests/test_eval.py` (or wherever `demo/eval.py`
-  is currently tested) covers the `_llm_client_from_env` → `llm_client_from_env`
-  rename.
-- `.harness/handoff.md`: an updated manual demo-run checklist covering the
-  cycle selector's pin/no-pin behavior, the step-through/auto-play, and the
-  metrics comparison tab's persistence across a gateway restart.
+  - Selector groups by **turn**, not raw cycle: a cycle is a turn's own
+    chip iff `kind === "conversation"`, or iff `kind === "tool_continuation"`
+    with no resolvable `parent_request_id` (orphan fallback — see
+    Non-goals for why this must stay visible, not hidden). Every other
+    `tool_continuation` cycle (one with a `parent_request_id` pointing at a
+    turn present in the buffered cycles) is a **child** of that turn, not a
+    chip of its own. `title_generation`/`internal_continuation` are
+    unaffected — still fully hidden by default behind the existing "Show
+    hidden" toggle.
+  - Selecting a turn renders a single chronological **timeline**: every
+    stage event from the turn's own cycle, every child cycle's stage
+    events, and every `kind: "hook"` event tagged with that turn, merged
+    and sorted by timestamp (all three already carry an ISO timestamp
+    today). A stage-type entry renders a short label plus its existing
+    expandable pane content (reused, not reimplemented); a hook-type entry
+    renders `<hook> <phase>` (e.g. "PreToolUse: detokenizing…" /
+    "PreToolUse: done") with no expandable content (there is nothing in
+    its payload to expand — see the hook-event schema above).
+  - Live state: a hook `"start"` event with no matching `"done"`/`"error"`
+    yet for the same `(hook, tool_name)` pair renders as in-progress
+    (spinner); a cycle that is not yet `cycleIsComplete` renders a trailing
+    "waiting for the next stage…" row. This is what makes the actual DB
+    round-trip's duration visible live, per the human's own stated
+    motivation.
+  - `HIDDEN_KIND_LABEL`/`HIDDEN_KINDS` stay exactly as today; nothing about
+    `title_generation`/`internal_continuation` classification, hiding, or
+    the existing toggle changes in this mission.
+- Tests: `tests/test_gateway.py` gains coverage for the reclassification
+  (a pure-tool_result last user message → `"tool_continuation"`, not
+  `"conversation"`), the `parent_request_id` attachment (with and without
+  an open turn), and the new `/veil-panel/hook-event` endpoint (known open
+  turn → event published and tagged; no open turn → `204` with nothing
+  published; malformed body → `204`, never a 500). A new
+  `tests/test_hooks.py`-adjacent test (or extending the existing hook test
+  module, whichever already exists) covers `_panel_report.report`'s
+  best-effort contract: pointed at a closed/unreachable port, the call
+  returns (does not raise) within a bounded short time, and the calling
+  hook's exit code/stdout are byte-for-byte identical to a run with
+  `VEIL_GATEWAY_URL` pointed at nothing reachable versus a run where
+  reporting is skipped entirely.
+- `.harness/handoff.md`: a manual demo-run checklist — run a real demo-db
+  query end to end through both the gateway and the hooks together, and
+  confirm exactly one chip appears for the whole turn, its timeline shows
+  the PreToolUse/PostToolUse markers in the right place relative to the
+  request/response stages, and the gap between PreToolUse "done" and
+  PostToolUse "start" visibly corresponds to the real query's wall-clock
+  time.
 
 ## Non-goals
 
-- Any change to `core/detector.py`, `core/tokenizer.py`'s substitution
-  logic, or `core/vault.py` — this mission is entirely inside the gateway
-  adapter's observability side-channel and the frontend. The one
-  `core/tokenizer.py`-adjacent change is `_tokenize_body` now managing its
-  own `LLMClient` lifecycle explicitly instead of letting `tokenize()` do it
-  invisibly — `tokenize()`'s own signature, defaults, and behavior for every
-  other caller are untouched.
-- Changing what bytes the gateway actually forwards upstream or relays back
-  to the real client — only the pipeline-stream's own side-channel display
-  text changes; the wire-level relay (`_write_chunk` calls, SSE rewriting,
-  detokenization) is byte-for-byte identical to before this mission.
-- Persisting the pipeline-stream itself to disk, or surviving a gateway
-  *restart* — the 20-cycle ring buffer is still purely in-memory, per
-  mission-11's existing decision; only the *within-one-running-process,
-  connect-after-the-fact* gap is fixed.
-- Any authentication layer on the new `/veil-panel/metrics/comparison`
-  routes — same `127.0.0.1`-only trust model as every other panel route.
-- A full animation/motion polish pass beyond the specific step-through
-  interaction requested (fixed-delay auto-play, stage-box highlight, one-line
-  captions) — no easing curves, particles, or transitions beyond what
-  mission-11's MVP CSS already has.
-- Showing the manifest's raw `Miss.value` (the concrete missed synthetic PII
-  value `demo/eval.py` already prints to stdout) in the comparison tab —
-  only the aggregate `by_type`/`by_detector` numbers, to keep the persisted
-  cache and the new endpoints small and scoped to what was asked.
+- No change to `core/detector.py`, `core/vault.py`, or
+  `core/tokenizer.py`'s substitution logic — this is entirely inside the
+  gateway's observability side-channel, the two hook scripts' own
+  best-effort reporting, and the frontend.
+- **The new `/veil-panel/hook-event` payload never carries a command
+  string, a tool response, or any tokenized/detokenized value — only
+  `hook`, `phase`, and a static `tool_name`.** This is deliberate, not an
+  oversight: `pre_tool_use.py`'s whole reason to exist is producing a
+  command containing the *real, detokenized* PII value the DB needs to
+  see, so any observability path fed by that hook must be designed from
+  the start to have no field capable of carrying it — not "carefully
+  redacted before sending", which would need its own review every time the
+  hook's internals change. The tokenized/detokenized text these hooks
+  handle remains visible only where it already is today: inside the
+  gateway's own `tool_continuation` cycle panes (which only ever see the
+  *tokenized* wire value, never the hook's locally-detokenized one).
+- A `tool_continuation` cycle with no open turn (the panel never saw a
+  preceding `"conversation"` cycle for that session, e.g. process restart
+  mid-turn) is **not** dropped or hidden the way an orphan hook event is —
+  it falls back to being its own visible chip. Silently discarding a
+  hook's ephemeral marker loses nothing (the audit log already has the
+  durable record); silently discarding an entire cycle's request/response
+  content, which exists nowhere else in the panel, would.
+- `PipelineEventBus`'s existing 20-cycle ring buffer bound stays a bound on
+  raw `request_id`s, not turns — unchanged from mission-12. A turn with
+  several tool round-trips now consumes several of those 20 slots, so a
+  very tool-call-heavy session may evict older *turns* from the buffer
+  faster than before. Accepted for this mission; revisit the constant
+  later if it proves too aggressive in real use.
+- No authentication on `/veil-panel/hook-event` beyond the existing
+  `127.0.0.1`-only bind, matching every other panel route.
+- No animation/motion polish beyond the specific live pending → in-progress
+  → done state transitions described above.
+- No change to what bytes the gateway forwards upstream or relays back to
+  the real client, and no change to what the two hooks actually do to
+  `tool_input`/`tool_response` — every new call in this mission is
+  additive observability plumbing around existing, unmodified logic.
 
 ## Acceptance criteria
 
-1. For a realistic multi-field Claude Code-shaped request (system prompt +
-   tool definitions + multi-turn `messages` history), pane 1 ("Input")
-   shows only the latest user turn's text, and any regex/LLM span
-   highlighting lands on the correct characters of *that* text — proven by
-   a test with a payload where the naive whole-document-offset approach
-   would provably highlight the wrong substring.
-2. A non-text last-user-turn content block (e.g. a bare `tool_result`, no
-   text block) renders a placeholder rather than an empty pane, proven by
+1. A gateway request whose last user message's content is entirely
+   non-text blocks (e.g. a bare `tool_result`) is classified
+   `cycle_kind == "tool_continuation"`, not `"conversation"` — proven by
+   test; a request with the same shape but a real text/thinking block
+   present anywhere in that message stays `"conversation"`.
+2. A `"tool_continuation"` cycle published while a `"conversation"` cycle
+   for the same `session_id` is open carries `parent_request_id` equal to
+   that conversation cycle's `request_id` — proven by test. A second,
+   later `"conversation"` cycle for the same session supersedes the first
+   as the open turn for any subsequent `tool_continuation` — proven by
    test.
-3. Pane 2/3/4 show only reconstructed human-readable text (the tokenized
-   user message; the model's response text; the detokenized response
-   text) for both the buffered-JSON and the SSE streaming response shapes,
-   proven by test for each shape — no `event:`/`data:` framing, no
-   `message_start`/`content_block_start` envelope JSON, leaking into any
-   pane's text.
-4. A client connecting to `/veil-panel/pipeline-stream` *after* one or more
-   complete request/response cycles have already run receives every stage
-   event of up to the last 20 of those cycles (oldest first) before any new
-   live event, proven by test; the audit log still never contains any of
-   this, unchanged from mission-11's existing proof.
-5. `GET /veil-panel/metrics/comparison` before any `POST` returns
-   `{"available": false}` (or the actually-persisted last run, if a prior
-   test/process already wrote one to the same file;
-   test isolates this with a `tmp_path`-scoped cache file). `POST
-   /veil-panel/metrics/comparison` persists a file that a *second*,
-   independently-constructed handler (simulating a gateway restart) can
-   read back via `GET`, proven by test.
-6. `POST /veil-panel/metrics/comparison` still returns the regex mode's
-   result when the LLM mode fails (e.g. no `LLM_BASE_URL_ENV_VAR`/
-   `LLM_MODEL_ENV_VAR` configured), marking only the failing mode(s)
-   unavailable, proven by test.
-7. The frontend (manually verified per `handoff.md`'s checklist): opening
-   the panel against a gateway that already processed requests shows their
-   cycles in the selector; selecting an older cycle and then triggering a
-   new request does not change the selection; the pipeline diagram's
-   prev/next/play controls step a completed cycle's six stages with the
-   panes progressively revealing; the Metrics tab shows a regex/LLM/unified
-   comparison that survives a gateway restart until "Run comparison" is
-   pressed again.
+3. A `"tool_continuation"` cycle published with no open turn for its
+   session carries no `parent_request_id` — proven by test.
+4. `POST /veil-panel/hook-event` with a known open turn publishes exactly
+   one `kind: "hook"` event tagged with that turn's `request_id`, carrying
+   only `hook`/`phase`/`tool_name` — proven by test. With no open turn for
+   the given `session_id`, or a malformed body, it responds `204` and
+   publishes nothing — proven by test, in neither case a 500.
+5. `_panel_report.report`, pointed at an unreachable/closed port, returns
+   without raising, within a small bounded wall-clock budget (test asserts
+   an upper time bound, proving the timeout is actually short and not
+   accidentally unbounded) — proven by test. The calling hook's exit code
+   and stdout are unaffected by whether the gateway is reachable — proven
+   by test running `pre_tool_use.main()`/`post_tool_use.main()` both ways.
+6. No test payload, log line, or new endpoint request/response anywhere in
+   this mission's diff contains a detokenized command string or a raw
+   `tool_response` value — proven by code review plus a test asserting the
+   `/veil-panel/hook-event` schema rejects/ignores any extra field beyond
+   `session_id`/`hook`/`phase`/`tool_name` rather than passing it through.
+7. Frontend (manual checklist in `handoff.md`): a demo-db query end to end
+   produces exactly one selector chip for the whole turn; expanding it
+   shows request → PreToolUse start/done → PostToolUse start/done →
+   tool-result continuation → final response, in chronological order, with
+   the request/response steps still expandable to their existing
+   tokenized/detokenized text; `title_generation`/pure
+   `internal_continuation` cycles remain hidden by default exactly as
+   before this mission.
 8. `.harness/bin/verify` exits 0.
-9. `.harness/handoff.md` documents the plaintext-never-in-the-persisted-cache
-   proof (the comparison cache holds only aggregate counts, never a value),
-   the updated manual demo-run checklist, and anything left for human
-   follow-up.
+9. `.harness/handoff.md` documents the manual demo-run checklist above and
+   anything left for human follow-up.
 
 ## Risk
 
 Risk class: medium
 
-Rationale: this mission edits `adapters/gateway/server.py`, one of the
-project's designated high-risk files by virtue of being the live proxy —
-but strictly on its observability side-channel (what the panel is shown),
-never on the actual request/response bytes relayed to the real client or
-on `core/vault.py`/`core/tokenizer.py`'s substitution/detection logic, which
-CLAUDE.md's own risk doctrine reserves the "high" class for. The main
-failure mode to guard against in review is a regression in the *real*
-relay path while refactoring `_relay_buffered_response`/`_relay_sse_response`'s
-return values — mitigated by keeping the actual `_write_chunk`/detokenize
-calls untouched and only changing what the two functions *return* for the
-pipeline-stream side channel, plus full existing-test-suite re-runs.
-The new disk-persisted metrics cache is a new git-ignored file next to the
-vault/audit files, following their existing convention, and holds no PII
-(aggregate counts only).
+Rationale: this mission edits `adapters/gateway/server.py` (the live proxy,
+observability side-channel only — same class of change mission-11/mission-12
+already made, not the request/response relay bytes or any
+detection/vault/tokenization logic) *and*, newly, `adapters/hooks/`, which
+BRIEF does not name among the explicitly "high-risk" surface
+(detector/vault/tokenizer) but which sits on `PreToolUse`'s fail-closed
+path — the one place in this codebase where an unrelated bug could turn
+into a hook that blocks (or, worse, silently misbehaves on) every demo-db
+command instead of just failing to show a spinner. Mitigated by: the
+reporting call being additive at existing branch points (no existing
+branch, return value, or exit code is restructured to make room for it),
+a hard, short timeout with a blanket exception swallow, and a dedicated
+test proving the hook's behavior is identical whether or not the gateway
+is reachable. The one genuine new security-relevant design point (the
+hook-event schema must structurally exclude command/output text, not just
+avoid sending it by convention) is called out explicitly in Non-goals and
+covered by acceptance criterion 6.
 
 ## Merge policy
 
@@ -284,106 +288,112 @@ No commit, push, or merge without explicit human review of the diff and
 
 ## Tooling And Approach Assessment
 
-1. **What project type is this?** A bug fix (message-text extraction
-   replacing whole-document text in the observability side channel) plus
-   three additive frontend/backend features (cycle selector with pin-to-
-   latest, disk-persisted metrics comparison, interactive stage step-
-   through) — all inside the gateway adapter and the unbuilt React
-   frontend already established by mission-11. No new architectural shapes.
-2. **What methods, tooling, or approaches does that imply?** Stdlib only
-   again (`collections.deque` for the ring buffer, `json`/`Path` for the
-   comparison cache file) — no new Python runtime dependency. Frontend
-   stays CDN React + Babel Standalone, no bundler. Reuses `core.detector`'s
-   existing process-wide LLM response cache (`_llm_span_cache`) to make the
-   one extra per-cycle `detect()` call for display-span offsets effectively
-   free rather than a second network round trip, as long as the same
-   `LLMClient` instance is threaded through.
+1. **What project type is this?** A reclassification bug fix
+   (`tool_continuation` kind) plus one new additive feature (hooks
+   reporting best-effort progress to a new gateway endpoint) plus a
+   frontend regrouping/timeline view — all inside the existing gateway
+   adapter, hooks adapters, and the unbuilt-toolchain React frontend
+   mission-11/12 already established. No new architectural shapes, no new
+   process boundary beyond one new local HTTP call hooks already have the
+   dependency (`httpx`) to make.
+2. **What methods, tooling, or approaches does that imply?** Stdlib plus
+   the already-present `httpx` dependency for the hook→gateway call
+   (`timeout=0.2`, no retries — a retry would only spend more of the
+   hook's own wall-clock time on a best-effort signal). No new Python
+   runtime dependency. Frontend stays CDN React + Babel Standalone, no
+   bundler, reusing existing per-stage pane render functions rather than
+   duplicating them for the timeline view.
 3. **What risks or missing decisions does it reveal?** (a) The
-   `PipelineEventBus` backlog-snapshot-under-lock design must be exactly
-   right or a subscriber can double-receive or drop an event at the
-   subscribe/publish race boundary — worked through in the Intake Grill's
-   evidence section; validation needs a concurrency-shaped test, not just a
-   sequential one. (b) Reusing one `LLMClient` across `tokenize()`'s
-   document-wide pass and the extra per-leaf `detect()` call only avoids a
-   second network call when the extracted display text is byte-identical
-   to a leaf `tokenize()` already scanned — true for the common single-
-   string-content case, not guaranteed if a message's content is multiple
-   text blocks joined with `"\n"` (a string tokenize() never scanned as one
-   piece); accepted as a minor, documented cache-miss edge case, not a
-   correctness bug. (c) The metrics comparison cache file must never grow
-   into a de facto second vault — validation asserts it holds only
-   aggregate counts, no `Miss.value`. (d) Frontend state complexity grows
-   meaningfully (per-cycle stage maps, pin/no-pin selection, manual vs.
-   auto-follow viewed-stage index) — this is a "verify by hand" surface
-   pytest cannot reach; the manual checklist in `handoff.md` must be
-   concrete enough to actually catch a regression here.
-4. **What should be added to validation?** All the standard gates; a
-   concurrency test for the pipeline ring buffer's subscribe/publish
-   ordering; span-offset-correctness tests against a realistic multi-field
-   payload (the actual bug being fixed); comparison-cache persistence
-   across two independently-constructed handlers; partial-failure
-   (regex-succeeds-llm-fails) coverage for the comparison endpoint; a
-   detailed manual checklist for everything only a browser can show.
+   best-effort contract must be provably non-blocking, not just documented
+   as such — validation needs a test against a genuinely closed port, not
+   a mock that always succeeds instantly. (b) The hook-event schema must
+   be incapable of carrying PII by construction, addressed by making the
+   schema's only string fields fixed short labels, never freeform command/
+   output text — see Non-goals and acceptance criterion 6. (c) The
+   turn-correlation heuristic (latest open `"conversation"` cycle per
+   session) depends on single-threaded-per-session real usage; a
+   pathological interleaving (two genuinely concurrent conversations
+   somehow sharing one `session_id`) would misattribute a hook event to
+   the wrong turn — accepted as out of scope, since Claude Code does not
+   produce that shape in real use and BRIEF's own threat model already
+   scopes this project to a single developer's local session.
+4. **What should be added to validation?** All standard gates; the
+   reclassification tests; the `parent_request_id` attachment tests (with
+   an open turn, without one, and after a second conversation cycle
+   supersedes the first); the new endpoint's three response shapes (known
+   turn, no turn, malformed body); the best-effort-timeout test against an
+   actually unreachable port; a schema test proving extra fields are
+   ignored, not stored or forwarded; the manual demo-run checklist for
+   what only a browser can show (the live spinner states, the chronological
+   ordering "reading right").
 5. **What is explicitly not needed now?** Any core detection/vault/
-   tokenizer change; disk persistence of the pipeline-stream itself; a new
-   auth layer; animation polish beyond the specific step-through ask;
-   surfacing raw missed-value detail in the comparison tab.
+   tokenizer change; authentication on the new endpoint; retries or
+   queuing for the best-effort hook report; raising the 20-cycle ring
+   buffer bound; any change to `title_generation`/`internal_continuation`
+   classification or hiding.
 
 ## Status
 
 implemented — awaiting human review for merge (see `.harness/handoff.md`).
 
-Reopened and re-closed 2026-09-08: the human live-tested the
-`_classify_cycle_kind` fix below (their own prior approval) and reported
-it over-hides real conversation, and that the Input pane still shows
-injected wrapper text (`<session>...</session>`, etc.) instead of exactly
-what they typed. This was a regression fix against this mission's own
-already-approved scope (same file, same functions), not new scope, so it
-proceeded under the existing approval rather than a fresh Intake Grill
-round. Root cause: `_classify_cycle_kind`'s `internal_continuation` check
-used `received_text.strip().lower().startswith("<system-reminder")` —
-true for *any* real conversational turn where Claude Code happens to
-prepend a `<system-reminder>` block before the human's own typed text
-(the common case, confirmed by this very session's own transcript shape),
-not just for a turn that is *entirely* reminder content. Fixed by
-stripping known Claude-Code-injected wrapper tags (`<system-reminder>`,
-`<local-command-caveat>`, `<command-name>`, `<command-message>`,
-`<command-args>`, `<local-command-stdout>`, `<session>`) out of the
-*displayed* text via a new `_strip_injected_wrapper_tags`, applied to
-`received_text`/`outbound_text` before they're shown or classified;
-`internal_continuation` now fires only when nothing human-authored
-survives that stripping, not on a mere prefix match. Re-verified: full
-`.harness/bin/verify` (exit 0) plus a live capture through a real gateway
-process and a separate `claude -p` call (see `.harness/handoff.md`).
+Reopened 2026-09-09: the human live-tested the first cut (real gateway +
+real `PreToolUse`/`PostToolUse` hooks + a real `claude -p --demo-db`
+session, not the synthetic curl/browser smoke test the original
+implementation pass used) and reported the conversation was still
+splitting across several chips, screenshot attached. Proceeded under the
+existing approval as a regression-fix-and-revision against this mission's
+own already-approved scope, not a fresh Intake Grill round — same reasoning
+mission-11's own reopening used.
 
-The same live session surfaced a second, distinct, NOT-yet-fixed issue
-(the human's separately reported "el formato es erróneo" report) — see
-`.harness/handoff.md`'s "Live investigation of the reported output-format
-issue" section and "Remaining for human follow-up" below. It is
-out-of-scope for this reopening: it is not a defect in text
-extraction/substitution (both are byte-for-byte correct, live-confirmed)
-but a cross-cycle UX gap needing its own scoping conversation.
+Root causes, all found by capturing real pipeline-stream traffic from that
+live session (raw data preserved in `.harness/handoff.md`):
 
----
+1. Claude Code's own internal harm/safety-classifier request (fires
+   roughly once per tool call: `<transcript>{...}</transcript>` as the
+   last user message, `Respond with <severity>N</severity>` as an
+   instruction *outside* that tag) read as an ordinary `"conversation"`
+   cycle and repeatedly stole the turn-tracking pointer mid-turn,
+   misattributing hook events to the wrong screen. Fixed: a new
+   `"safety_check"` kind (`_SAFETY_CLASSIFIER_MARKER`), hidden by default
+   like `title_generation`.
+2. The same real human turn legitimately produced more than one
+   independent, complete `"conversation"` round-trip with byte-identical
+   received text (observed live). The original "most recent conversation
+   cycle wins" pointer split those across two chips instead of folding
+   them. Fixed: turns are now keyed by `(session_id, received_text)` --
+   a same-text cycle folds under the first one seen, not the most recent.
+3. A burst of auxiliary-kind cycles (mostly the safety-check calls in
+   finding 1, before finding 1's own fix) was enough to evict the *real*
+   conversation cycle from `PipelineEventBus`'s single shared 20-slot ring
+   buffer before a freshly-opened panel ever saw it -- reproduced live with
+   zero chips shown for a completed, successful query. Fixed: hidden-kind
+   cycles now evict from their own separate ring buffer
+   (`_aux_order`/`_AUXILIARY_CYCLE_KINDS`), on both the gateway and the
+   frontend, so they can never crowd out a real turn's budget.
 
-implemented — awaiting human review for merge (see `.harness/handoff.md`).
+New, scope-expanding ask from the same reopening: keep the four classic
+panes (Input/Outbound/API response/Developer view) as the panel's main
+content, and move the mission-13 Timeline into a left sidebar instead of
+replacing the panes outright. Implemented; see `.harness/handoff.md` for
+the live-tested screenshots and evidence.
 
-Root cause of the three live-testing observations, confirmed by capturing
-raw traffic through a throwaway diagnostic proxy that bypassed this
-module's own extraction entirely: all three are genuine Claude Code
-requests, not bugs. (1)/(3) `<session>...</session>` plus "write a title"
-plus a `{"title": "..."}` response is Claude Code's own dedicated
-session-title-generation request — its own system prompt literally says
-"You are naming a coding session...". (2) The `<system-reminder>` cycle is
-a real agent-loop continuation turn (token-budget reminders, tool
-results), not human-authored input. Both are legitimate but not
-conversational, so the fix is: classify each cycle server-side
-(`_classify_cycle_kind` in `adapters/gateway/server.py`, a new `"kind"`
-field on every pipeline-stage event) and hide `"title_generation"`/
-`"internal_continuation"` cycles from the panel's selector by default,
-with a "Show N hidden" toggle to reveal them. Covered by three new tests
-in `TestCycleKindClassification` (`tests/test_gateway.py`) and re-verified
-live with a second Playwright pass, which also caught and fixed a real,
-unrelated latent bug: the "Jump to latest" button never actually moved the
-selection, only recomputed the pinned flag against whatever was already
-selected.
+Reopened again 2026-09-09 (same day, immediate follow-up): the human
+clarified the four panes' intended meaning after seeing the first sidebar
+cut, which wired a sidebar row click to *change* what the panes show
+(click-to-focus-a-round). That contradicts what the human actually wants:
+the four panes are a fixed view of the *turn's own boundary* -- panel 1/2
+always the turn's first round (the human's real input, and that input
+tokenized), panel 3/4 always the turn's latest completed round (the API's
+raw answer, and that answer resolved) -- never whatever round happens to
+be expanded in the sidebar. Confirmed explicitly before implementing (per
+CLAUDE.md's Intake Grill spirit, since this reverses a design decision
+from earlier the same day) then implemented: removed the sidebar-click-
+focuses-panes wiring (`focusedRoundId`/`onFocusRound`/the "jump to latest
+round" button) entirely; `Panes` now takes `firstCycle`/`lastCycle`
+computed once from the selected turn's own round list, never from
+sidebar interaction. The sidebar itself (row list, inline expand,
+hook markers, live spinners) is otherwise untouched, per explicit
+instruction to leave it as-is. Re-verified live against a fourth real
+`claude -p --demo-db` session: one chip, panes show input/final-answer,
+expanding a "Tool round" sidebar row leaves the panes byte-for-byte
+unchanged, no "jump to latest" button rendered, zero console errors.

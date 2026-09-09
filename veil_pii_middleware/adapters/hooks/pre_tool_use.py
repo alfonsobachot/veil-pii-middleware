@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import sys
 
+from veil_pii_middleware.adapters.hooks._panel_report import report
 from veil_pii_middleware.adapters.hooks._paths import VAULT_DB_PATH
 from veil_pii_middleware.adapters.hooks._scope import is_demo_db_command
 from veil_pii_middleware.core.tokenizer import JSONValue, detokenize
@@ -61,18 +62,24 @@ def main() -> int:
         print("pre_tool_use: missing session_id, blocking", file=sys.stderr)
         return 2
 
+    # Best-effort only -- see adapters/hooks/_panel_report.py's own
+    # docstring. Never raises, never affects anything below.
+    report(session_id, "pre_tool_use", "start", "Bash")
+
     try:
         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with Vault(VAULT_DB_PATH, session_id) as vault:
             detokenized = detokenize(command, vault)
     except Exception:
         print("pre_tool_use: detokenization failed, blocking", file=sys.stderr)
+        report(session_id, "pre_tool_use", "error", "Bash")
         return 2
 
     if not isinstance(detokenized, str):
         # detokenize() always returns a str for a str input; this only
         # guards mypy's narrowing and would indicate a core/ contract break.
         print("pre_tool_use: detokenization failed, blocking", file=sys.stderr)
+        report(session_id, "pre_tool_use", "error", "Bash")
         return 2
 
     updated_input: JSONValue = {**tool_input, "command": detokenized}
@@ -83,6 +90,7 @@ def main() -> int:
         }
     }
     sys.stdout.write(json.dumps(output))
+    report(session_id, "pre_tool_use", "done", "Bash")
     return 0
 
 
