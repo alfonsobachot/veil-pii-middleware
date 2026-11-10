@@ -1,4 +1,4 @@
-"""Best-effort progress report from a hook script to the gateway's panel (mission-13).
+"""Best-effort progress report from a hook script to the gateway's panel.
 
 Shared by ``pre_tool_use.py``/``post_tool_use.py`` so both scripts call the
 exact same, tightly-scoped reporting primitive rather than two independently
@@ -14,8 +14,8 @@ gateway from meaningfully delaying the hook itself.
 Deliberately excludes anything that could carry a command string, a tool
 response, or a tokenized/detokenized value: the only fields this module ever
 sends are ``session_id``, ``hook``, ``phase``, and a static ``tool_name`` --
-see ``adapters/gateway/server.py::_serve_hook_event``'s matching schema and
-the mission's Non-goals for why this must be true by construction, not by
+see ``adapters/gateway/server.py::_serve_hook_event``'s matching schema; this
+must be true by construction, not by
 convention (``pre_tool_use.py`` in particular exists specifically to produce
 a command containing the *real, detokenized* PII value the local DB needs to
 see, so nothing derived from that command may ever reach this module).

@@ -230,7 +230,7 @@ class TestTokenFormatOverflow:
 
 
 class TestIncrementalDetokenizer:
-    """Chunk-boundary-safe response-side detokenization (mission-8).
+    """Chunk-boundary-safe response-side detokenization.
 
     ``feed()`` is called once per incoming text chunk; ``flush()`` once at
     end of stream. Every scenario is checked against the token produced by
@@ -545,7 +545,7 @@ class TestLLMLayerWiring:
     ) -> None:
         """A misbehaving LLM endpoint must not stop the regex layer's own guarantee.
 
-        This is BRIEF acceptance criterion 4 exercised at the level a real
+        This is that guarantee exercised at the level a real
         adapter actually calls: `tokenize()` itself, not just `detect()`.
         """
         state, base_url = fake_llm_server

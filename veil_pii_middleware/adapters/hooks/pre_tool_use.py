@@ -21,8 +21,8 @@ demo db; a compound/chained command (e.g. `` rm -rf ~; sqlite3
 demo/veil_demo.db "select 1"` ``) would also match it. Pairing that with
 ``permissionDecision: "allow"`` would auto-approve the *entire* command and
 skip Claude Code's normal ask-permission prompt -- the same failure class
-the (now-closed) `/veil` mission already hit once and fixed by removing its
-`allowed-tools` wildcard grant (see `docs/missions/mission-5/handoff.md`).
+the `/veil` command already hit once and fixed by removing its
+`allowed-tools` wildcard grant.
 Leaving `permissionDecision` unset here means the rewritten command still
 goes through that same normal ask-permission flow before it runs.
 """

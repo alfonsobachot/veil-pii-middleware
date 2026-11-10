@@ -9,7 +9,7 @@ Studio (no `httpx` transport mocking), matching this codebase's existing
 "never assume, verify the real behavior" testing style for the gateway
 adapter -- these tests prove `detect_llm`/`detect`'s own contract logic
 (offset recovery, fail-closed, caching). A real LM Studio instance was also
-live-tested against this code (2026-09-08, see `.harness/handoff.md`), which
+live-tested against this code (2026-09-08), which
 is what surfaced `test_request_omits_response_format` below.
 """
 
@@ -529,13 +529,13 @@ class TestDetectLLM:
     def test_prompt_states_dni_vs_nie_leading_letter_rule(
         self, fake_llm: tuple[_FakeLLMState, str]
     ) -> None:
-        """BRIEF SS6, item 15: mission-10's live LM Studio run measured 0% DNI
+        """A live LM Studio run measured 0% DNI
 
         recall / 0.087 NIE precision because the prompt gave no structural
         rule to tell the two apart. The fix adds that rule to the prompt --
         this only proves the rule is present in the text sent to the model,
-        not that a real model now applies it correctly (see handoff.md for
-        the live before/after comparison).
+        not that a real model now applies it correctly (that was checked
+        separately by a live before/after comparison).
         """
         state, base_url = fake_llm
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:

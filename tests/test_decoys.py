@@ -112,7 +112,7 @@ def test_no_decoy_is_detected_under_the_real_validators(
 
 
 # --------------------------------------------------------------------------
-# BRIEF SS6, item 16: the decoy check must exercise whatever layer(s) the
+# The decoy check must exercise whatever layer(s) the
 # calling --mode enabled, not a hardcoded detect_regex() call
 # --------------------------------------------------------------------------
 
@@ -153,7 +153,7 @@ def test_evaluate_decoys_routes_through_detect_with_the_callers_flags(
 def test_evaluate_decoys_default_matches_regex_only_behavior(
     corpus: tuple[Path, Path, Path],
 ) -> None:
-    """Omitting use_regex/use_llm/llm_client (every pre-mission caller) must
+    """Omitting use_regex/use_llm/llm_client (every pre-existing caller) must
     reproduce today's regex-only behavior exactly.
     """
     db_path, _, decoys_path = corpus

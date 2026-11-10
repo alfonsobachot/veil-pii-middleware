@@ -378,8 +378,7 @@ from a live run against this repo's current code and a real LM Studio instance
 (`qwen_qwen3-4b-instruct-2507`, LAN-local), demo corpus: 20 customers, 50 users, 100 invoices,
 30 support tickets, 200 log lines, 30 webhooks.
 
-**`--mode regex`** (the only mode `.harness/bin/verify`'s gate is bound to — `--min-recall 1.0`,
-`--max-false-positives 0`):
+**`--mode regex`** (the gated mode — `--min-recall 1.0`, `--max-false-positives 0`):
 
 ```
 entity      support   found  missed    fp   recall    prec
@@ -436,12 +435,8 @@ actually mean.
 
 ## 9. Known limitations and open items
 
-This project tracks its own risk register in `docs/private/BRIEF.md` (design-of-record,
-git-ignored) and in each mission's archived `docs/missions/mission-N/handoff.md`. The items
-below are the ones still genuinely open, cross-checked directly against the current code
-(some rows in BRIEF's own risk table were superseded by a later mission and are stale in that
-document even though the underlying issue was fixed — this list reflects the code, not the
-document).
+The items below are the ones still genuinely open, cross-checked directly against the
+current code.
 
 **Genuinely open:**
 
@@ -453,9 +448,9 @@ document).
   deliberately-wrong DNI/NIE control letter, a Luhn-failing card number, and a mod-97-failing
   IBAN as real PII (`demo/eval.py`'s decoy check, §8's `--mode union`/`--mode llm` failures) —
   unsurprising, since nothing in its prompt asks it to verify a check digit; that's exactly
-  what the regex validators are for. Invisible to `.harness/bin/verify`'s own gate, which runs
-  `--mode regex` (`evaluate_decoys(use_llm=False)`) — it only surfaces when a human explicitly
-  runs `--mode llm`/`--mode union` with an LLM configured.
+  what the regex validators are for. Invisible to the `--mode regex` gate
+  (`evaluate_decoys(use_llm=False)`) — it only surfaces when a human explicitly runs
+  `--mode llm`/`--mode union` with an LLM configured.
 - **This specific model confuses DNI vs. NIE labeling.** It reliably finds the right span but
   sometimes mislabels a DNI as a NIE despite the prompt's explicit structural rule (§4) — DNI
   recall in `--mode llm`-only stays below 1.0 (currently ~0.70; started at 0.000 before the

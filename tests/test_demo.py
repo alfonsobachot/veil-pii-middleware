@@ -110,7 +110,7 @@ def test_person_names_are_reported_as_an_open_gap(corpus: tuple[Path, Path]) -> 
 
 
 # --------------------------------------------------------------------------
-# llm_client_from_env (mission-12: renamed from a private helper so the
+# llm_client_from_env (renamed from a private helper so the
 # gateway's metrics-comparison endpoint can reuse it instead of duplicating
 # this env-reading logic a third time)
 # --------------------------------------------------------------------------

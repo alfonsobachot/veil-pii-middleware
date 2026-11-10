@@ -34,7 +34,7 @@ _TEST_KEY_B64 = base64.b64encode(os.urandom(32)).decode()
 VALID_EMAIL = "alice@example.com"
 
 #: Hook-shaped test session id (deliberately not `gateway-<uuid>`-shaped) --
-#: mission-9's fix reconciles the gateway's vault keying with exactly this
+#: the session-id fix reconciles the gateway's vault keying with exactly this
 #: kind of id, the same one `pre_tool_use.py`/`post_tool_use.py` read from a
 #: real hook payload's `session_id`.
 HOOK_SESSION_ID = "hooks-11111111-1111-1111-1111-111111111111"
@@ -51,8 +51,8 @@ def _post(
 ) -> httpx.Response:
     """``httpx.post`` that attaches ``X-Claude-Code-Session-Id`` by default.
 
-    Real Claude Code traffic always carries this header (mission-7's live
-    spike); defaulting it here keeps every test in this file representative
+    Real Claude Code traffic always carries this header (confirmed in live
+    testing); defaulting it here keeps every test in this file representative
     of that, without individually editing each call site. Pass
     ``session_id=None`` to test the header-missing fallback path.
     """
@@ -278,8 +278,8 @@ class TestRequestTokenization:
 
 class TestResponseWithNoRecognizedTokenStructure:
     """Content with no ``PII_`` substring (non-JSON) or that never touched the
-    vault at all is relayed exactly as mission-7 always did -- this mission
-    only changes behavior for content that actually carries a token.
+    vault at all is relayed exactly as the original gateway always did --
+    detokenization only changes behavior for content that actually carries a token.
     """
 
     def test_large_response_relayed_byte_for_byte(self, servers: _Servers) -> None:
@@ -306,7 +306,7 @@ class TestResponseWithNoRecognizedTokenStructure:
 
 
 class TestResponseSideDetokenization:
-    """Mission-8: a token the model echoes back must resolve to its real
+    """A token the model echoes back must resolve to its real
     value before it reaches the client, in both response shapes.
     """
 
@@ -513,7 +513,7 @@ class TestResponseSideDetokenization:
 
 
 class TestSessionIdReconciliation:
-    """Mission-9 (BRIEF item 10c): a token minted by the gateway under
+    """A token minted by the gateway under
     ``X-Claude-Code-Session-Id: <sid>`` must be resolvable by anyone who
     opens a ``Vault`` with that same ``sid`` -- the same call shape
     ``pre_tool_use.py`` uses from a hook payload's ``session_id`` -- proving
@@ -574,8 +574,8 @@ class TestSessionIdReconciliation:
 
 
 class TestSessionIdFallback:
-    """Mission-9: a request with no usable ``X-Claude-Code-Session-Id``
-    header must still succeed (mission-7/8's original behavior, unchanged),
+    """A request with no usable ``X-Claude-Code-Session-Id``
+    header must still succeed (the original behavior, unchanged),
     falling back to the gateway's own per-process UUID rather than blocking
     -- universality of this header across every ``ANTHROPIC_BASE_URL``
     client, not just Claude Code, is unconfirmed, and no PII-leak risk is at
@@ -866,7 +866,7 @@ def _run_request_and_collect_pipeline_events(
 ) -> list[dict[str, Any]]:
     """POST ``body`` through the gateway, returning *this* request's own pipeline-stage events.
 
-    Mission-12's ring buffer means a subscriber connecting now may also
+    The pipeline ring buffer means a subscriber connecting now may also
     receive backlog from earlier, unrelated cycles this same test already
     ran (e.g. to mint a token first) -- so this filters down to the events
     sharing the request id of the very last event captured, which is always
@@ -1100,7 +1100,7 @@ class TestMetricsEndpoint:
 
 
 class TestCycleKindClassification:
-    """Mission-12 follow-up: label a cycle so the panel can hide non-conversational ones.
+    """Label a cycle so the panel can hide non-conversational ones.
 
     Found via a throwaway raw-capture proxy (bypassing this module's own
     extraction entirely) against real Claude Code traffic: a session-
@@ -1216,7 +1216,7 @@ class TestCycleKindClassification:
             assert event["kind"] == "conversation", stage
 
     def test_internal_safety_classifier_request_is_classified(self, servers: _Servers) -> None:
-        """Mission-13, found live against a real ``claude -p --demo-db`` session.
+        """Found live against a real ``claude -p --demo-db`` session.
 
         Claude Code's own harm/safety classifier wraps a JSON transcript
         summary in ``<transcript>...</transcript>`` as the *last user
@@ -1224,8 +1224,8 @@ class TestCycleKindClassification:
         the instruction text sits *outside* the tag, so stripping known
         wrapper tags alone does not empty this message the way it does for
         ``<system-reminder>``. Before this fix it read as an ordinary
-        ``"conversation"`` and stole mission-13's turn-tracking pointer
-        away from the real conversation (see ``.harness/handoff.md``).
+        ``"conversation"`` and stole the turn-tracking pointer
+        away from the real conversation.
         """
         body = {
             "messages": [
@@ -1298,10 +1298,10 @@ class TestExcludedMetadataNeverTokenized:
 
 
 class TestMessageTextExtraction:
-    """Mission-12: panes must show the human message, not the raw JSON document.
+    """Panes must show the human message, not the raw JSON document.
 
     ``core/tokenizer.py``'s ``Span`` offsets are per string-leaf, not per
-    whole-document -- these tests exist because the pre-mission-12 code
+    whole-document -- these tests exist because the earlier code
     sliced them into the whole document text anyway, which is the concrete
     reason the panel read as illegible garbage for any real payload.
     """
@@ -1409,7 +1409,7 @@ class TestMessageTextExtraction:
 
 
 class TestResponseTextExtraction:
-    """Mission-12: the response panes reconstruct display text, never wire framing."""
+    """The response panes reconstruct display text, never wire framing."""
 
     def _mint_email_token(self, servers: _Servers) -> str:
         _post(
@@ -1502,7 +1502,7 @@ class TestResponseTextExtraction:
 
 
 class TestPipelineHistoryBuffer:
-    """Mission-12: a panel opened after cycles already ran must still see them."""
+    """A panel opened after cycles already ran must still see them."""
 
     def test_late_subscriber_receives_already_completed_cycles_oldest_first(
         self, servers: _Servers
@@ -1535,13 +1535,13 @@ class TestPipelineHistoryBuffer:
         assert received_texts == [f"turn {i}" for i in range(2, total)]
 
     def test_auxiliary_kind_burst_never_evicts_a_real_turn(self) -> None:
-        """Mission-13, found live: a single real conversation with several
+        """Found live: a single real conversation with several
 
         tool round-trips produced enough interleaved ``"safety_check"``
         cycles (Claude Code's own harm classifier, observed firing roughly
         once per tool call) to evict the real conversation cycle from a
-        single shared 20-slot ring buffer before the panel ever connected
-        -- see ``.harness/handoff.md``. ``"safety_check"``/``"title_generation"``/
+        single shared 20-slot ring buffer before the panel ever connected.
+        ``"safety_check"``/``"title_generation"``/
         ``"internal_continuation"`` now evict from their own separate
         buffer, so a real ``"conversation"`` cycle published once, however
         many auxiliary-kind cycles follow it, must always survive.
@@ -1573,7 +1573,7 @@ class TestPipelineHistoryBuffer:
 class TestPipelineEventBusConcurrency:
     """Direct unit test of the ring buffer's lock discipline (no HTTP layer).
 
-    Exercises the exact race `mission.md`'s Scrutiny Validator calls out:
+    Exercises this exact race:
     ``publish()``'s history/subscriber-snapshot and ``subscribe()``'s
     backlog-snapshot/registration must be mutually exclusive, or an event
     could be delivered to one subscriber twice (once via backlog, once
@@ -1631,7 +1631,7 @@ class TestPipelineEventBusConcurrency:
 
 
 class TestMetricsComparisonEndpoint:
-    """Mission-12: the persisted regex/LLM/union comparison the Metrics tab shows."""
+    """The persisted regex/LLM/union comparison the Metrics tab shows."""
 
     def test_cache_miss_before_any_run(self, servers: _Servers) -> None:
         resp = _get(f"{servers.gateway_url}/veil-panel/metrics/comparison")
@@ -1730,7 +1730,7 @@ class TestMetricsComparisonEndpoint:
 
 
 class TestToolContinuationClassification:
-    """Mission-13: a pure tool_result continuation must not read as a fresh conversation.
+    """A pure tool_result continuation must not read as a fresh conversation.
 
     ``_extract_last_user_message_text`` renders a bare ``tool_result`` block
     as the non-empty placeholder ``"[tool_result]"`` -- non-empty enough to
@@ -1781,7 +1781,7 @@ class TestToolContinuationClassification:
 
 
 class TestTurnTracking:
-    """Mission-13: ``PipelineEventBus`` attaches a tool_continuation cycle to its open turn.
+    """``PipelineEventBus`` attaches a tool_continuation cycle to its open turn.
 
     Direct unit tests of ``PipelineEventBus`` itself (no HTTP layer,
     matching ``TestPipelineEventBusConcurrency``'s existing pattern) --
@@ -1839,11 +1839,11 @@ class TestTurnTracking:
         assert rc_events and all(e["parent_request_id"] == "rB" for e in rc_events)
 
     def test_same_text_conversation_cycles_merge_under_one_turn(self) -> None:
-        """Mission-13 (revised after live testing): two real, independent
+        """Revised after live testing: two real, independent
 
         gateway round-trips with byte-identical received text -- observed
-        live against a real ``claude -p`` session, see
-        ``.harness/handoff.md`` -- must fold into the *same* turn rather
+        live against a real ``claude -p`` session --
+        must fold into the *same* turn rather
         than opening a second one and splitting a single logical request
         across two chips.
         """
@@ -1903,7 +1903,7 @@ class TestTurnTracking:
 
 
 class TestHookEventEndpoint:
-    """Mission-13: best-effort ingress for a hook's own live progress report."""
+    """Best-effort ingress for a hook's own live progress report."""
 
     def test_known_open_turn_publishes_a_hook_event(self, servers: _Servers) -> None:
         conversation_events = _run_request_and_collect_pipeline_events(

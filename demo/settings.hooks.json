@@ -1,9 +1,9 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
 
-  "//": "Demo-only hooks (BRIEF work-plan step 8, PreToolUse/PostToolUse). NOT auto-loaded by Claude Code -- activate explicitly for a demo run with `claude --settings demo/settings.hooks.json`. `--settings` merges additively per top-level key, but the `hooks` key itself is replaced wholesale for that session: this repo's own meta-development hooks (protect-paths.sh, mission-state-guard.sh, format.sh, etc. from .claude/settings.json) do not run while this is active. That is an accepted trade-off for a demo session, which does not edit repo files -- see README.md and .harness/mission.md.",
+  "//": "Demo-only hooks (PreToolUse/PostToolUse). NOT auto-loaded by Claude Code -- activate explicitly for a demo run with `claude --settings demo/settings.hooks.json`. `--settings` merges additively per top-level key, but the `hooks` key itself is replaced wholesale for that session: any other project or user hooks do not run while this is active. That is an accepted trade-off for a demo session, which does not edit repo files -- see README.md.",
 
-  "//permissions": "`permissions` merges additively on top of .claude/settings.json's (unlike `hooks`, replaced wholesale above), so this only adds one narrowly-scoped allow rule rather than replacing the base permission set. Needed because .claude/settings.json's own Bash allow-list has no sqlite3 entry -- without this, a non-interactive `claude -p` session (no TTY to answer an 'ask' prompt) silently denies the demo-db query instead of running it, which is what motivated adding this rule.",
+  "//permissions": "`permissions` merges additively on top of any other settings (unlike `hooks`, replaced wholesale above), so this only adds one narrowly-scoped allow rule. Without it, a non-interactive `claude -p` session (no TTY to answer an 'ask' prompt) silently denies the demo-db query instead of running it, which is what motivated adding this rule.",
   "permissions": {
     "allow": [
       "Bash(sqlite3 demo/veil_demo.db:*)"

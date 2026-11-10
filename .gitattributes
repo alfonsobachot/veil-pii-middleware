@@ -1,11 +1,6 @@
-# Harness scripts must keep LF endings.
+# Shell scripts must keep LF endings.
 #
-# A POSIX bash refuses to parse CRLF and fails with `$'\r': command not found`,
-# and the blueprint installer writes these files with CRLF on Windows. Without
-# these rules, `core.autocrlf=true` reintroduces CRLF on the next clone and the
-# hooks silently stop working for whoever checks the repo out.
+# A POSIX bash refuses to parse CRLF and fails with `$'': command not found`.
+# Without this rule, `core.autocrlf=true` reintroduces CRLF on the next clone.
 
 *.sh            text eol=lf
-.harness/bin/*  text eol=lf
-.harness/internal/* text eol=lf
-.claude/hooks/* text eol=lf

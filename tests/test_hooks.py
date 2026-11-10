@@ -284,19 +284,17 @@ class TestNoShellExecutionPrimitives:
 
 
 class TestSettingsFragmentNotWiredIntoCommittedSettings:
-    def test_settings_json_does_not_reference_demo_hooks(self) -> None:
+    def test_no_committed_settings_file_wires_the_demo_hooks(self) -> None:
+        """The demo hooks only load via an explicit `--settings demo/settings.hooks.json`."""
         root = Path(__file__).parent.parent
-        settings = (root / ".claude" / "settings.json").read_text(encoding="utf-8")
-        assert "pre_tool_use.py" not in settings
-        assert "post_tool_use.py" not in settings
-        assert "demo/settings.hooks.json" not in settings
-
-    def test_settings_local_example_does_not_reference_demo_hooks(self) -> None:
-        root = Path(__file__).parent.parent
-        example = (root / ".claude" / "settings.local.json.example").read_text(encoding="utf-8")
-        assert "pre_tool_use.py" not in example
-        assert "post_tool_use.py" not in example
-        assert "demo/settings.hooks.json" not in example
+        for name in ("settings.json", "settings.local.json.example"):
+            path = root / ".claude" / name
+            if not path.exists():
+                continue
+            settings = path.read_text(encoding="utf-8")
+            assert "pre_tool_use.py" not in settings
+            assert "post_tool_use.py" not in settings
+            assert "demo/settings.hooks.json" not in settings
 
     def test_settings_hooks_json_is_valid_and_has_only_hooks_and_permissions(self) -> None:
         root = Path(__file__).parent.parent
@@ -314,7 +312,7 @@ class TestGitignoreCoversVault:
 
 
 class TestPanelReportBestEffort:
-    """Mission-13: the hooks' new panel-reporting call must never affect the hook itself.
+    """The hooks' panel-reporting call must never affect the hook itself.
 
     ``_panel_report.report`` is additive observability plumbing only -- see
     its own module docstring. These tests prove the best-effort contract

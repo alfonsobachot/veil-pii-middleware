@@ -45,8 +45,6 @@ packages = ["veil_pii_middleware"]
 target-version = "py311"
 line-length = 100
 src = ["veil_pii_middleware", "tests"]
-# Vendored harness tooling: upstream code, not ours to restyle.
-extend-exclude = [".harness"]
 
 [tool.ruff.lint]
 select = [

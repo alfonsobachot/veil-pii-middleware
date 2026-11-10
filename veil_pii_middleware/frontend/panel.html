@@ -112,7 +112,7 @@
   }
   #show-internal-toggle.active { color: var(--text); border-color: var(--stage-active); }
 
-  /* mission-13 (revised): the four panels stay the main content -- one
+  /* The four panels stay the main content -- one
      scrolling Timeline sits in a left sidebar next to them, one entry per
      turn stage/hook marker/round, click-to-focus which round the panels
      show (see `#live-main`/`#panes` below). */
@@ -277,11 +277,11 @@ const { useState, useEffect, useRef, useCallback } = React;
 // of how they're grouped for display below.
 const STAGES = ["received", "tokenized", "forwarded", "response_received", "detokenized", "displayed"];
 
-// mission-13: a turn (one logical user request, however many gateway/tool
+// A turn (one logical user request, however many gateway/tool
 // round-trips it took) renders as one scrolling Timeline instead of a fixed
 // six-box diagram for a single cycle -- see `buildTimelineEntries` below.
 // Per-stage label/renderer, keyed by the same raw stage name the server
-// publishes; `render` mirrors the pre-mission-13 `Panes` component's own
+// publishes; `render` mirrors the earlier `Panes` component's own
 // per-stage rendering so a stage's content looks the same, just reached by
 // expanding its row instead of by stepping a fixed pipeline diagram.
 // `render` optionally takes the same round's tokenized pre-image text (only
@@ -458,7 +458,7 @@ function cycleIsComplete(cycle) {
   return STAGES.every((stage) => cycle.stages[stage]);
 }
 
-// mission-13: a cycle is its own top-level turn (gets a chip) unless it is
+// A cycle is its own top-level turn (gets a chip) unless it is
 // a tool_result continuation whose parent turn is still around in `cycles`
 // -- the documented fallback for an orphaned continuation (no parent ever
 // seen, or the parent has since been evicted from the ring buffer) is to
@@ -466,7 +466,7 @@ function cycleIsComplete(cycle) {
 // else in the panel shows.
 function isTopLevelCycle(cycle, cycles) {
   if (!cycle) return false;
-  // mission-13 (revised after live testing): a cycle folds into another
+  // Revised after live testing: a cycle folds into another
   // turn's timeline whenever it has a *resolvable* parent, regardless of
   // its own kind -- not just a "tool_continuation" child, but also a
   // same-text sibling "conversation" cycle the turn-tracking merged in
@@ -531,14 +531,14 @@ function CycleSelector({ order, cycles, selectedRequestId, onSelect, hiddenCount
   );
 }
 
-// mission-13: one logical user turn can now span several raw gateway
+// One logical user turn can now span several raw gateway
 // cycles (the turn's own, plus zero or more tool_continuation children
 // chained onto it) plus hook progress markers reported in between. This
 // builds one chronologically-sorted list mixing all three, replacing the
 // old fixed six-stage-diagram-for-one-cycle view.
 // The turn's own cycle plus every child cycle folded into it (a
 // tool_continuation, or a same-text sibling "conversation" the revised
-// mission-13 turn-tracking merges in) -- shared by `buildTimelineEntries`
+// turn-tracking merges in) -- shared by `buildTimelineEntries`
 // and `LiveTab`'s own "which round do the four panes show" logic, so both
 // always agree on the same round order.
 function getRoundIds(cycles, turnRequestId) {
@@ -640,8 +640,8 @@ function TimelineRow({ entry, isOpen, onToggle }) {
   }
   const info = STAGE_TIMELINE[entry.stage];
   // A round beyond the first is either a tool_result continuation or a
-  // same-text sibling conversation the turn-tracking merged in (mission-13,
-  // revised after live testing) -- label it honestly either way.
+  // same-text sibling conversation the turn-tracking merged in (revised
+  // after live testing) -- label it honestly either way.
   const roundPrefix =
     entry.roundIndex === 0
       ? ""
@@ -699,7 +699,7 @@ function Timeline({ turnRequestId, cycles }) {
 }
 
 // The four panels represent the *turn's* own boundary, not whichever round
-// is expanded in the sidebar (mission-13, second revision, per explicit
+// is expanded in the sidebar (second revision, per explicit
 // human request): panel 1/2 always come from the turn's own first round
 // (what the human actually typed, and that same text tokenized) and panel
 // 3/4 always come from the turn's latest completed round (the final answer
@@ -754,7 +754,7 @@ function Panes({ firstCycle, lastCycle }) {
 const MAX_AUDIT_ROWS = 50;
 
 function AuditLogPane() {
-  // Consumes /veil-panel/audit-stream directly (BRIEF SS5: "a panel that
+  // Consumes /veil-panel/audit-stream directly (by design, "a panel that
   // consumes the audit log over SSE") -- structurally separate from the
   // pipeline-stream feeding the four panes above: every row here is exactly
   // what core/audit.py ever writes (token, type, detector, offset, adapter,
@@ -926,7 +926,7 @@ function ModeReport({ mode, report }) {
 }
 
 function MetricsTab() {
-  // Regex/LLM/union comparison (mission-12). The llm/union modes are
+  // Regex/LLM/union comparison. The llm/union modes are
   // genuinely expensive (one real LLM call per manifest entry), so this
   // never runs on its own -- it shows whatever was last persisted to
   // `.veil/metrics_comparison.json` (surviving a gateway restart) until
@@ -987,7 +987,7 @@ function MetricsTab() {
 
 function LiveTab({ hidden }) {
   const [cycles, setCycles] = useState({});
-  // mission-13 (revised after live testing): two independent, independently-
+  // Revised after live testing: two independent, independently-
   // capped orders, mirroring gateway_server.PipelineEventBus's own
   // `_order`/`_aux_order` split -- a burst of hidden-kind cycles (Claude
   // Code's own internal safety-classifier calls, observed live firing once
@@ -1053,7 +1053,7 @@ function LiveTab({ hidden }) {
     if (isNewCycle) {
       // Pinning to "latest" only ever follows a cycle that would get its
       // own chip: a real conversational turn, or an orphaned
-      // tool_continuation with no resolvable parent (mission-13's
+      // tool_continuation with no resolvable parent (the
       // documented fallback) -- never a hidden session-title/internal-
       // agent-loop cycle, and never a tool_continuation that is about to
       // fold into an already-visible parent turn's timeline instead of
@@ -1066,7 +1066,7 @@ function LiveTab({ hidden }) {
       // sync, which previously caused a freshly-arrived child's parent to
       // look not-yet-known even though its own "received" event had
       // already been processed earlier in the very same burst.
-      // mission-13 (revised): the server only ever sets `parent_request_id`
+      // The server only ever sets `parent_request_id`
       // when this cycle really does fold into another turn -- a
       // tool_continuation child, or a same-text sibling "conversation" the
       // turn-tracking merged in -- so no `kind` check is needed here.

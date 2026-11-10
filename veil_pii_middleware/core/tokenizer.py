@@ -373,7 +373,7 @@ class IncrementalDetokenizer:
     """Chunk-boundary-safe ``detokenize`` for a single streaming text source.
 
     Anthropic's streaming responses can split a token's text across two
-    separate deltas (confirmed live against the real API, mission-8); this
+    separate deltas (confirmed live against the real API); this
     class buffers only what might be an in-progress token and resolves
     everything else immediately, so a caller relaying a stream chunk by
     chunk never emits a partial or literal token.

@@ -400,8 +400,8 @@ DEFAULT_LLM_TIMEOUT_SECONDS: Final = 10.0
 
 _ENTITY_TYPE_NAMES: Final = tuple(entity_type.value for entity_type in EntityType)
 
-#: Per-type structural/format rules, added 2026-09-08 (BRIEF SS6, work-plan
-#: item 15) after mission-10's live LM Studio verification measured 0% DNI
+#: Per-type structural/format rules, added 2026-09-08
+#: after a live LM Studio verification measured 0% DNI
 #: recall / 0.087 NIE precision: the model reliably found the right span but
 #: mislabeled its entity type whenever two types are structurally close, with
 #: no rule in the prompt to go on. Each line states the one distinguishing
@@ -467,10 +467,10 @@ _SYSTEM_PROMPT: Final = (
 )
 
 
-#: System prompt for ``LLMClient.confirm_person_candidates`` (mission
-#: follow-up, 2026-09-09). Deliberately a *separate*, much smaller task from
+#: System prompt for ``LLMClient.confirm_person_candidates`` (added
+#: 2026-09-09). Deliberately a *separate*, much smaller task from
 #: ``_SYSTEM_PROMPT``'s full-block span extraction: live evidence
-#: (``.harness/handoff.md``) showed the main extraction call can correctly
+#: showed the main extraction call can correctly
 #: find every DNI/IBAN/phone/card in a dense block while still missing a
 #: person's name sitting in the same block, at temperature 0 -- so a retry
 #: of the *same* request would deterministically reproduce the same miss.
@@ -782,7 +782,7 @@ def _confirm_missed_person_candidates(
 ) -> list[Span]:
     """Best-effort second pass for a person's name the main LLM call missed.
 
-    Live evidence (2026-09-09, ``.harness/handoff.md``) showed the main
+    Live evidence (2026-09-09) showed the main
     ``detect_llm`` call can correctly find every DNI/IBAN/phone/card in a
     dense block while still missing a person's name in that same block, at
     temperature 0 -- so simply retrying ``detect_llm`` would deterministically

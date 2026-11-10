@@ -8,7 +8,7 @@ otherwise-untouched method/path/headers (including auth).
 
 The response is rewritten on the way back so a token the model echoes (e.g.
 ``PII_EMAIL_0001``) resolves to its real value before it reaches the client
-(mission-8; mission-7 relayed the response untouched as an explicit,
+(an earlier version relayed the response untouched as an explicit,
 documented scope cut). Two response shapes are handled, both via
 ``core/tokenizer.py`` -- this module never re-implements detection or
 substitution, only wires ``core/`` into the transport:
@@ -16,7 +16,7 @@ substitution, only wires ``core/`` into the transport:
 - **Streaming (``text/event-stream``)**: each ``content_block_delta`` event's
   text-bearing field is fed through a ``core.tokenizer.IncrementalDetokenizer``
   keyed by ``content_block_index``, live-verified against the real Anthropic
-  API (mission-8 spike) to confirm the event/delta shapes below and that an
+  API to confirm the event/delta shapes below and that an
   SSE ``data:`` line is always one complete JSON event -- a token can only
   split across the *text* of two such events, never mid-JSON. Any leftover
   buffered text is flushed into a synthetic extra delta event right before
@@ -24,7 +24,7 @@ substitution, only wires ``core/`` into the transport:
 - **Buffered JSON (anything else that parses as JSON)**: detokenized in one
   shot via ``core.tokenizer.detokenize_lenient()``.
 - **Anything else** (non-JSON, non-SSE): relayed byte-for-byte untouched,
-  same as mission-7's original behavior -- there is nothing to safely
+  same as the gateway's original behavior -- there is nothing to safely
   detokenize about content with no recognized token-bearing structure.
 
 A token that fails to resolve (e.g. minted under a different gateway
@@ -40,10 +40,10 @@ forwarding the original bytes upstream unscanned.
 
 Keyed per request by the real Claude Code ``session_id``, read from the
 ``X-Claude-Code-Session-Id`` request header (confirmed present on every
-outbound Claude Code request by mission-7's live spike) -- the same id
+outbound Claude Code request in live testing) -- the same id
 ``PreToolUse``/``PostToolUse`` already use from their own hook payload's
 ``session_id``. This is what lets a token minted by the gateway resolve
-under a hook, and vice versa (mission-9/BRIEF item 10c): before this, the
+under a hook, and vice versa: before this, the
 gateway minted its own ``gateway-<uuid>`` once per process, unresolvable by
 either hook. Each request already opens its own ``Vault(...)`` (see
 ``_tokenize_body``, ``_relay_sse_response``, ``_relay_buffered_response``),
@@ -61,7 +61,7 @@ request. Two concurrent gateway processes still do not share a token
 vocabulary with each other in the no-header/fallback case; that remains an
 accepted scope limitation.
 
-Also serves BRIEF SS5's observability panel under the reserved
+Also serves the observability panel under the reserved
 ``/veil-panel`` path prefix, intercepted before the proxy pass-through
 above: a static, unbuilt frontend page; an SSE tail of the shared
 ``core/audit.py`` JSONL (written by this process and by the hook/`/veil`
@@ -69,9 +69,9 @@ adapters, so the panel sees every adapter's activity); a *separate*,
 in-memory-only SSE stream of pipeline-stage-transition events
 (``PIPELINE_STAGES``) this process publishes for its own request/response
 cycles -- structurally distinct from the audit log because it carries
-human-readable request/response *display* text (mission-12: the last user
+human-readable request/response *display* text (the last user
 turn's own text, and the model's reconstructed reply text -- never the
-whole raw JSON document or SSE wire framing) that BRIEF's four panes need
+whole raw JSON document or SSE wire framing) that the panel's four panes need
 to show, which the audit log deliberately never does. That stream keeps a
 bounded ring buffer of the last ``PIPELINE_HISTORY_LIMIT`` cycles
 (``PipelineEventBus``) so a panel tab opened against an already-running
@@ -83,7 +83,7 @@ regex/LLM/union metrics *comparison* persisted to
 an explicit POST, and survives a gateway restart). None of this adds
 authentication beyond the gateway's existing ``127.0.0.1``-only bind.
 
-Mission-13 additionally groups pipeline-stage events into *turns*: a
+It additionally groups pipeline-stage events into *turns*: a
 tool_result-only continuation cycle (``_classify_cycle_kind``'s
 ``"tool_continuation"``) is tagged with its parent conversation cycle's
 ``request_id`` (``PipelineEventBus``'s per-session "open turn" tracking) so
@@ -145,8 +145,8 @@ VAULT_DB_PATH = Path(".veil") / "vault.db"
 #: show every adapter's activity, not just the gateway's own.
 AUDIT_LOG_PATH = Path(".veil") / "audit.jsonl"
 
-#: Persisted cache of the last regex/LLM/union metrics comparison (mission-12
-#: item), git-ignored like every other ``.veil/`` file. Running the LLM/union
+#: Persisted cache of the last regex/LLM/union metrics comparison,
+#: git-ignored like every other ``.veil/`` file. Running the LLM/union
 #: modes is expensive (one real LLM call per manifest entry), so the panel's
 #: Metrics tab shows whatever was last written here rather than recomputing
 #: on every page load, and this file survives a gateway restart -- unlike the
@@ -154,7 +154,7 @@ AUDIT_LOG_PATH = Path(".veil") / "audit.jsonl"
 METRICS_COMPARISON_PATH = Path(".veil") / "metrics_comparison.json"
 
 #: Reserved path prefix for the observability panel's own HTTP surface
-#: (BRIEF SS5) -- checked before the unconditional upstream-proxy pass-through,
+#: -- checked before the unconditional upstream-proxy pass-through,
 #: so a panel request never reaches the real API and a real API path can
 #: never collide with it (no Anthropic endpoint starts with this segment).
 _PANEL_PREFIX: Final = "/veil-panel"
@@ -164,10 +164,10 @@ _PANEL_PREFIX: Final = "/veil-panel"
 _AUDIT_TAIL_POLL_SECONDS: Final = 0.25
 
 #: Pipeline-stage names published on the in-memory SSE stream, in the order
-#: BRIEF SS5's requested flow diagram lists them. Structurally separate from
+#: the panel's flow diagram lists them. Structurally separate from
 #: AuditLog's JSONL: these carry the actual request/response text (needed to
-#: render BRIEF's four panes) and are never persisted -- see the mission's
-#: Intake Grill decision on why the two streams do not share a schema.
+#: render the panel's four panes) and are never persisted, which is why the
+#: two streams deliberately do not share a schema.
 PIPELINE_STAGES: Final = (
     "received",
     "tokenized",
@@ -180,31 +180,30 @@ PIPELINE_STAGES: Final = (
 #: How many completed request/response cycles ``PipelineEventBus`` keeps
 #: buffered in memory (oldest evicted first) so a panel tab opened against
 #: an already-running gateway can see recent history instead of nothing --
-#: see the module docstring and the mission's Intake Grill. Matches the
+#: see the module docstring. Matches the
 #: frontend's own cycle-selector cap; both sides must agree on this number.
 PIPELINE_HISTORY_LIMIT: Final = 20
 
 #: Cycle kinds that are real Claude Code requests but never human-authored
-#: conversation (mission-11/12/13's ``_classify_cycle_kind``) -- the
-#: panel hides them from the selector by default, and, as of mission-13's
+#: conversation (``_classify_cycle_kind``) -- the
+#: panel hides them from the selector by default, and, after a
 #: live-testing fix, they also get their *own* ``PIPELINE_HISTORY_LIMIT``-
 #: sized ring buffer (``PipelineEventBus._aux_order``) entirely separate
 #: from real turns' (``_order``). Found live: a single real conversation
 #: with several tool round-trips produced enough interleaved
 #: ``"safety_check"`` cycles (Claude Code's own harm classifier, one per
 #: tool call) to evict the real conversation's own cycle from a single
-#: shared 20-slot buffer before the panel ever connected -- see
-#: `.harness/handoff.md`. Must mirror the frontend's own ``HIDDEN_KINDS``
+#: shared 20-slot buffer before the panel ever connected. Must mirror the
+#: frontend's own ``HIDDEN_KINDS``
 #: constant exactly; both sides need to agree on what counts as noise.
 _AUXILIARY_CYCLE_KINDS: Final = frozenset(
     {"title_generation", "safety_check", "internal_continuation"}
 )
 
 #: Allowed values for ``POST /veil-panel/hook-event``'s ``hook``/``phase``
-#: fields (mission-13) -- a fixed, small enum, not freeform text, so the
+#: fields -- a fixed, small enum, not freeform text, so the
 #: schema stays structurally incapable of carrying a command string or tool
-#: output (see the mission's Non-goals on why this must be true by
-#: construction, not by convention).
+#: output (this must be true by construction, not by convention).
 _ALLOWED_HOOK_NAMES: Final = frozenset({"pre_tool_use", "post_tool_use"})
 _ALLOWED_HOOK_PHASES: Final = frozenset({"start", "done", "error"})
 
@@ -234,19 +233,19 @@ class PipelineEventBus:
     regardless of how the two calls interleave across threads. Still purely
     in-memory: a process restart loses it, same as before this buffer.
 
-    **Two separate ring buffers, not one (mission-13, found live).** A
+    **Two separate ring buffers, not one (found live).** A
     cycle whose kind is in ``_AUXILIARY_CYCLE_KINDS`` (hidden from the
     selector by default) is evicted from its own ``_aux_order`` deque,
     entirely independent of real turns' ``_order`` -- a single shared
     20-slot buffer let a burst of Claude Code's own internal harm-classifier
     calls (one per tool call, observed live during one ordinary demo-db
     query) evict the *real* conversation cycle before a freshly-opened
-    panel ever got to see it, per ``.harness/handoff.md``.
+    panel ever got to see it.
 
-    **Turn tracking (mission-13, revised after live testing against a real
+    **Turn tracking (revised after live testing against a real
     ``claude -p`` session).** A first cut keyed the session's "open turn" by
     *the most recently seen ``"conversation"`` cycle*, full stop. Live
-    testing (see ``.harness/handoff.md``) showed that breaks two ways: (a)
+    testing showed that breaks two ways: (a)
     Claude Code's own internal harm/safety-classifier request briefly read
     as an ordinary ``"conversation"`` cycle before ``_classify_cycle_kind``
     learned to recognize it, silently stealing the pointer between two
@@ -313,7 +312,7 @@ class PipelineEventBus:
     def open_turn_for_session(self, session_id: str) -> str | None:
         """Return the ``request_id`` of ``session_id``'s currently open turn, if any.
 
-        Used by ``/veil-panel/hook-event`` (mission-13) to attach a hook's
+        Used by ``/veil-panel/hook-event`` to attach a hook's
         best-effort progress report to the right screen -- see the class
         docstring's "Turn tracking" section.
         """
@@ -389,7 +388,7 @@ def _publish_stage(
     filter a whole cycle out of the selector as soon as any one of its
     events arrives, regardless of which stage that happens to be.
 
-    ``session_id`` feeds ``PipelineEventBus``'s turn-tracking (mission-13) --
+    ``session_id`` feeds ``PipelineEventBus``'s turn-tracking --
     only meaningful the first time a given ``request_id`` is published (see
     ``PipelineEventBus.publish``), but harmless to pass on every call.
     """
@@ -414,8 +413,8 @@ def _publish_stage(
     bus.publish(event, session_id=session_id)
 
 
-#: Directory containing the static, unbuilt observability panel page (BRIEF
-#: SS5) -- plain HTML/CSS/vanilla-loaded React, no bundler, served directly
+#: Directory containing the static, unbuilt observability panel page --
+#: plain HTML/CSS/vanilla-loaded React, no bundler, served directly
 #: by this process so there is no CORS to fight (see module docstring).
 _FRONTEND_DIR: Final = Path(__file__).resolve().parent.parent.parent / "frontend"
 _PANEL_HTML_PATH: Final = _FRONTEND_DIR / "panel.html"
@@ -483,8 +482,8 @@ def _new_session_id() -> str:
     return f"gateway-{uuid.uuid4()}"
 
 
-#: Real Claude Code session id, sent on every outbound request (mission-7's
-#: live spike). Reading it lets the gateway key its ``Vault`` calls the same
+#: Real Claude Code session id, sent on every outbound request (confirmed
+#: in live testing). Reading it lets the gateway key its ``Vault`` calls the same
 #: way ``PreToolUse``/``PostToolUse`` already key theirs from the hook
 #: payload's ``session_id`` -- see the module docstring.
 SESSION_ID_HEADER = "X-Claude-Code-Session-Id"
@@ -497,7 +496,7 @@ def _resolve_session_id(handler: BaseHTTPRequestHandler, fallback_session_id: st
     whitespace; otherwise falls back to ``fallback_session_id`` (the
     per-process UUID) and logs a stderr warning. Matches the hooks adapters'
     own ``session_id`` validation (non-empty ``str``, no further format
-    check) -- this mission does not invent a stricter schema.
+    check) -- deliberately no stricter schema.
     """
     header_value = handler.headers.get(SESSION_ID_HEADER)
     if header_value is not None and header_value.strip():
@@ -520,8 +519,7 @@ def _resolve_session_id(handler: BaseHTTPRequestHandler, fallback_session_id: st
 # read the same next_seq and then collide inserting the same token for two
 # different values (caught as a generic exception and failed closed, so no
 # PII leak -- just an availability/flakiness bug under concurrency). Scoped
-# to this process only; does not touch core/vault.py, which this mission's
-# non-goals put out of scope.
+# to this process only; deliberately does not touch core/vault.py.
 _vault_lock = threading.Lock()
 
 
@@ -561,7 +559,7 @@ def _skip_reserved_anthropic_metadata(text: str) -> bool:
 #: other block type (``tool_use``, ``tool_result``, ``image``, ...) becomes
 #: a short bracketed placeholder instead of being silently dropped, so a
 #: turn with no text/thinking block still renders as *something* rather
-#: than a mysteriously empty pane (BRIEF SS5's four panes must show the
+#: than a mysteriously empty pane (the panel's four panes must show the
 #: actual message, not nothing).
 _TEXT_CONTENT_BLOCK_FIELDS: Final = {"text": "text", "thinking": "thinking"}
 
@@ -595,8 +593,8 @@ def _extract_text_from_content_blocks(content: JSONValue) -> str:
 def _find_last_user_message_content(parsed: JSONValue) -> JSONValue:
     """Return the last ``role == "user"`` message's raw ``content`` value.
 
-    Shared by ``_extract_last_user_message_text`` (mission-12) and
-    ``_last_user_content_has_text`` (mission-13, for ``_classify_cycle_kind``'s
+    Shared by ``_extract_last_user_message_text`` and
+    ``_last_user_content_has_text`` (for ``_classify_cycle_kind``'s
     ``tool_continuation`` distinction) so both walk the exact same message,
     never two independently-drifting definitions of "the last user turn".
     Returns ``None`` if ``parsed`` is not shaped like a Messages API request
@@ -619,7 +617,7 @@ def _extract_last_user_message_text(parsed: JSONValue) -> str:
 
     Claude Code resends the full conversation history on every request; the
     panel's "Input" pane is scoped to what the user actually typed *this
-    turn*, not the repeated history (mission-12's Intake Grill).
+    turn*, not the repeated history.
     """
     return _extract_text_from_content_blocks(_find_last_user_message_content(parsed))
 
@@ -632,8 +630,8 @@ def _last_user_content_has_text(parsed: JSONValue) -> bool:
     signal ``_classify_cycle_kind`` needs to tell a genuine tool_result
     continuation apart from an ordinary conversational turn, since
     ``_extract_text_from_content_blocks`` renders the former as the
-    non-empty placeholder ``"[tool_result]"`` (see mission-13's Intake
-    Grill: this is exactly why that placeholder used to be misread as real
+    non-empty placeholder ``"[tool_result]"`` (this is exactly
+    why that placeholder used to be misread as real
     conversational content).
     """
     content = _find_last_user_message_content(parsed)
@@ -686,7 +684,7 @@ def _default_llm_client_for_display() -> LLMClient | None:
 _TITLE_GENERATION_SYSTEM_MARKER: Final = "naming a coding session"
 
 #: Substring of Claude Code's own internal harm/safety-classifier request
-#: (mission-13, confirmed live 2026-09-09 by capturing a real `claude -p
+#: (confirmed live 2026-09-09 by capturing a real `claude -p
 #: --demo-db` session's raw traffic): the *last user message* itself --
 #: not the system prompt, unlike the title-generation marker above -- wraps
 #: a JSON summary of the transcript in `<transcript>...</transcript>` and
@@ -695,9 +693,8 @@ _TITLE_GENERATION_SYSTEM_MARKER: Final = "naming a coding session"
 #: *outside* the `<transcript>` tag, so stripping known wrapper tags alone
 #: does not empty this message the way it does for `<system-reminder>`
 #: etc. -- without this marker, this cycle read as an ordinary
-#: `"conversation"` and, worse, kept stealing mission-13's turn-tracking
-#: away from the real conversation between two of its own stages (see
-#: `.harness/handoff.md`).
+#: `"conversation"` and, worse, kept stealing the turn-tracking
+#: away from the real conversation between two of its own stages.
 _SAFETY_CLASSIFIER_MARKER: Final = "respond with <severity>"
 
 #: Tag names Claude Code itself wraps around non-human-authored content
@@ -845,7 +842,7 @@ def _classify_cycle_kind(
     ``"tool_continuation"`` are all real, legitimate Claude Code requests --
     classified so the panel's cycle selector can default to hiding the
     first three (they carry no human-authored conversational content) and
-    fold the fourth into its parent turn's screen (mission-13) instead of
+    fold the fourth into its parent turn's screen instead of
     giving it a chip of its own, not because anything about any of them is
     wrong. ``"conversation"`` is the default for everything else, including
     a request this heuristic fails to recognize as one of the other four.
@@ -942,8 +939,8 @@ def _tokenize_body(
 #: rather than the buffered-JSON or untouched-relay paths.
 _SSE_CONTENT_TYPE = "text/event-stream"
 
-# Delta shapes confirmed live against the real Anthropic API (mission-8
-# spike, see handoff.md) that carry freeform, potentially token-bearing
+# Delta shapes confirmed live against the real Anthropic API that
+# carry freeform, potentially token-bearing
 # display text, mapped to the JSON field holding that text. Substitution
 # here is a plain text replacement, safe for `text_delta`/`thinking_delta`
 # because the *outer* SSE envelope re-escapes the whole field via
@@ -1144,8 +1141,8 @@ def _extract_buffered_display_text(body: bytes, raw_text: str) -> str:
     ``raw_text`` (the plain-decoded body) is the fallback for anything that
     is not a JSON Messages API response shape (an error object, a ``ping``,
     non-JSON) -- there is no structured content to extract there, so the
-    decoded bytes are the best available display text, same as before this
-    mission's extraction helpers existed.
+    decoded bytes are the best available display text, same as before these
+    extraction helpers existed.
     """
     try:
         parsed = json.loads(body)
@@ -1158,7 +1155,7 @@ def _relay_buffered_response(
     handler: BaseHTTPRequestHandler, upstream: httpx.Response, session_id: str
 ) -> tuple[str, str]:
     # Fully buffers the body into memory before writing anything, unlike
-    # mission-7's original bounded, progressively-streamed relay -- a
+    # the original bounded, progressively-streamed relay -- a
     # trade-off accepted here because detokenizing requires the whole JSON
     # value up front, response bodies on this path (anything that isn't
     # `text/event-stream`) are the small, non-streaming Anthropic API
@@ -1167,7 +1164,7 @@ def _relay_buffered_response(
     #
     # Returns ``(raw_display, rewritten_display)`` for the pipeline panel --
     # see ``_relay_sse_response``'s docstring; the wire bytes actually
-    # written via `_write_chunk` below are unchanged by this mission.
+    # written via `_write_chunk` below are unaffected by this.
     body = upstream.read()
     raw_text = _decode(body)
     raw_display = _extract_buffered_display_text(body, raw_text)
@@ -1214,7 +1211,7 @@ def _serialize_report(report: eval_module.Report) -> dict[str, Any]:
 
     Deliberately never includes ``Miss.value`` (the manifest's synthetic
     PII value) -- the comparison tab shows recall/precision numbers, not
-    the underlying data, per the mission's Non-goals.
+    the underlying data, by design.
     """
     return {
         "by_type": {name: _serialize_metrics(m) for name, m in report.by_type.items()},
@@ -1229,8 +1226,7 @@ def _run_comparison_mode(mode: eval_module.Mode) -> dict[str, Any]:
     ``{"available": False, "reason": ...}`` on any failure -- a missing demo
     database, unset LLM env vars (``eval_module.llm_client_from_env()``
     raises ``SystemExit`` for that), or a real network failure talking to
-    the local LLM -- so one mode's failure never blocks the other two
-    (mission-12 AC6).
+    the local LLM -- so one mode's failure never blocks the other two.
     """
     llm_client: LLMClient | None = None
     try:
@@ -1280,7 +1276,7 @@ def make_handler(
     #: Single-entry mutable box for the most-recently-seen real session id,
     #: so the panel's vault views have a sensible default without the human
     #: having to paste one in -- this is a single-active-debugging-session
-    #: demo tool, not a multi-tenant dashboard (see mission Non-goals).
+    #: demo tool, not a multi-tenant dashboard.
     last_session_id: dict[str, str] = {}
 
     class GatewayHandler(BaseHTTPRequestHandler):
@@ -1597,7 +1593,7 @@ def make_handler(
                 _write_json(self, 409, {"error": "vault integrity check failed for this token"})
                 return
             # This is the one endpoint in the whole codebase whose entire job
-            # is to return a decrypted value on request (BRIEF SS5's explicit
+            # is to return a decrypted value on request (the panel's
             # "explicit action" reveal) -- a forensic trail of *when* and
             # *which token* is the least this should leave behind. Never the
             # value itself, matching every other log line this project ever
@@ -1638,7 +1634,7 @@ def make_handler(
         def _serve_metrics_comparison_post(self) -> None:
             # Genuinely expensive (one real LLM call per manifest entry for
             # the llm/union modes) -- only ever runs on this explicit POST,
-            # never automatically, per the mission's Intake Grill. Persisted
+            # never automatically, by design. Persisted
             # so the result survives a gateway restart; the panel's default
             # view is whatever this last wrote, not a fresh run every time.
             payload = {
@@ -1650,7 +1646,7 @@ def make_handler(
             _write_json(self, 200, payload)
 
         def _serve_hook_event(self) -> None:
-            """Best-effort ingress for a hook's own live progress report (mission-13).
+            """Best-effort ingress for a hook's own live progress report.
 
             Request schema is deliberately minimal --
             ``session_id``/``hook``/``phase``/``tool_name``, all short

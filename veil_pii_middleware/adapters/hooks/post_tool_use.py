@@ -17,8 +17,8 @@ the real shape turns out to be, every string in it gets scanned.
 ``PostToolUse`` cannot block (the tool has already run, per the official
 hooks reference). On any failure this hook prints a stderr diagnostic and
 exits non-zero, but the tool's original, untokenized response still reaches
-the model on that path -- an accepted, documented gap (see
-``.harness/mission.md``), not something fixable at this layer.
+the model on that path -- an accepted, documented gap,
+not something fixable at this layer.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from veil_pii_middleware.core.vault import Vault
 __all__ = ["main"]
 
 #: Recorded on every audit entry this hook produces so the observability
-#: frontend (BRIEF SS5) can attribute a token to the leg that minted it.
+#: frontend can attribute a token to the leg that minted it.
 _ADAPTER_NAME = "hooks:post_tool_use"
 
 

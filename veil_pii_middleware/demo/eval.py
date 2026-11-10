@@ -10,8 +10,8 @@ would score a detector that finds *roughly* the right region, and the
 tokenizer needs the exact one.
 
 Person names are in the manifest on purpose. No regex can prove them, so they
-report as misses in regex-only mode — the BRIEF is explicit that false
-negatives are published rather than hidden, and they are excluded from the
+report as misses in regex-only mode — false
+negatives are deliberately published rather than hidden, and they are excluded from the
 gated set rather than deleted from the corpus. ``--mode llm``/``--mode union``
 run the same sweep through the LLM layer instead of (or in addition to) regex,
 so this is the concrete comparison: the 100%-recall gate stays bound to
@@ -255,7 +255,7 @@ def evaluate_decoys(
     `use_regex`/`use_llm`/`llm_client` mirror `evaluate()`'s own -- routing
     through `detect()` instead of a hardcoded regex-only call means a
     `--mode llm`/`--mode union` run's decoy check actually exercises the LLM
-    layer too (BRIEF SS6: previously this check never did, in any mode, so an
+    layer too (previously this check never did, in any mode, so an
     LLM hallucinating a decoy as valid would have gone completely unmeasured).
     """
     decoys: list[dict[str, Any]] = json.loads(decoys_path.read_text(encoding="utf-8"))
@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(report, args.min_recall)
 
         # Same use_regex/use_llm/llm_client this run already resolved for
-        # evaluate() above (BRIEF SS6, item 16) -- previously this call
+        # evaluate() above -- previously this call
         # always hardcoded detect_regex(), so an LLM hallucinating a decoy
         # as valid PII went completely unmeasured in every --mode. Now
         # --mode llm/union's decoy check exercises the LLM layer too, the
@@ -404,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     # The recall gate is scoped to --mode regex only (an LLM-only/union run
     # is not expected to reach it and gating it would leave the gate
     # permanently red). The decoy gate still runs and still fails the
-    # process in every mode, but as of BRIEF SS6 item 16 it now scores
+    # process in every mode, but it now scores
     # whichever layer(s) that mode enabled (regex-only, LLM-only, or the
     # union) -- symmetric with what that mode's recall numbers reflect,
     # rather than always silently checking regex alone.
