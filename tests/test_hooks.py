@@ -298,11 +298,12 @@ class TestSettingsFragmentNotWiredIntoCommittedSettings:
         assert "post_tool_use.py" not in example
         assert "demo/settings.hooks.json" not in example
 
-    def test_settings_hooks_json_is_valid_and_hooks_only(self) -> None:
+    def test_settings_hooks_json_is_valid_and_has_only_hooks_and_permissions(self) -> None:
         root = Path(__file__).parent.parent
         data = json.loads((root / "demo" / "settings.hooks.json").read_text(encoding="utf-8"))
         keys = {k for k in data if not k.startswith("$") and not k.startswith("//")}
-        assert keys == {"hooks"}
+        # `permissions` merges additively (the sqlite3 allow rule); only `hooks` is replaced.
+        assert keys == {"hooks", "permissions"}
 
 
 class TestGitignoreCoversVault:

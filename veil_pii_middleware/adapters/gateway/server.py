@@ -778,6 +778,41 @@ def _excluded_ranges(text: str) -> list[tuple[int, int]]:
     return ranges
 
 
+#: The only top-level request field that is tokenized (regex *and* LLM). It
+#: holds the conversation: the user's typed text and every tool result
+#: (database rows, file contents) re-sent on each turn -- the only place
+#: customer data can appear. Everything else (``system`` prompt, ``tools``
+#: definitions, ``metadata``, model/params) is Claude Code's own boilerplate and
+#: is forwarded byte-for-byte: scanning it protected no customer data and
+#: produced false positives ("Claude Code" as a PERSON, a temp-dir id as a
+#: phone number).
+_TOKENIZED_FIELDS: Final = frozenset({"messages"})
+
+
+def _tokenize_request(
+    parsed: JSONValue,
+    vault: Vault,
+    llm_client: LLMClient | None,
+    audit_log: AuditLog,
+) -> JSONValue:
+    """Tokenize a request body's ``messages``; every other field passes through untouched."""
+
+    def run(value: JSONValue) -> JSONValue:
+        return tokenize(
+            value,
+            vault,
+            llm_client=llm_client,
+            audit_log=audit_log,
+            adapter="gateway",
+            skip=_skip_reserved_anthropic_metadata,
+            exclude=_excluded_ranges,
+        )
+
+    if not isinstance(parsed, dict):
+        return run(parsed)
+    return {key: run(value) if key in _TOKENIZED_FIELDS else value for key, value in parsed.items()}
+
+
 def _extract_system_text(parsed: JSONValue) -> str:
     """Join a Messages API request body's ``system`` field into plain text.
 
@@ -875,15 +910,7 @@ def _tokenize_body(
     VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         with _vault_lock, Vault(VAULT_DB_PATH, session_id) as vault:
-            tokenized: JSONValue = tokenize(
-                parsed,
-                vault,
-                llm_client=display_client,
-                audit_log=audit_log,
-                adapter="gateway",
-                skip=_skip_reserved_anthropic_metadata,
-                exclude=_excluded_ranges,
-            )
+            tokenized: JSONValue = _tokenize_request(parsed, vault, display_client, audit_log)
         received_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(parsed))
         outbound_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(tokenized))
         cycle_kind = _classify_cycle_kind(

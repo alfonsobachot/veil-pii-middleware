@@ -26,4 +26,6 @@ if [ -z "${VEIL_VAULT_KEY:-}" ]; then
          "will fail closed (blocked commands / no tokenization) until it is." >&2
 fi
 
+# Windows Python defaults to cp1252; Claude Code reads Bash output as UTF-8.
+export PYTHONUTF8=1
 exec "$bin" --settings demo/settings.hooks.json

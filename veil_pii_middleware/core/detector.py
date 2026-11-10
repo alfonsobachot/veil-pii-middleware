@@ -95,6 +95,9 @@ class EntityType(StrEnum):
     IP = "IP"
     PERSON = "PERSON"
     ADDRESS = "ADDRESS"
+    #: A company / organization name (a customer's business, a counterparty).
+    #: Like ``PERSON`` and ``ADDRESS`` it is produced only by the LLM layer.
+    ORG = "ORG"
 
 
 class Detector(StrEnum):
@@ -290,7 +293,12 @@ _IBAN = re.compile(
 )
 # Nine digits opening 6, 7 or 9, in ANY grouping. Fixing the grouping at 3-3-3
 # missed `91 234 56 78`, which is simply how a Madrid landline is written.
-_PHONE_ES = re.compile(r"(?<![0-9+])(?P<value>[679](?:[ \-]?[0-9]){8})(?![0-9])")
+# The extra lookbehind rejects digits glued to the tail of a longer
+# alphanumeric identifier (e.g. the `622755116` in a hex temp-dir name such as
+# `9f483fe622755116`), which is an ID fragment, not a phone number. Four or
+# more alphanumerics immediately before is the cut-off: `tel612345678` style
+# typos are still caught, `tel:`/`tlf `/`+34 ` forms always are.
+_PHONE_ES = re.compile(r"(?<![0-9+])(?<![A-Za-z0-9]{4})(?P<value>[679](?:[ \-]?[0-9]){8})(?![0-9])")
 # Any country in international form, not a hard-coded +34.
 _PHONE_INTL = re.compile(r"(?<![0-9+])(?P<value>(?:\+|00)(?:[ \-]?[0-9]){8,15})(?![0-9])")
 _CARD = re.compile(r"(?<![0-9])(?P<value>[0-9](?:[ \-]?[0-9]){11,18})(?![0-9])")
@@ -447,7 +455,15 @@ _SYSTEM_PROMPT: Final = (
     "multiple name parts (a given name plus one or more surnames), return "
     "them together as ONE span covering the full name, never one span per "
     'word -- in "Alfonso Garcia" the match is "Alfonso Garcia", not '
-    '"Alfonso" and "Garcia" separately.'
+    '"Alfonso" and "Garcia" separately. '
+    "ORG is the name of a company, business, association or other "
+    'organization that is a customer or counterparty (for example "Acme '
+    'Consulting S.L.", "Familia Aguado S.A."): match the full name including '
+    "its legal suffix (S.L., S.A., S.Com., & Asociados...) as ONE span. Do "
+    "NOT report as PERSON or ORG: software products, tools, programming "
+    "languages, AI models or assistants (Claude, Claude Code, Anthropic...), "
+    "technology vendors, or generic role words -- only organizations that "
+    "identify a real-world customer or business relationship."
 )
 
 
@@ -472,9 +488,41 @@ _PERSON_CONFIRMATION_SYSTEM_PROMPT: Final = (
     'JSON object of the exact shape {"persons": [<the numbers of every '
     "fragment that IS a person's name>]} -- no prose, no markdown code "
     "fences, no explanation, nothing before or after the JSON. Numbers only, "
-    'never the fragment text itself. If none of the fragments are a person\'s '
+    "never the fragment text itself. If none of the fragments are a person's "
     'name, respond with exactly {"persons": []}.'
 )
+
+
+#: Proper nouns the LLM layer tends to flag as PERSON/ORG but that are never
+#: customer data: Anthropic's own product and model names, which sit in the
+#: boilerplate of every Claude Code request. Compared case-insensitively and
+#: only against a span's *whole* text, so "Claude Rodriguez" is unaffected.
+#: Kept deliberately narrow (Anthropic-controlled names only): a broader
+#: vendor list would start hiding a real customer that happens to share a
+#: name with a well-known company.
+_NON_PII_NAMES: Final = frozenset(
+    {
+        "claude",
+        "claude code",
+        "claude agent sdk",
+        "claude api",
+        "claude desktop",
+        "claude opus",
+        "claude sonnet",
+        "claude haiku",
+        "anthropic",
+        "opus",
+        "sonnet",
+        "haiku",
+    }
+)
+
+#: Entity types ``_NON_PII_NAMES`` applies to.
+_NAME_LIKE_TYPES: Final = frozenset({EntityType.PERSON, EntityType.ORG})
+
+
+def _is_known_non_pii_name(text: str) -> bool:
+    return " ".join(text.split()).casefold() in _NON_PII_NAMES
 
 
 class LLMDetectionError(Exception):
@@ -689,11 +737,14 @@ def detect_llm(text: str, client: LLMClient) -> list[Span]:
         if start is None:
             continue
         taken_starts.add(start)
+        entity_type = EntityType(entity_type_raw)
+        if entity_type in _NAME_LIKE_TYPES and _is_known_non_pii_name(value):
+            continue
         found.append(
             Span(
                 start=start,
                 end=start + len(value),
-                entity_type=EntityType(entity_type_raw),
+                entity_type=entity_type,
                 text=value,
                 detector=Detector.LLM,
             )
@@ -758,6 +809,7 @@ def _confirm_missed_person_candidates(
         (match.start(), match.end(), match.group(0))
         for match in _NAME_CANDIDATE_RE.finditer(text)
         if not any(match.start() < span.end and span.start < match.end() for span in spans)
+        and not _is_known_non_pii_name(match.group(0))
     ]
     if not occurrences:
         _person_confirmation_cache[key] = []

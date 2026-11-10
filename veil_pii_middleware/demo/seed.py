@@ -63,6 +63,7 @@ N_LOG_LINES: Final = 200
 #: Entity kinds the manifest may carry that no regex can prove. They are
 #: recorded so the evaluation reports them as misses until the LLM layer lands.
 PERSON: Final = "PERSON"
+ORG: Final = "ORG"
 
 _VALIDATORS: Final[dict[str, Callable[[str], bool]]] = {
     EntityType.DNI: valid_dni,
@@ -248,6 +249,7 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
             (customer_id, name, national_id, faker.city()),
         )
         corpus.note("customers", "national_id", customer_id, national_id, national_id, entity)
+        corpus.note("customers", "name", customer_id, name, name, ORG)
         customer_emails.append(f"customer{customer_id}@project.com")
 
     # --- users: email in its own column, name only a model will catch -----

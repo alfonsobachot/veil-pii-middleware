@@ -70,6 +70,10 @@ if [ "$demo_db" -eq 1 ]; then
   # file's own comment for why (relative paths inside the hook scripts
   # resolve the shared vault against *this*, not the scratch dir below).
   export VEIL_REPO_ROOT="$ROOT"
+  # The model's `python -c` queries run on Windows with a cp1252 stdout by default;
+  # Claude Code reads Bash output as UTF-8, so accents came back as U+FFFD
+  # ("Consultorï¿½a"). Force UTF-8 for every child process.
+  export PYTHONUTF8=1
   SCRATCH="$HOME/.veil-cli-scratch/demo-db"
   mkdir -p "$SCRATCH/demo"
   cd "$SCRATCH"

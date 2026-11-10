@@ -108,6 +108,7 @@ def tokenize(
     span_sink: list[Span] | None = None,
     skip: Callable[[str], bool] | None = None,
     exclude: Callable[[str], list[tuple[int, int]]] | None = None,
+    use_llm: bool = True,
 ) -> JSONValue:
     """Replace every PII span ``detect()`` finds in ``value`` with a vault token.
 
@@ -159,10 +160,20 @@ def tokenize(
     leaf, and skipping the whole leaf would also stop scanning the real
     content next to it. Same transport-agnostic contract as ``skip``: this
     module has no opinion on what counts as excludable, only the caller does.
+
+    ``use_llm=False`` runs this call regex-only even when an LLM client is
+    supplied or configured in the environment -- for a caller that knows a
+    *region* of its payload (e.g. a request's ``system``/``tools`` boilerplate)
+    cannot carry the kind of data only the LLM layer finds (names, companies),
+    so paying an LLM call per string there is pure latency and false positives.
+    The regex layer, the guaranteed floor, still runs. Defaults to ``True``.
     """
     if audit_log is not None and not adapter:
         raise ValueError("adapter must be a non-empty string when audit_log is supplied")
-    client = llm_client if llm_client is not None else _default_llm_client()
+    if not use_llm:
+        client = None
+    else:
+        client = llm_client if llm_client is not None else _default_llm_client()
     context = _TokenizeContext(
         llm_client=client,
         audit_log=audit_log,

@@ -837,3 +837,66 @@ class TestDetectUnion:
         captured = capsys.readouterr()
         assert secret_email not in captured.err
         assert secret_email not in captured.out
+
+
+# --- phone glued to an identifier, ORG, and non-PII proper nouns -------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r"C:\Temp\claude\9f483fe622755116\0bb05033",
+        "session id abcd622755116 resumed",
+    ],
+)
+def test_phone_digits_at_the_tail_of_an_identifier_are_not_a_phone(text: str) -> None:
+    """A hex temp-dir name ended in nine digits opening 6 and was minted as a PHONE."""
+    assert [s for s in detect_regex(text) if s.entity_type is EntityType.PHONE] == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Tel: 622755116", "tlf 622755116", "(622755116)", "tel:622755116", "+34 622 755 116"],
+)
+def test_phone_with_a_normal_separator_is_still_found(text: str) -> None:
+    assert [s for s in detect_regex(text) if s.entity_type is EntityType.PHONE]
+
+
+class _StubLLM(LLMClient):
+    """LLMClient whose model reply is canned; never opens a connection."""
+
+    def __init__(self, spans: list[dict[str, Any]]) -> None:
+        super().__init__("http://stub.invalid", "stub-model")
+        self._canned = spans
+
+    def complete_spans(self, text: str) -> list[dict[str, Any]]:
+        return self._canned
+
+
+def test_llm_org_span_is_returned_as_org() -> None:
+    clear_llm_cache()
+    text = "Empresa: Familia Aguado S.A. (cliente)"
+    client = _StubLLM([{"value": "Familia Aguado S.A.", "entity_type": "ORG"}])
+
+    spans = detect_llm(text, client)
+
+    assert [(s.entity_type, s.text) for s in spans] == [(EntityType.ORG, "Familia Aguado S.A.")]
+    assert EntityType.ORG not in STRUCTURED_TYPES
+
+
+@pytest.mark.parametrize("name", ["Claude Code", "claude code", "Anthropic", "Claude"])
+@pytest.mark.parametrize("entity_type", ["PERSON", "ORG"])
+def test_known_non_pii_names_are_dropped_from_llm_spans(name: str, entity_type: str) -> None:
+    clear_llm_cache()
+    client = _StubLLM([{"value": name, "entity_type": entity_type}])
+
+    assert detect_llm(f"You are {name}, a coding assistant.", client) == []
+
+
+def test_non_pii_name_filter_only_matches_the_whole_span() -> None:
+    clear_llm_cache()
+    client = _StubLLM([{"value": "Claude Rodriguez", "entity_type": "PERSON"}])
+
+    spans = detect_llm("Cliente Claude Rodriguez", client)
+
+    assert [s.text for s in spans] == ["Claude Rodriguez"]

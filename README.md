@@ -210,7 +210,7 @@ failure.
 `/v1/chat/completions` endpoint — never a hardcoded host, always `VEIL_LLM_BASE_URL` /
 `VEIL_LLM_MODEL`, so pointing it at a different LAN machine or a different server is a config
 change, not a code change. Asked for *every* entity type the regex layer also covers (so
-recall can be compared per type per detector), plus `PERSON` and `ADDRESS`, which no regex
+recall can be compared per type per detector), plus `PERSON`, `ORG` (company names) and `ADDRESS`, which no regex
 can prove. The model returns spans as JSON only (`{"value": ..., "entity_type": ...}`) —
 **never rewritten text**; substitution always happens in code, because a model asked to
 rewrite will paraphrase, drop rows, or break the JSON of tool payloads. The prompt states
@@ -250,7 +250,7 @@ hooks together) needs more than one running at once:
 | Raw prompt (fail-closed check) | `UserPromptSubmit` hook | Can only **block** (exit 2), never rewrite — fail-closed by design, not a substitution mechanism. |
 | Model → local tool (e.g. a `Bash`/SQL call) | `PreToolUse` hook | **Mandatory alongside the gateway**, not optional: the gateway never sees local tool execution at all (a Bash call runs entirely outside the HTTP traffic it intercepts), so it structurally cannot resolve a token back to a real value for a tool to act on. Without this hook, a query referencing a customer by token simply fails. |
 | Local tool → model (re-ingestion) | `PostToolUse` hook | Defense-in-depth for the *local* transcript, not required for the outbound-API guarantee — the gateway re-tokenizes this same content again on the next outbound request regardless. Its value is keeping raw PII out of `~/.claude/projects/*.jsonl` between the tool call and that next request. Cannot block (the tool has already run); a failure here is a documented, accepted gap, not fixable at this layer. |
-| Whole payload, both directions | **Gateway** (`ANTHROPIC_BASE_URL` reverse proxy) | The only mechanism that achieves the narrow architectural requirement (§1) for the **whole conversation**: the request body is tokenized before forwarding, and the response is rewritten on the way back (including a token split across two SSE delta events) so the model's own echoed tokens resolve to real values before reaching the screen — never before reaching the API. |
+| Whole payload, both directions | **Gateway** (`ANTHROPIC_BASE_URL` reverse proxy) | The only mechanism that achieves the narrow architectural requirement (§1) for the **whole conversation**: the request's `messages` (what the user typed plus every tool result re-sent on each turn) are tokenized before forwarding, while the system prompt, tool definitions and other boilerplate fields are forwarded untouched, and the response is rewritten on the way back (including a token split across two SSE delta events) so the model's own echoed tokens resolve to real values before reaching the screen — never before reaching the API. |
 
 Run gateway and hooks **together** for the real target scenario. The gateway alone protects
 everything sent to Anthropic; hooks alone protect nothing sent to Anthropic (they only touch

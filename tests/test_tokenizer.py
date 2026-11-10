@@ -13,6 +13,7 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 from veil_pii_middleware.core.audit import AuditLog
@@ -721,6 +722,7 @@ class TestExcludePredicateForInterleavedMetadata:
 
         result = tokenize(text, vault, exclude=lambda t: [(0, len(excluded))])
 
+        assert isinstance(result, str)
         assert VALID_EMAIL in result  # left untouched, inside the excluded range
         assert "PII_EMAIL_0001" in result  # the second, non-excluded email still caught
         assert other_email not in result
@@ -752,3 +754,28 @@ class TestExcludePredicateForInterleavedMetadata:
     def test_omitting_exclude_scans_everything_as_before(self, vault: Vault) -> None:
         result = tokenize(VALID_EMAIL, vault)
         assert result == "PII_EMAIL_0001"
+
+
+class TestUseLlmSwitch:
+    """`use_llm=False` forces regex-only even when an LLM client is supplied."""
+
+    def test_regex_still_runs_but_the_client_is_never_called(self, vault: Vault) -> None:
+        class _ExplodingClient(LLMClient):
+            def __init__(self) -> None:
+                super().__init__("http://stub.invalid", "stub")
+
+            def complete_spans(self, text: str) -> list[dict[str, Any]]:
+                raise AssertionError("LLM layer must not run when use_llm=False")
+
+        with _ExplodingClient() as client:
+            result = tokenize(
+                f"contact {VALID_EMAIL} Familia Aguado S.A.",
+                vault,
+                llm_client=client,
+                use_llm=False,
+            )
+
+        assert isinstance(result, str)
+        assert VALID_EMAIL not in result
+        assert "PII_EMAIL_0001" in result
+        assert "Familia Aguado S.A." in result
