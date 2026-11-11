@@ -1136,6 +1136,10 @@ class _SseResponseRewriter:
 
 
 def _write_chunk(handler: BaseHTTPRequestHandler, data: bytes) -> None:
+    # A zero-length chunk is the end-of-body marker; writing one for empty
+    # data would end the body early and corrupt a keep-alive connection.
+    if not data:
+        return
     handler.wfile.write(f"{len(data):X}\r\n".encode())
     handler.wfile.write(data)
     handler.wfile.write(b"\r\n")
@@ -1482,12 +1486,18 @@ def make_handler(
                         if k.lower() in _HOP_BY_HOP:
                             continue
                         self.send_header(k, v)
-                    self.send_header("Transfer-Encoding", "chunked")
+                    # 1xx, 204 and 304 must not carry a body, chunked or not.
+                    bodyless = upstream.status_code in (204, 304) or upstream.status_code < 200
+                    if not bodyless:
+                        self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
                     response_started = True
 
                     content_type = upstream.headers.get("content-type", "")
-                    if content_type.startswith(_SSE_CONTENT_TYPE):
+                    if bodyless:
+                        upstream.read()
+                        raw_text = out_text = ""
+                    elif content_type.startswith(_SSE_CONTENT_TYPE):
                         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
                         with Vault(VAULT_DB_PATH, session_id) as vault:
                             raw_text, out_text = _relay_sse_response(self, upstream, vault)

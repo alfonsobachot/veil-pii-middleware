@@ -2242,3 +2242,23 @@ class TestPanelTurnBoundaries:
         chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
 
         assert _parse_sse_events("".join(chunks)) == []
+
+
+class TestEmptyResponseFraming:
+    """An empty or bodyless response must not desync a keep-alive connection."""
+
+    @pytest.mark.parametrize("status", [200, 204, 304])
+    def test_two_requests_on_one_connection_both_succeed(
+        self, servers: _Servers, status: int
+    ) -> None:
+        servers.upstream_state.response_status = status
+        servers.upstream_state.response_body = b""
+
+        with httpx.Client(timeout=10.0) as client:
+            first = client.get(f"{servers.gateway_url}/v1/models")
+            second = client.get(f"{servers.gateway_url}/v1/models")
+
+        assert first.status_code == second.status_code == status
+        assert first.content == second.content == b""
+        if status != 200:
+            assert "transfer-encoding" not in first.headers
