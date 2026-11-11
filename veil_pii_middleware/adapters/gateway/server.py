@@ -1,8 +1,9 @@
 """Reverse-HTTP-proxy gateway: whole-payload tokenization at ``ANTHROPIC_BASE_URL``.
 
 Listens locally and stands in for ``https://api.anthropic.com``. For every
-request: reads the full body, and if it is JSON, tokenizes every string leaf
-via ``core/tokenizer.py::tokenize()`` against a per-process
+request: reads the full body, and if it is JSON, tokenizes the text in its
+``messages`` (``_tokenize_messages``: ids, signatures, thinking and base64
+pass through) via ``core/tokenizer.py::tokenize()`` against a per-process
 ``core/vault.py::Vault`` before forwarding it upstream with an
 otherwise-untouched method/path/headers (including auth).
 
@@ -110,6 +111,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -537,24 +539,6 @@ def _write_error(handler: BaseHTTPRequestHandler, status: int, message: str) -> 
     handler.wfile.write(body)
 
 
-#: Prefix of a system-prompt block Claude Code itself injects on every
-#: request (confirmed live 2026-09-08, capturing the raw pipeline-stream
-#: "received" event) -- never user content. The real Anthropic API rejects
-#: the whole request if this block's value is altered in any way ("400:
-#: x-anthropic-billing-header is a reserved keyword and may not be used in
-#: the system prompt"). Live-observed: the LLM layer mistook the "cc_"
-#: prefix in its `cc_version=...; cc_entrypoint=...;` value for a
-#: credit-card indicator and tokenized both fields, breaking every
-#: Claude-Code-originated request through this gateway with the LLM layer
-#: enabled. This carries no PII (a CLI version string and entrypoint name),
-#: so excluding it from detection entirely loses no real protection.
-_ANTHROPIC_RESERVED_SYSTEM_PREFIX = "x-anthropic-billing-header:"
-
-
-def _skip_reserved_anthropic_metadata(text: str) -> bool:
-    return text.startswith(_ANTHROPIC_RESERVED_SYSTEM_PREFIX)
-
-
 #: Anthropic content-block types this module renders as display text; any
 #: other block type (``tool_use``, ``tool_result``, ``image``, ...) becomes
 #: a short bracketed placeholder instead of being silently dropped, so a
@@ -803,14 +787,69 @@ def _tokenize_request(
             llm_client=llm_client,
             audit_log=audit_log,
             adapter="gateway",
-            skip=_skip_reserved_anthropic_metadata,
             exclude=_excluded_ranges,
             encoder=_ENCODER,
         )
 
     if not isinstance(parsed, dict):
         return run(parsed)
-    return {key: run(value) if key in _TOKENIZED_FIELDS else value for key, value in parsed.items()}
+    return {
+        key: _tokenize_messages(value, run) if key in _TOKENIZED_FIELDS else value
+        for key, value in parsed.items()
+    }
+
+
+#: Content blocks forwarded byte for byte. Thinking blocks are signed (any
+#: change makes the API reject the conversation) and were generated from
+#: already-tokenized input, so they hold no raw PII; images carry base64.
+_PASSTHROUGH_BLOCK_TYPES: Final = frozenset({"thinking", "redacted_thinking", "image"})
+
+#: Keys of a content block (or message) that are protocol data, never user
+#: text: ids, signatures, tool names, cache control, media types.
+_PASSTHROUGH_BLOCK_KEYS: Final = frozenset(
+    {"type", "id", "tool_use_id", "signature", "cache_control", "name", "media_type", "role"}
+)
+
+#: ``source.type`` values whose payload is binary or a reference, never text.
+_OPAQUE_SOURCE_TYPES: Final = frozenset({"base64", "url", "file"})
+
+
+def _tokenize_messages(messages: JSONValue, run: Callable[[JSONValue], JSONValue]) -> JSONValue:
+    """Tokenize the text a ``messages`` array carries, and nothing else.
+
+    Walks messages and content blocks with fixed rules: protocol keys
+    (``_PASSTHROUGH_BLOCK_KEYS``), thinking and image blocks, and base64 or
+    URL sources pass through untouched; ``text``, ``tool_result`` content
+    (string or nested blocks), ``tool_use.input``, document text and any
+    other field are tokenized. Scanning ids, signatures and base64 used to
+    corrupt them (a random base64 run can pass the IBAN check) and cost
+    most of the gateway's detection time.
+    """
+    if not isinstance(messages, list):
+        return run(messages)
+    return [_tokenize_block(message, run) for message in messages]
+
+
+def _tokenize_block(block: JSONValue, run: Callable[[JSONValue], JSONValue]) -> JSONValue:
+    if isinstance(block, list):
+        return [_tokenize_block(item, run) for item in block]
+    if not isinstance(block, dict):
+        return run(block)
+    if block.get("type") in _PASSTHROUGH_BLOCK_TYPES:
+        return block
+    out: dict[str, JSONValue] = {}
+    for key, value in block.items():
+        if key in _PASSTHROUGH_BLOCK_KEYS:
+            out[key] = value
+        elif key == "source" and isinstance(value, dict):
+            out[key] = (
+                value if value.get("type") in _OPAQUE_SOURCE_TYPES else _tokenize_block(value, run)
+            )
+        elif key == "content":
+            out[key] = _tokenize_block(value, run) if isinstance(value, list) else run(value)
+        else:
+            out[key] = run(value)
+    return out
 
 
 def _extract_system_text(parsed: JSONValue) -> str:
@@ -969,6 +1008,12 @@ _TEXT_BEARING_DELTA_FIELDS = {
     "thinking_delta": "thinking",
 }
 
+#: The delta fields ``_SseResponseRewriter`` actually detokenizes. Thinking
+#: is displayed (above) but never rewritten: Claude Code stores it and sends
+#: it back signed, and a detokenized copy would have to re-tokenize to the
+#: exact same bytes on the next turn or the API rejects the signature.
+_DETOKENIZED_DELTA_FIELDS = {"text_delta": "text"}
+
 
 def _split_sse_event(raw_event: str) -> tuple[list[str], dict[str, Any] | None, int]:
     """Split one SSE event's raw text into lines, plus its parsed ``data:`` JSON.
@@ -1058,7 +1103,7 @@ class _SseResponseRewriter:
         delta_type = delta.get("type") if isinstance(delta, dict) else None
         if index is None or not isinstance(delta, dict) or not isinstance(delta_type, str):
             return raw_event
-        field = _TEXT_BEARING_DELTA_FIELDS.get(delta_type)
+        field = _DETOKENIZED_DELTA_FIELDS.get(delta_type)
         if field is None or not isinstance(delta.get(field), str):
             return raw_event
 
@@ -1078,7 +1123,7 @@ class _SseResponseRewriter:
         delta_type = self._delta_kinds.pop(index)
         if not leftover:
             return []
-        field = _TEXT_BEARING_DELTA_FIELDS[delta_type]
+        field = _DETOKENIZED_DELTA_FIELDS[delta_type]
         flush_event = {
             "type": "content_block_delta",
             "index": index,
@@ -1155,6 +1200,23 @@ def _extract_buffered_display_text(body: bytes, raw_text: str) -> str:
     return _extract_response_text(parsed) or raw_text
 
 
+def _detokenize_response_text_blocks(parsed: JSONValue, vault: Vault) -> JSONValue:
+    """Resolve tokens in a buffered Messages response's ``text`` blocks only.
+
+    Thinking blocks are signed and go back to the API verbatim; tool_use
+    input stays tokenized, as on the SSE path, for PreToolUse to resolve.
+    """
+    blocks = parsed.get("content") if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict) or not isinstance(blocks, list):
+        return parsed
+    content: list[JSONValue] = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            block = {**block, "text": detokenize_lenient(block.get("text"), vault)}
+        content.append(block)
+    return {**parsed, "content": content}
+
+
 def _relay_buffered_response(
     handler: BaseHTTPRequestHandler, upstream: httpx.Response, session_id: str
 ) -> tuple[str, str]:
@@ -1188,7 +1250,7 @@ def _relay_buffered_response(
         return raw_display, raw_display
     VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with Vault(VAULT_DB_PATH, session_id) as vault:
-        rewritten: JSONValue = detokenize_lenient(parsed, vault)
+        rewritten = _detokenize_response_text_blocks(parsed, vault)
     out_bytes = json.dumps(rewritten).encode()
     _write_chunk(handler, out_bytes)
     handler.wfile.write(b"0\r\n\r\n")

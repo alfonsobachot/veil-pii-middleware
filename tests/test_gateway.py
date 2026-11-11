@@ -666,18 +666,6 @@ class TestMidStreamUpstreamFailure:
         assert resp.status_code == 200
 
 
-class TestSkipReservedAnthropicMetadataPredicate:
-    def test_matches_the_reserved_prefix(self) -> None:
-        assert gateway_server._skip_reserved_anthropic_metadata(
-            "x-anthropic-billing-header: cc_version=1.0.0; cc_entrypoint=sdk-cli;"
-        )
-
-    def test_does_not_match_ordinary_text(self) -> None:
-        assert not gateway_server._skip_reserved_anthropic_metadata(
-            "please don't share my card 4111111111111111"
-        )
-
-
 class TestReservedAnthropicMetadataExclusion:
     """Claude Code injects a reserved system-prompt block on every request
 
@@ -2051,3 +2039,164 @@ class _StubLLMClient:
 
     def close(self) -> None:
         pass
+
+
+class TestContentBlockWalk:
+    """Only text is tokenized; ids, signatures, base64 and thinking pass byte for byte."""
+
+    _BASE64_IBAN_LOOKALIKE = "pf50hVxWO4IIUrzQljUUt37gsKD0"
+
+    def _forward(self, servers: _Servers, messages: list[Any]) -> list[Any]:
+        resp = _post(f"{servers.gateway_url}/v1/messages", json={"messages": messages})
+        assert resp.status_code == 200
+        forwarded: list[Any] = json.loads(servers.upstream_state.requests[-1]["body"])["messages"]
+        return forwarded
+
+    def test_tool_result_text_blocks_are_tokenized(self, servers: _Servers) -> None:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01",
+                        "content": [{"type": "text", "text": "DNI 12345678Z"}],
+                    }
+                ],
+            }
+        ]
+
+        forwarded = self._forward(servers, messages)
+
+        block = forwarded[0]["content"][0]
+        assert block["tool_use_id"] == "toolu_01"
+        assert block["content"][0]["text"] == "DNI PII_DNI_0001"
+
+    def test_tool_use_input_is_tokenized_and_its_id_kept(self, servers: _Servers) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_02",
+                        "name": "Bash",
+                        "input": {"command": f"grep {VALID_EMAIL} users.csv"},
+                    }
+                ],
+            }
+        ]
+
+        forwarded = self._forward(servers, messages)
+
+        block = forwarded[0]["content"][0]
+        assert block["id"] == "toolu_02"
+        assert block["name"] == "Bash"
+        assert block["input"]["command"] == "grep PII_EMAIL_0001 users.csv"
+
+    def test_image_and_thinking_blocks_are_forwarded_byte_for_byte(self, servers: _Servers) -> None:
+        image = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": f"iVBORw0K{self._BASE64_IBAN_LOOKALIKE}AAAA",
+            },
+        }
+        thinking = {
+            "type": "thinking",
+            "thinking": f"the user wrote {VALID_EMAIL}",
+            "signature": f"Eq{self._BASE64_IBAN_LOOKALIKE}xyz",
+        }
+        messages = [
+            {"role": "assistant", "content": [thinking, {"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [image, {"type": "text", "text": f"see {VALID_EMAIL}"}]},
+        ]
+
+        forwarded = self._forward(servers, messages)
+
+        assert forwarded[0]["content"][0] == thinking
+        assert forwarded[1]["content"][0] == image
+        assert forwarded[1]["content"][1]["text"] == "see PII_EMAIL_0001"
+
+    def test_text_document_source_is_tokenized(self, servers: _Servers) -> None:
+        document = {
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": f"to {VALID_EMAIL}"},
+        }
+
+        forwarded = self._forward(servers, [{"role": "user", "content": [document]}])
+
+        source = forwarded[0]["content"][0]["source"]
+        assert source["media_type"] == "text/plain"
+        assert source["data"] == "to PII_EMAIL_0001"
+
+
+class TestThinkingIsNeverDetokenized:
+    """Thinking goes back to the API signed; a resolved copy would break the signature."""
+
+    def _mint_email_token(self, servers: _Servers) -> str:
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+        )
+        return "PII_EMAIL_0001"
+
+    def test_streaming_thinking_delta_keeps_its_tokens(self, servers: _Servers) -> None:
+        token = self._mint_email_token(servers)
+        servers.upstream_state.response_headers = {
+            "Content-Type": "text/event-stream; charset=utf-8"
+        }
+        servers.upstream_state.response_body = _sse_body(
+            [
+                {"type": "message_start"},
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": f"look up {token}"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": f"found {token}"},
+                },
+                {"type": "content_block_stop", "index": 1},
+                {"type": "message_stop"},
+            ]
+        )
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json={"messages": []})
+
+        assert resp.status_code == 200
+        assert f"look up {token}" in resp.text
+        assert _extract_text_deltas(resp.text, index=1) == f"found {VALID_EMAIL}"
+
+    def test_buffered_thinking_and_tool_input_keep_their_tokens(self, servers: _Servers) -> None:
+        token = self._mint_email_token(servers)
+        servers.upstream_state.response_body = json.dumps(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": f"look up {token}", "signature": "sig"},
+                    {"type": "text", "text": f"found {token}"},
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"q": token}},
+                ]
+            }
+        ).encode()
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json={"messages": []})
+
+        content = resp.json()["content"]
+        assert content[0]["thinking"] == f"look up {token}"
+        assert content[1]["text"] == f"found {VALID_EMAIL}"
+        assert content[2]["input"] == {"q": token}
