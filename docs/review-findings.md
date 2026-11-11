@@ -392,7 +392,7 @@ regex-detectable PII in evaluated cells.
 
 ### E1. Soft coverage rule credits partially leaked names
 
-- [ ] Done
+- [x] Done (ced1d3c)
 - **Where:** `demo/eval.py:261, 276-291` (`_SOFT_MIN_COVERAGE`).
 - **Evidence (confirmed):** in 77 of 450 PERSON values one token alone covers ≥50%; with
   3-token names (367 of 450) two tokens usually suffice, and the third leaks. Conversely a
@@ -403,7 +403,7 @@ regex-detectable PII in evaluated cells.
 
 ### E2. One predicted span can match several gold values
 
-- [ ] Done
+- [x] Done (ced1d3c)
 - **Where:** `demo/eval.py:217-228`.
 - **Evidence (confirmed):** one ENCODER span over `Rosa Pérez Gil is diabetic` counted as
   PERSON hit, SENSITIVE hit, and 2 ENCODER hits. A whole-cell span would take all soft recall
@@ -414,16 +414,19 @@ regex-detectable PII in evaluated cells.
 
 ### E3. Decoys only count on exact span match
 
-- [ ] Done
+- [x] Done (d52423e)
 - **Where:** `demo/eval.py:369-370`.
 - **Evidence (confirmed):** ORG on `billing department` inside the decoy
   `the billing department` gave 0 hits.
 - **Fix:** any span overlapping `[offset, offset+len)` is a hit.
 - **Test:** partial overlap with a decoy counts.
+- **Follow-up:** the overlap rule exposed a real regex false positive: the bad Spanish IBAN
+  decoy `ES4386588947031358349966` was trimmed to a 16-char prefix that passes mod-97 by
+  chance. Fixed in b99ce93 by checking the registered IBAN length per country.
 
 ### E4. Exit codes, messages and options
 
-- [ ] Done (needs decision 3)
+- [x] Done (292d752)
 - **Where:** `demo/eval.py:410-414, 487, 530-538, 546-547, 191, 360, 198`.
 - **Evidence:**
   - `--help` says `--max-false-positives` applies only to `--mode regex`, but the decoy gate
@@ -443,7 +446,7 @@ regex-detectable PII in evaluated cells.
 
 ### E5. Server fixtures take 0.5 s to shut down per test
 
-- [ ] Done
+- [x] Done (167c83d)
 - **Where:** `tests/test_detector.py:493-502`, `tests/test_gateway.py:180-206`.
 - **Evidence (confirmed):** 0.51 s teardown per test in about 78 detector tests; two servers
   shut down in sequence in about 79 gateway tests. Roughly 1–1.5 min of the suite.
