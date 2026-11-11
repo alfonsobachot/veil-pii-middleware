@@ -340,7 +340,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R12. Panel depends on a CDN at presentation time
 
-- [ ] Done
+- [x] Done (a00064e)
 - **Where:** `frontend/panel.html:268-270`; panel served at `server.py:1498`.
 - **Evidence:** three scripts, nothing else external:
   - `https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js`
@@ -371,7 +371,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R14. Ollama model unload and timeouts during the demo
 
-- [ ] Done
+- [x] Done (fe0c69c)
 - **Where:** environment; `core/detector.py:610-613, 852-855, 1188-1196`.
 - **Evidence (read-only):** Ollama unloads an idle model after 5 minutes; the reload exceeds
   the 10 s default timeout. A 5xx gets one retry (worst case about 20 s), connect/timeout
@@ -381,6 +381,9 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
   `VEIL_LLM_TIMEOUT=30`, and add a warm-up call to `scripts/run-gateway.sh` that logs loudly
   if Ollama is unreachable. A strict mode that blocks instead of falling back is in the
   backlog (D7).
+- **Note:** `OLLAMA_KEEP_ALIVE` is read by the Ollama server at start-up, so a script cannot
+  set it for a running instance. `demo/warmup.py` sends `keep_alive: -1` on a native
+  `/api/generate` load request instead, which pins that model the same way.
 
 ---
 
