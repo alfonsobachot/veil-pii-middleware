@@ -387,3 +387,59 @@ class TestPanelReportBestEffort:
         )
         assert result_a.returncode == result_b.returncode == 0
         assert result_a.stdout == result_b.stdout
+
+
+def _run_utf8_bytes(
+    module: str, payload: Any, tmp_path: Path
+) -> subprocess.CompletedProcess[bytes]:
+    """Run a hook the way Claude Code does on Windows: raw UTF-8 bytes, no PYTHONUTF8."""
+    env = dict(os.environ)
+    env["VEIL_VAULT_KEY"] = _TEST_KEY_B64
+    env.pop("PYTHONUTF8", None)
+    env.pop("PYTHONIOENCODING", None)
+    return subprocess.run(
+        [sys.executable, "-m", module],
+        input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        capture_output=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=30,
+    )
+
+
+class TestHooksReadUtf8Stdin:
+    def test_pre_tool_use_keeps_accents_in_updated_input(self, tmp_path: Path) -> None:
+        token = _seed_token(tmp_path, "session-a", "alice@example.com", "EMAIL")
+        command = (
+            "sqlite3 demo/veil_demo.db "
+            f"\"select * from users where name='José Muñoz' or email='{token}'\""
+        )
+        payload = {
+            "session_id": "session-a",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+
+        result = _run_utf8_bytes(
+            "veil_pii_middleware.adapters.hooks.pre_tool_use", payload, tmp_path
+        )
+
+        assert result.returncode == 0, result.stderr
+        updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert "name='José Muñoz'" in updated
+        assert "alice@example.com" in updated
+
+    def test_post_tool_use_keeps_accents_in_tokenized_output(self, tmp_path: Path) -> None:
+        payload = {
+            "session_id": "session-a",
+            "tool_name": "Bash",
+            "tool_input": {"command": _DEMO_DB_COMMAND},
+            "tool_response": {"stdout": "Logroño|alice@example.com", "exit_code": 0},
+        }
+
+        result = _run_utf8_bytes(
+            "veil_pii_middleware.adapters.hooks.post_tool_use", payload, tmp_path
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Logroño|PII_EMAIL_" in json.dumps(json.loads(result.stdout), ensure_ascii=False)

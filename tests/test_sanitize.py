@@ -173,3 +173,22 @@ class TestInitDocstring:
 
         assert "/veil" in (command.__doc__ or "")
         assert "/ask" not in (command.__doc__ or "")
+
+
+def test_accented_prompt_survives_without_pythonutf8(tmp_path: Path) -> None:
+    """Windows defaults stdin/stdout to cp1252; the prompt must still round-trip as UTF-8."""
+    env = dict(os.environ)
+    env["VEIL_VAULT_KEY"] = _TEST_KEY_B64
+    env.pop("PYTHONUTF8", None)
+    env.pop("PYTHONIOENCODING", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "veil_pii_middleware.adapters.command.sanitize"],
+        input="Logroño: alice@example.com".encode(),
+        capture_output=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.decode("utf-8").startswith("Logroño: PII_EMAIL_")

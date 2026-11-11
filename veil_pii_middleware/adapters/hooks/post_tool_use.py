@@ -42,7 +42,7 @@ _ADAPTER_NAME = "hooks:post_tool_use"
 
 def main() -> int:
     try:
-        payload = json.loads(sys.stdin.read())
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("hook payload must be a JSON object")
     except Exception:

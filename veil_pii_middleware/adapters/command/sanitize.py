@@ -50,7 +50,7 @@ _AUDIT_LOG_PATH = Path(".veil") / "audit.jsonl"
 
 def main() -> int:
     try:
-        prompt = sys.stdin.read()
+        prompt = sys.stdin.buffer.read().decode("utf-8")
         session_id = os.environ.get(_SESSION_ID_ENV_VAR)
         if not session_id:
             # Not a fatal condition -- this is the accepted demo fallback --
@@ -79,7 +79,8 @@ def main() -> int:
     except Exception:
         print("veil: sanitization failed, blocking prompt", file=sys.stderr)
         return 1
-    sys.stdout.write(sanitized)
+    sys.stdout.buffer.write(sanitized.encode("utf-8"))
+    sys.stdout.buffer.flush()
     return 0
 
 
