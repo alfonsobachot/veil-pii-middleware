@@ -21,7 +21,7 @@ from veil_pii_middleware.core.detector import (
     EntityType,
 )
 from veil_pii_middleware.demo.eval import evaluate, llm_client_from_env
-from veil_pii_middleware.demo.seed import PERSON, seed_demo
+from veil_pii_middleware.demo.seed import ADDRESS, DEMO_EMAIL, DOB, ORG, PERSON, seed_demo
 
 
 @pytest.fixture(scope="module")
@@ -81,6 +81,46 @@ def test_pii_lands_where_column_masking_cannot_reach(corpus: tuple[Path, Path]) 
     assert ("webhooks", "payload", EntityType.DNI) in placed
     assert ("error_logs", "message", PERSON) in placed
     assert ("invoices", "notes", EntityType.PHONE) in placed
+
+
+def test_demo_customer_rows_carry_many_kinds_of_pii(corpus: tuple[Path, Path]) -> None:
+    """The presentation turn must surface a lot of PII, not two or three values.
+
+    Follows the lookups an investigation of the demo email naturally makes:
+    the user, their company, its users, invoices, payments and tickets.
+    """
+    db_path, manifest_path = corpus
+    lookups = {
+        "users": "SELECT id FROM users WHERE customer_id = ?",
+        "customers": "SELECT id FROM customers WHERE id = ?",
+        "invoices": "SELECT id FROM invoices WHERE customer_id = ?",
+        "payments": "SELECT p.id FROM payments p JOIN invoices i ON i.id = p.invoice_id "
+        "WHERE i.customer_id = ?",
+        "support_tickets": "SELECT id FROM support_tickets WHERE customer_id = ?",
+    }
+    with sqlite3.connect(db_path) as connection:
+        (customer_id,) = connection.execute(
+            "SELECT customer_id FROM users WHERE email = ?", (DEMO_EMAIL,)
+        ).fetchone()
+        rows = {
+            (table, row_id)
+            for table, query in lookups.items()
+            for (row_id,) in connection.execute(query, (customer_id,))
+        }
+    found = [i for i in _manifest(manifest_path) if (i["table"], i["row_id"]) in rows]
+    assert len({i["value"] for i in found}) >= 15
+    assert {i["entity_type"] for i in found} >= {
+        EntityType.EMAIL,
+        EntityType.PHONE,
+        EntityType.DNI,
+        EntityType.CIF,
+        EntityType.IBAN,
+        EntityType.CARD,
+        PERSON,
+        ORG,
+        ADDRESS,
+        DOB,
+    }
 
 
 # --------------------------------------------------------------------------

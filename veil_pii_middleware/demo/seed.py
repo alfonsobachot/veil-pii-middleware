@@ -24,6 +24,7 @@ import random
 import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Final
 
@@ -44,6 +45,7 @@ from veil_pii_middleware.core.detector import (
 )
 
 __all__ = [
+    "DEMO_EMAIL",
     "Decoy",
     "Instance",
     "DEFAULT_DB_PATH",
@@ -91,7 +93,8 @@ CREATE TABLE customers (
 );
 CREATE TABLE users (
     id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL,
-    email TEXT NOT NULL, full_name TEXT NOT NULL
+    email TEXT NOT NULL, full_name TEXT NOT NULL, phone TEXT NOT NULL,
+    national_id TEXT NOT NULL, date_of_birth TEXT NOT NULL, address TEXT NOT NULL
 );
 CREATE TABLE invoices (
     id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL,
@@ -249,25 +252,30 @@ class _Corpus:
         )
 
     def phone(self, variant: int) -> str:
-        """Faker's es_ES phone formats vary; build one this layer must catch.
+        """A Spanish phone number drawn from the main generator."""
+        return _spanish_phone(self.faker, variant)
 
-        Cycles through the ways a Spanish number is actually written. The
-        corpus previously emitted only the bare nine-digit form, so the recall
-        gate never exercised separators, groupings or the country prefix --
-        and two real gaps sat behind a green gate until review found them.
-        The 2-3-2-2 form is how a Madrid landline is normally printed.
-        """
-        first = self.faker.random_element(("6", "7", "9"))
-        digits = first + "".join(str(self.faker.random_digit()) for _ in range(8))
-        head, middle, tail = digits[:3], digits[3:6], digits[6:]
-        formats = (
-            digits,
-            f"{head} {middle} {tail}",
-            f"{digits[:2]} {digits[2:5]} {digits[5:7]} {digits[7:]}",
-            f"{head}-{middle}-{tail}",
-            f"+34 {head} {middle} {tail}",
-        )
-        return formats[variant % len(formats)]
+
+def _spanish_phone(faker: Faker, variant: int) -> str:
+    """Faker's es_ES phone formats vary; build one this layer must catch.
+
+    Cycles through the ways a Spanish number is actually written. The corpus
+    previously emitted only the bare nine-digit form, so the recall gate never
+    exercised separators, groupings or the country prefix -- and two real gaps
+    sat behind a green gate until review found them. The 2-3-2-2 form is how a
+    Madrid landline is normally printed.
+    """
+    first = faker.random_element(("6", "7", "9"))
+    digits = first + "".join(str(faker.random_digit()) for _ in range(8))
+    head, middle, tail = digits[:3], digits[3:6], digits[6:]
+    formats = (
+        digits,
+        f"{head} {middle} {tail}",
+        f"{digits[:2]} {digits[2:5]} {digits[5:7]} {digits[7:]}",
+        f"{head}-{middle}-{tail}",
+        f"+34 {head} {middle} {tail}",
+    )
+    return formats[variant % len(formats)]
 
 
 def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
@@ -294,15 +302,29 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         customer_emails.append(f"customer{customer_id}@project.com")
 
     # --- users: email in its own column, name only a model will catch -----
+    # The profile columns (phone, DNI, birth date, address) were added later
+    # and come from their own generator, so the values drawn from `faker`
+    # here and in every table after this one did not change when they landed.
+    profile = Faker("es_ES")
+    profile.seed_instance(SEED + 1)
     for user_id in range(1, N_USERS + 1):
         customer_id = (user_id % N_CUSTOMERS) + 1
         email = f"user{user_id}@{faker.domain_name()}"
         full_name = faker.name()
+        phone = _spanish_phone(profile, user_id)
+        national_id = _dni(profile)
+        birth = profile.date_of_birth(minimum_age=18, maximum_age=80).strftime("%Y-%m-%d")
+        address = f"{profile.street_address()}, {profile.postcode()} {profile.city()}"
         cursor.execute(
-            "INSERT INTO users VALUES (?, ?, ?, ?)", (user_id, customer_id, email, full_name)
+            "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, customer_id, email, full_name, phone, national_id, birth, address),
         )
         corpus.note("users", "email", user_id, email, email, EntityType.EMAIL)
         corpus.note("users", "full_name", user_id, full_name, full_name, PERSON)
+        corpus.note("users", "phone", user_id, phone, phone, EntityType.PHONE)
+        corpus.note("users", "national_id", user_id, national_id, national_id, EntityType.DNI)
+        corpus.note("users", "date_of_birth", user_id, birth, birth, DOB)
+        corpus.note("users", "address", user_id, address, address, ADDRESS)
 
     # --- invoices: phone buried in a free-text note -----------------------
     for invoice_id in range(1, N_INVOICES + 1):
@@ -484,6 +506,20 @@ def _secret_line(corpus: _Corpus, log_id: int) -> tuple[str, str]:
         return f"Authorization: Bearer {jwt}", jwt
     key = "sk_live_" + _random_string(corpus, _ALNUM, 24)
     return f"stripe.api_key = {key}", key
+
+
+_DNI_LETTERS: Final = "TRWAGMYFPDXBNJZSQVHLCKE"
+
+
+def _dni(faker: Faker) -> str:
+    """A valid DNI drawn from ``faker``'s own generator.
+
+    Faker's ``nif()`` draws from the global ``random`` module, not from the
+    instance, so calling it on a separately seeded generator would still
+    shift every value the main generator produces after it.
+    """
+    number = faker.random_int(0, 99_999_999)
+    return f"{number:08d}{_DNI_LETTERS[number % 23]}"
 
 
 def _cif(corpus: _Corpus) -> str:
@@ -980,6 +1016,240 @@ def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         )
 
 
+# --------------------------------------------------------------------------
+# The presentation's customer: one hand-written incident (an invoice charged
+# twice, once to a cancelled direct-debit mandate) spread over every table, so
+# the rows an investigation naturally reads -- the user, their company, its
+# invoices, payments and tickets -- return a dozen kinds of personal data, not
+# two or three. Fixed literals, no generator draws: the rest of the corpus is
+# unaffected, and `docs/demo-script.md` can list the exact values to check.
+# --------------------------------------------------------------------------
+
+DEMO_EMAIL: Final = "lucia.ferrer@riberanorte.es"
+DEMO_CUSTOMER_ID: Final = N_CUSTOMERS + 1
+DEMO_INVOICE_ID: Final = N_INVOICES + 2  # the one charged twice
+_DEMO_NAME: Final = "Lucía Ferrer Montoya"
+_DEMO_COMPANY: Final = "Transportes Ribera Norte S.L."
+_DEMO_CIF: Final = "B84712637"
+_DEMO_DNI: Final = "47392816M"
+_DEMO_PHONE: Final = "+34 612 384 905"
+_DEMO_BIRTH: Final = "1986-03-14"
+_DEMO_IBAN: Final = "ES5601822370420201593318"  # current mandate
+_DEMO_OLD_IBAN: Final = "ES9820385778983000760236"  # cancelled, still charged
+_DEMO_CARD: Final = "4532014876239153"
+_DEMO_IP: Final = "88.12.45.201"
+_DEMO_LANDLINE: Final = "983 214 776"
+_DEMO_COLLEAGUE_EMAIL: Final = "jorge.alcaraz@riberanorte.es"
+_DEMO_COLLEAGUE_NAME: Final = "Jorge Alcaraz Prieto"
+_DEMO_COLLEAGUE_DNI: Final = "52618407L"
+_DEMO_COLLEAGUE_IBAN: Final = "ES6100811532610001286377"
+
+
+def _next_id(connection: sqlite3.Connection, table: str) -> int:
+    query = f"SELECT COALESCE(MAX(id), 0) + 1 FROM {table}"  # noqa: S608
+    return int(connection.execute(query).fetchone()[0])
+
+
+def _insert_noted(
+    corpus: _Corpus,
+    connection: sqlite3.Connection,
+    table: str,
+    row: dict[str, Any],
+    noted: dict[str, list[tuple[str, str]]],
+) -> None:
+    """Insert ``row`` into ``table`` and record each ``(value, type)`` per column."""
+    columns = ", ".join(row)
+    marks = ", ".join("?" for _ in row)
+    connection.execute(
+        f"INSERT INTO {table} ({columns}) VALUES ({marks})",  # noqa: S608
+        tuple(row.values()),
+    )
+    for column, values in noted.items():
+        text = str(row[column])
+        for value, entity in values:
+            corpus.note(table, column, int(row["id"]), text, value, entity)
+
+
+def _build_demo_incident(corpus: _Corpus, connection: sqlite3.Connection) -> None:
+    """Insert the presentation customer's rows across every table."""
+    add = partial(_insert_noted, corpus, connection)
+    customer = DEMO_CUSTOMER_ID
+    add(
+        "customers",
+        {"id": customer, "name": _DEMO_COMPANY, "national_id": _DEMO_CIF, "city": "Valladolid"},
+        {"name": [(_DEMO_COMPANY, ORG)], "national_id": [(_DEMO_CIF, EntityType.CIF)]},
+    )
+    users = (
+        (
+            N_USERS + 1,
+            DEMO_EMAIL,
+            _DEMO_NAME,
+            _DEMO_PHONE,
+            _DEMO_DNI,
+            _DEMO_BIRTH,
+            "Calle de Santiago 27, 3º B, 47001 Valladolid",
+        ),
+        (
+            N_USERS + 2,
+            _DEMO_COLLEAGUE_EMAIL,
+            _DEMO_COLLEAGUE_NAME,
+            "655 902 117",
+            _DEMO_COLLEAGUE_DNI,
+            "1979-11-02",
+            "Paseo de Zorrilla 112, 47006 Valladolid",
+        ),
+    )
+    for user_id, email, name, phone, dni, birth, address in users:
+        add(
+            "users",
+            {
+                "id": user_id,
+                "customer_id": customer,
+                "email": email,
+                "full_name": name,
+                "phone": phone,
+                "national_id": dni,
+                "date_of_birth": birth,
+                "address": address,
+            },
+            {
+                "email": [(email, EntityType.EMAIL)],
+                "full_name": [(name, PERSON)],
+                "phone": [(phone, EntityType.PHONE)],
+                "national_id": [(dni, EntityType.DNI)],
+                "date_of_birth": [(birth, DOB)],
+                "address": [(address, ADDRESS)],
+            },
+        )
+
+    first, charged_twice, latest = N_INVOICES + 1, DEMO_INVOICE_ID, N_INVOICES + 3
+    invoices: tuple[tuple[int, float, str, list[tuple[str, str]]], ...] = (
+        (first, 1240.5, "No issues.", []),
+        (
+            charged_twice,
+            1875.0,
+            f"Billing contact: {_DEMO_NAME}, {_DEMO_PHONE}. Customer reports a duplicate "
+            "direct debit for this invoice.",
+            [(_DEMO_NAME, PERSON), (_DEMO_PHONE, EntityType.PHONE)],
+        ),
+        (
+            latest,
+            1312.75,
+            f"Billing contact: {_DEMO_LANDLINE}. Hold until the duplicate charge is refunded.",
+            [(_DEMO_LANDLINE, EntityType.PHONE)],
+        ),
+    )
+    for invoice_id, amount, notes, noted in invoices:
+        add(
+            "invoices",
+            {"id": invoice_id, "customer_id": customer, "amount": amount, "notes": notes},
+            {"notes": noted},
+        )
+    payment_id = _next_id(connection, "payments")
+    payments = (
+        (first, _DEMO_IBAN, "paid"),
+        (charged_twice, _DEMO_IBAN, "paid"),
+        (charged_twice, _DEMO_OLD_IBAN, "paid"),
+        (latest, _DEMO_COLLEAGUE_IBAN, "pending"),
+    )
+    for offset, (invoice_id, iban, status) in enumerate(payments):
+        add(
+            "payments",
+            {"id": payment_id + offset, "invoice_id": invoice_id, "iban": iban, "status": status},
+            {"iban": [(iban, EntityType.IBAN)]},
+        )
+
+    ticket = (
+        f"{_DEMO_NAME} (DNI {_DEMO_DNI}) wrote from {DEMO_EMAIL}: invoice {charged_twice} was "
+        f"charged twice, once to {_DEMO_IBAN} and again to her old account {_DEMO_OLD_IBAN}, "
+        f"which she cancelled last year. She also paid a late fee with card {_DEMO_CARD} by "
+        f"mistake and wants it refunded too. Call back on {_DEMO_PHONE}. "
+        f"Her colleague {_DEMO_COLLEAGUE_NAME} ({_DEMO_COLLEAGUE_EMAIL}) is copied."
+    )
+    add(
+        "support_tickets",
+        {
+            "id": _next_id(connection, "support_tickets"),
+            "customer_id": customer,
+            "subject": "Invoice charged twice",
+            "body": ticket,
+        },
+        {
+            "body": [
+                (_DEMO_NAME, PERSON),
+                (_DEMO_DNI, EntityType.DNI),
+                (DEMO_EMAIL, EntityType.EMAIL),
+                (_DEMO_IBAN, EntityType.IBAN),
+                (_DEMO_OLD_IBAN, EntityType.IBAN),
+                (_DEMO_CARD, EntityType.CARD),
+                (_DEMO_PHONE, EntityType.PHONE),
+                (_DEMO_COLLEAGUE_NAME, PERSON),
+                (_DEMO_COLLEAGUE_EMAIL, EntityType.EMAIL),
+            ]
+        },
+    )
+
+    log = (
+        "Traceback (most recent call last):\n"
+        '  File "billing/sepa.py", line 141, in collect\n'
+        f"    raise DuplicateCollection(f'invoice {charged_twice} already paid by {DEMO_EMAIL}')\n"
+        f"DuplicateCollection: mandate {_DEMO_OLD_IBAN} still active, request from {_DEMO_IP}"
+    )
+    add(
+        "error_logs",
+        {"id": _next_id(connection, "error_logs"), "level": "ERROR", "message": log},
+        {
+            "message": [
+                (DEMO_EMAIL, EntityType.EMAIL),
+                (_DEMO_OLD_IBAN, EntityType.IBAN),
+                (_DEMO_IP, EntityType.IP),
+            ]
+        },
+    )
+
+    payload = json.dumps(
+        {
+            "event": "payment.collected",
+            "data": {
+                "customer_email": DEMO_EMAIL,
+                "debtor_iban": _DEMO_OLD_IBAN,
+                "invoice_id": charged_twice,
+                "source_ip": _DEMO_IP,
+            },
+        },
+        sort_keys=True,
+    )
+    add(
+        "webhooks",
+        {"id": _next_id(connection, "webhooks"), "event": "payment.collected", "payload": payload},
+        {
+            "payload": [
+                (DEMO_EMAIL, EntityType.EMAIL),
+                (_DEMO_OLD_IBAN, EntityType.IBAN),
+                (_DEMO_IP, EntityType.IP),
+            ]
+        },
+    )
+
+    crm = (
+        f"Call with {_DEMO_NAME} about the double charge on invoice {charged_twice}. She is "
+        "on medical leave and asked to be contacted by email only. Born 14/03/1986, "
+        f"identity checked against DNI {_DEMO_DNI}."
+    )
+    add(
+        "crm_notes",
+        {"id": _next_id(connection, "crm_notes"), "author": "billing", "body": crm},
+        {
+            "body": [
+                (_DEMO_NAME, PERSON),
+                ("medical leave", SENSITIVE),
+                ("14/03/1986", DOB),
+                (_DEMO_DNI, EntityType.DNI),
+            ]
+        },
+    )
+
+
 def seed_demo(
     db_path: Path = DEFAULT_DB_PATH,
     manifest_path: Path = DEFAULT_MANIFEST_PATH,
@@ -1001,6 +1271,7 @@ def seed_demo(
         _build(corpus, connection)
         _build_notes(corpus, connection)
         _build_decoys(corpus, connection)
+        _build_demo_incident(corpus, connection)
         connection.commit()
 
     decoy_payload: list[dict[str, Any]] = [asdict(decoy) for decoy in corpus.decoys]
