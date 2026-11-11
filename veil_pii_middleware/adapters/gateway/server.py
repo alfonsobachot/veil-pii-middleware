@@ -420,6 +420,13 @@ def _publish_stage(
 #: by this process so there is no CORS to fight (see module docstring).
 _FRONTEND_DIR: Final = Path(__file__).resolve().parent.parent.parent / "frontend"
 _PANEL_HTML_PATH: Final = _FRONTEND_DIR / "panel.html"
+#: Third-party scripts the panel loads, shipped in the package so the panel
+#: works without network access (React 18.3.1, Babel standalone 7.24.7).
+#: Served by exact name only: nothing outside this set is ever read from disk.
+_VENDOR_DIR: Final = _FRONTEND_DIR / "vendor"
+_VENDOR_SCRIPTS: Final = frozenset(
+    {"react.production.min.js", "react-dom.production.min.js", "babel.min.js"}
+)
 
 
 def _query_param(path: str, name: str) -> str | None:
@@ -444,6 +451,16 @@ def _write_html(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> No
     handler.send_response(status)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _write_script(handler: BaseHTTPRequestHandler, body: bytes) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/javascript; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    # Pinned versions that never change under the same name.
+    handler.send_header("Cache-Control", "public, max-age=86400")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -1601,6 +1618,14 @@ def make_handler(
                 return True
             if path in (_PANEL_PREFIX, f"{_PANEL_PREFIX}/"):
                 _write_html(self, 200, _PANEL_HTML_PATH.read_bytes())
+                return True
+            vendor_prefix = f"{_PANEL_PREFIX}/vendor/"
+            if path.startswith(vendor_prefix) and self.command == "GET":
+                name = path.removeprefix(vendor_prefix)
+                if name in _VENDOR_SCRIPTS:
+                    _write_script(self, (_VENDOR_DIR / name).read_bytes())
+                else:
+                    _write_json(self, 404, {"error": f"no vendored script {name!r}"})
                 return True
             if path == f"{_PANEL_PREFIX}/audit-stream" and self.command == "GET":
                 self._serve_audit_stream()

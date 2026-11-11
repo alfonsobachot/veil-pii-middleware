@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import socket
 import threading
 import time
@@ -813,6 +814,29 @@ class TestPanelStaticPage:
         assert "babel" in body.lower()
         assert "node_modules" not in body
         assert "package.json" not in body
+
+    def test_loads_no_script_from_the_network(self, servers: _Servers) -> None:
+        """The panel must work offline: every script comes from the gateway."""
+        body = _get(f"{servers.gateway_url}/veil-panel").text
+        sources = re.findall(r"<script[^>]*\bsrc=\"([^\"]+)\"", body)
+        assert sources
+        assert all(src.startswith("/veil-panel/vendor/") for src in sources)
+
+    def test_every_referenced_script_is_served(self, servers: _Servers) -> None:
+        body = _get(f"{servers.gateway_url}/veil-panel").text
+        for src in re.findall(r"<script[^>]*\bsrc=\"([^\"]+)\"", body):
+            resp = _get(f"{servers.gateway_url}{src}")
+            assert resp.status_code == 200, src
+            assert resp.headers["content-type"].startswith("application/javascript")
+            assert len(resp.content) > 1000
+
+    @pytest.mark.parametrize(
+        "name", ["../panel.html", "..%2Fpanel.html", "missing.js", "vendor", ""]
+    )
+    def test_unknown_or_traversing_names_are_404(self, servers: _Servers, name: str) -> None:
+        resp = _get(f"{servers.gateway_url}/veil-panel/vendor/{name}")
+        assert resp.status_code == 404
+        assert "<html" not in resp.text.lower()
 
 
 class TestAuditStream:

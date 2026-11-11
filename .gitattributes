@@ -4,3 +4,6 @@
 # Without this rule, `core.autocrlf=true` reintroduces CRLF on the next clone.
 
 *.sh            text eol=lf
+
+# Vendored third-party scripts are byte-for-byte copies of the upstream files.
+veil_pii_middleware/frontend/vendor/*.js -text -diff

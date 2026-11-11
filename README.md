@@ -54,7 +54,8 @@ scope and known gaps are documented explicitly below rather than glossed over.
   `qwen_qwen3-4b-instruct-2507`. The base URL and model are always environment configuration
   (`VEIL_LLM_BASE_URL`, `VEIL_LLM_MODEL`), never a hardcoded host.
 - **Frontend:** one static, unbuilt HTML file (`frontend/panel.html`) — React + Babel Standalone
-  loaded from CDN, no bundler, no new dependency, served directly by the gateway process.
+  vendored under `frontend/vendor/` (works offline), no bundler, no new dependency, served
+  directly by the gateway process.
 
 Install:
 
