@@ -28,7 +28,7 @@ presentation" → Gateway).
 
 ## Open decisions
 
-Recommendations in bold. Settle these before working on the linked findings.
+Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 1. **Merge rule (F4).** **Regex spans take precedence; an overlapping soft span is trimmed to
    its non-overlapping remainders.** Changes the soft-type eval numbers, so it must land
@@ -47,7 +47,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F1. Wrapper-tag exclusion skips tokenization anywhere in `messages`
 
-- [ ] Done
+- [x] Done (0bd34a7)
 - **Where:** `adapters/gateway/server.py:710-723, 752-771` (`_excluded_ranges`).
 - **Evidence (confirmed):** text inside `<session>`, `<system-reminder>`, `<command-*>` or
   `<local-command-*>` is never tokenized, wherever it appears, including `tool_result`
@@ -65,7 +65,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F2. Card number next to expiry or CVV is not detected
 
-- [ ] Done
+- [x] Done (5ebdf03)
 - **Where:** `core/detector.py:429` (`_CARD`), `556-570` (validation loop).
 - **Evidence (confirmed):** `_CARD` matches greedily up to 19 digits; when the whole match
   fails Luhn it is discarded and `finditer` has already consumed the characters. All of these
@@ -82,7 +82,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F3. IBANs whose length is not a multiple of 4 are missed
 
-- [ ] Done
+- [x] Done (f005962)
 - **Where:** `core/detector.py:416-418` (`_IBAN`), `539-546` (`_trim_iban`).
 - **Evidence (confirmed):** the pattern only accepts full 4-character groups.
   `DE89 3704 0044 0532 0130 00` yields only `PHONE '0044 0532 0130 00'` (`DE89 3704` leaks).
@@ -99,7 +99,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F4. `merge_spans` drops the losing span whole
 
-- [ ] Done (needs decision 1)
+- [x] Done (d92a6f7)
 - **Where:** `core/detector.py:518-536`.
 - **Evidence (confirmed):** on a partial overlap the loser is dropped entirely, so its
   non-overlapping part goes out in clear:
@@ -127,7 +127,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F5. Tokenizer drops any span that touches an existing token; token pattern has no boundaries
 
-- [ ] Done (shares the trimming helper with F4)
+- [x] Done (d92a6f7)
 - **Where:** `core/tokenizer.py:54` (`_TOKEN_PATTERN`), `233-234` (`_drop_overlapping`).
 - **Evidence (confirmed):**
   - A span that covers a token plus real PII is discarded whole: LLM `PERSON` over
@@ -144,7 +144,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F6. Common secret shapes are missed
 
-- [ ] Done
+- [x] Done (eb3be26)
 - **Where:** `core/detector.py:470-473` (generic key/value in `_SECRET_PATTERNS`).
 - **Evidence (confirmed):** the `\b` before the keyword fails after `_`, and there is no
   `token` or `Authorization` keyword. All return `[]`: `DB_PASSWORD=hunter2222`,
@@ -160,7 +160,7 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F7. One bad LLM entry or chatty JSON loses the whole LLM layer for a block
 
-- [ ] Done
+- [x] Done (cc34827)
 - **Where:** `core/detector.py:1012-1025` (`detect_llm`), `763-776` (`_parse_json_object`).
 - **Evidence:**
   - (read-only) A single malformed entry (`"value": 612345678` as a number, empty string,
@@ -179,14 +179,14 @@ Recommendations in bold. Settle these before working on the linked findings.
 
 ### F8. Audit `value_hash` is an unkeyed SHA-256
 
-- [ ] Done
+- [x] Done (5e051de)
 - **Where:** `core/audit.py:130`; pinned by
   `tests/test_audit.py::test_value_absent_only_its_hash_present`.
 - **Evidence (confirmed):** DNI and phone spaces are tiny; pure Python does 1M SHA-256 in
   0.6 s, so every DNI is recoverable in about 60 s. Contradicts "never records plaintext".
   Nothing reads `value_hash` except tests (the panel does not).
 - **Fix:** HMAC-SHA256 with an HKDF subkey of `VEIL_VAULT_KEY` (info `b"veil-audit"`), or
-  drop the field.
+  drop the field. Done by dropping the field (and `record()`'s `value` argument).
 - **Test:** change the pinning test to assert `sha256(value)` does not appear in the file.
 
 ---
