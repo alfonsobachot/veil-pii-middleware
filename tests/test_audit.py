@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.detector import Detector, EntityType
+from veil_pii_middleware.core.tokenizer import tokenize
+from veil_pii_middleware.core.vault import Vault
 
 VALID_EMAIL = "alice@example.com"
 
@@ -38,7 +41,6 @@ for i in range(count):
         entity_type=EntityType.EMAIL,
         detector=Detector.REGEX,
         offset=i,
-        value=f"user{worker_id}-{i}@example.com",
         adapter=f"process-{worker_id}",
     )
 """
@@ -46,38 +48,18 @@ VALID_DNI = "12345678Z"
 
 
 class TestRecordNeverWritesPlaintext:
-    def test_value_absent_only_its_hash_present(self, tmp_path: Path) -> None:
+    def test_tokenizing_writes_neither_the_value_nor_its_hash(self, tmp_path: Path) -> None:
+        """An unkeyed SHA-256 of a DNI is brute-forced in about a minute, so no hash either."""
         log_path = tmp_path / "audit.jsonl"
-        log = AuditLog(log_path)
-
-        log.record(
-            token="PII_EMAIL_0001",
-            entity_type=EntityType.EMAIL,
-            detector=Detector.REGEX,
-            offset=8,
-            value=VALID_EMAIL,
-            adapter="test",
-        )
+        text = f"Customer {VALID_EMAIL}, DNI {VALID_DNI}"
+        with Vault(tmp_path / "vault.db", "session-1", master_key=os.urandom(32)) as vault:
+            tokenize(text, vault, audit_log=AuditLog(log_path), adapter="test")
 
         raw = log_path.read_text(encoding="utf-8")
-        assert VALID_EMAIL not in raw
-        assert hashlib.sha256(VALID_EMAIL.encode()).hexdigest() in raw
-
-    def test_dni_value_absent_only_its_hash_present(self, tmp_path: Path) -> None:
-        log_path = tmp_path / "audit.jsonl"
-        log = AuditLog(log_path)
-
-        log.record(
-            token="PII_DNI_0001",
-            entity_type=EntityType.DNI,
-            detector=Detector.REGEX,
-            offset=0,
-            value=VALID_DNI,
-            adapter="test",
-        )
-
-        raw = log_path.read_text(encoding="utf-8")
-        assert VALID_DNI not in raw
+        assert len(raw.splitlines()) == 2
+        for value in (VALID_EMAIL, VALID_DNI):
+            assert value not in raw
+            assert hashlib.sha256(value.encode()).hexdigest() not in raw
 
 
 class TestEntryShape:
@@ -90,7 +72,6 @@ class TestEntryShape:
             entity_type=EntityType.EMAIL,
             detector=Detector.LLM,
             offset=3,
-            value=VALID_EMAIL,
             adapter="gateway",
         )
 
@@ -103,7 +84,6 @@ class TestEntryShape:
             "entity_type",
             "detector",
             "offset",
-            "value_hash",
             "adapter",
         }
         assert entry["token"] == "PII_EMAIL_0001"
@@ -120,7 +100,6 @@ class TestEntryShape:
             entity_type=EntityType.EMAIL,
             detector=Detector.REGEX,
             offset=0,
-            value=VALID_EMAIL,
             adapter="test",
         )
         log.record(
@@ -128,14 +107,13 @@ class TestEntryShape:
             entity_type=EntityType.DNI,
             detector=Detector.REGEX,
             offset=10,
-            value=VALID_DNI,
             adapter="test",
         )
 
         entries = list(AuditLog.read_entries(log_path))
 
         assert [e.token for e in entries] == ["PII_EMAIL_0001", "PII_DNI_0001"]
-        assert entries[0].value_hash == hashlib.sha256(VALID_EMAIL.encode()).hexdigest()
+        assert entries[0].entity_type == "EMAIL"
 
     def test_reading_a_missing_file_yields_nothing(self, tmp_path: Path) -> None:
         assert list(AuditLog.read_entries(tmp_path / "does-not-exist.jsonl")) == []
@@ -183,6 +161,5 @@ class TestConcurrentAppendSafety:
                 "entity_type",
                 "detector",
                 "offset",
-                "value_hash",
                 "adapter",
             }

@@ -261,7 +261,6 @@ def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
                 entity_type=span.entity_type,
                 detector=span.detector,
                 offset=span.start,
-                value=span.text,
                 adapter=context.adapter,
             )
         text = text[: span.start] + token + text[span.end :]

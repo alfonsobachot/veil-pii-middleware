@@ -1,12 +1,13 @@
 """Append-only JSONL audit log.
 
-Records timestamp, token, entity type, detector, offset, hash of the value and
-originating adapter. It never contains the original value.
+Records timestamp, token, entity type, detector, offset and originating
+adapter. It never contains the original value, nor a hash of it: an unkeyed
+hash of a DNI or phone number is recoverable by brute force in about a
+minute, and the token already correlates repeated values.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sys
@@ -87,7 +88,6 @@ class AuditEntry:
     entity_type: str
     detector: str
     offset: int
-    value_hash: str
     adapter: str
 
 
@@ -111,23 +111,15 @@ class AuditLog:
         entity_type: EntityType,
         detector: Detector,
         offset: int,
-        value: str,
         adapter: str,
     ) -> None:
-        """Append one entry. ``value`` is hashed here and never stored or returned.
-
-        Accepting the raw value only to hash it internally -- rather than
-        asking every call site to hash it first -- keeps "never write
-        plaintext" a property of this one function instead of a convention
-        every caller must remember.
-        """
+        """Append one entry. Takes no value at all, so none can be written."""
         entry = {
             "timestamp": datetime.now(UTC).isoformat(),
             "token": token,
             "entity_type": entity_type.value,
             "detector": detector.value,
             "offset": offset,
-            "value_hash": hashlib.sha256(value.encode()).hexdigest(),
             "adapter": adapter,
         }
         line = json.dumps(entry) + "\n"
@@ -183,6 +175,5 @@ class AuditLog:
                     entity_type=raw["entity_type"],
                     detector=raw["detector"],
                     offset=raw["offset"],
-                    value_hash=raw["value_hash"],
                     adapter=raw["adapter"],
                 )
