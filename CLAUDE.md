@@ -75,7 +75,8 @@ Code boilerplate and are forwarded untouched.
 check-digit validation — DNI/NIE letter, IBAN mod-97, card Luhn. The local LLM
 layer returns spans as JSON, never rewritten text; substitution happens in
 code. It covers `PERSON`, `ORG` and `ADDRESS`, which no regex can prove. On
-overlapping spans the longest wins; ties go to regex.
+overlapping spans regex takes precedence (longest wins among regex spans) and an
+overlapping soft span is trimmed to its uncovered parts, never dropped whole.
 
 **Tokens.** Format `PII_<TYPE>_<NNNN>`. The same normalized value must always
 map to the same token within a session — otherwise the model cannot correlate

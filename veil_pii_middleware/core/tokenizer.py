@@ -20,6 +20,7 @@ from veil_pii_middleware.core.detector import (
     SpanEncoder,
     detect,
     llm_client_from_env,
+    trim_to_uncovered,
 )
 from veil_pii_middleware.core.vault import TokenNotFoundError, Vault, VaultIntegrityError
 
@@ -196,14 +197,18 @@ def _tokenize(value: JSONValue, vault: Vault, context: _TokenizeContext) -> JSON
     return value
 
 
-def _drop_overlapping(spans: list[Span], ranges: list[tuple[int, int]]) -> list[Span]:
+#: An already-minted token standing alone in text, used to keep detection off
+#: it. Bounded, unlike ``_TOKEN_PATTERN``: a token glued inside a larger word
+#: (``juan.PII_X_1234@corp.com``) is not a token, and that word still needs
+#: scanning.
+_STANDALONE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_.@])PII_[A-Z]+_\d{4}(?!\d)")
+
+
+def _trim_overlapping(spans: list[Span], ranges: list[tuple[int, int]]) -> list[Span]:
+    """Cut each span to its parts outside ``ranges``, never dropping the rest."""
     if not ranges:
         return spans
-    return [
-        span
-        for span in spans
-        if not any(span.start < r_end and span.end > r_start for r_start, r_end in ranges)
-    ]
+    return [part for span in spans for part in trim_to_uncovered(span, ranges)]
 
 
 def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
@@ -225,15 +230,17 @@ def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
     # detokenize()/detokenize_lenient() only run one substitution pass, so
     # the outer layer resolved back to the inner token text instead of the
     # real value, never the placeholder, so this went unnoticed as a
-    # resolution failure. Any span exactly overlapping an already-minted
-    # token's own text can never be genuine user/tool PII -- this format is
-    # reserved and only ever written by this module -- so it is dropped
-    # before substitution, the same way `exclude` drops known non-user
-    # ranges below.
-    already_tokenized_ranges = [(m.start(), m.end()) for m in _TOKEN_PATTERN.finditer(text)]
-    spans = _drop_overlapping(spans, already_tokenized_ranges)
+    # resolution failure. An already-minted token's own text can never be
+    # genuine user/tool PII -- this format is reserved and only ever written
+    # by this module -- so any span is cut back to the parts outside it (and
+    # outside the `exclude` ranges below). Cut, not dropped: a span over
+    # `PII_PERSON_0001 Garcia Lopez` must still tokenize `Garcia Lopez`.
+    already_tokenized_ranges = [
+        (m.start(), m.end()) for m in _STANDALONE_TOKEN_PATTERN.finditer(text)
+    ]
+    spans = _trim_overlapping(spans, already_tokenized_ranges)
     if context.exclude is not None:
-        spans = _drop_overlapping(spans, context.exclude(text))
+        spans = _trim_overlapping(spans, context.exclude(text))
     if context.span_sink is not None:
         context.span_sink.extend(sorted(spans, key=lambda s: s.start))
     # Right-to-left by start offset: substituting a token of a different

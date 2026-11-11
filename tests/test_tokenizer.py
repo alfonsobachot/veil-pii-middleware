@@ -779,3 +779,45 @@ class TestUseLlmSwitch:
         assert VALID_EMAIL not in result
         assert "PII_EMAIL_0001" in result
         assert "Familia Aguado S.A." in result
+
+
+class TestExistingTokenGuard:
+    """Detection stays off already-minted tokens without hiding the PII next to them."""
+
+    def test_span_over_a_token_and_a_surname_still_tokenizes_the_surname(
+        self, vault: Vault, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import veil_pii_middleware.core.tokenizer as tokenizer_module
+
+        text = "Cliente PII_PERSON_0001 Garcia Lopez, calle Mayor 5"
+        value = "PII_PERSON_0001 Garcia Lopez"
+        start = text.index(value)
+
+        def fake_detect(source: str, **_: object) -> list[Span]:
+            assert source == text
+            return [Span(start, start + len(value), EntityType.PERSON, value)]
+
+        monkeypatch.setattr(tokenizer_module, "detect", fake_detect)
+
+        result = tokenize(text, vault)
+
+        assert isinstance(result, str)
+        assert "Garcia" not in result
+        assert "Lopez" not in result
+        assert "PII_PERSON_0001 " in result
+        assert vault.resolve(result.split()[2].rstrip(",")) == "Garcia Lopez"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "mail PII_EMAIL_0001.juan@corp.com now",
+            "mail juan.PII_X_1234@corp.com now",
+            "PII_EMAIL_0001juan@corp.com",
+        ],
+    )
+    def test_email_glued_to_a_token_lookalike_is_tokenized(self, vault: Vault, text: str) -> None:
+        result = tokenize(text, vault)
+
+        assert isinstance(result, str)
+        assert "juan" not in result
+        assert "corp.com" not in result

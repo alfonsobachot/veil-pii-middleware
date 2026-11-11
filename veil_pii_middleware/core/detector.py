@@ -5,8 +5,9 @@ mandatory check-digit validation. The LLM layer, reached over an OpenAI-
 compatible ``/v1/chat/completions`` endpoint (LM Studio, or anything else
 serving that schema), is asked for every entity type this module knows about
 -- not just names -- so recall can be compared per entity type per detector,
-and must return spans as JSON, never rewritten text. On overlap the longest
-span wins; ties go to regex.
+and must return spans as JSON, never rewritten text. On overlap regex spans
+take precedence and an overlapping LLM or encoder span is trimmed to its
+uncovered parts (``merge_spans``).
 
 The LLM layer is switched on only when a caller supplies a constructed
 ``LLMClient`` to ``detect()``; nothing in this module reads the environment
@@ -70,6 +71,7 @@ __all__ = [
     "detect_llm",
     "detect_regex",
     "merge_spans",
+    "trim_to_uncovered",
     "valid_card",
     "valid_cif",
     "valid_dni",
@@ -530,24 +532,67 @@ class SpanEncoder(Protocol):
 # --------------------------------------------------------------------------
 
 
-def merge_spans(spans: Iterable[Span]) -> list[Span]:
-    """Drop overlaps: the longest span wins, and an exact tie goes to regex.
+def trim_to_uncovered(span: Span, ranges: Iterable[tuple[int, int]]) -> list[Span]:
+    """The parts of ``span`` outside every ``(start, end)`` range in ``ranges``.
 
-    Shared with the future LLM union stage, which resolves the same conflict
-    between layers that the patterns already create among themselves -- an
-    IBAN contains digit runs a card or phone pattern will happily claim.
+    Each part keeps ``span``'s type and detector, loses non-alphanumeric
+    characters at its edges, and is dropped if nothing alphanumeric is left
+    (a leftover ``(`` or ``, ``). A span no range touches comes back as is.
+    """
+    cuts = sorted((max(start, span.start), min(end, span.end)) for start, end in ranges)
+    cuts = [(start, end) for start, end in cuts if start < end]
+    if not cuts:
+        return [span]
+    parts: list[Span] = []
+    cursor = span.start
+    for cut_start, cut_end in [*cuts, (span.end, span.end)]:
+        start, end = cursor, cut_start
+        while start < end and not span.text[start - span.start].isalnum():
+            start += 1
+        while end > start and not span.text[end - 1 - span.start].isalnum():
+            end -= 1
+        if start < end:
+            parts.append(
+                Span(
+                    start=start,
+                    end=end,
+                    entity_type=span.entity_type,
+                    text=span.text[start - span.start : end - span.start],
+                    detector=span.detector,
+                )
+            )
+        cursor = max(cursor, cut_end)
+    return parts
+
+
+def merge_spans(spans: Iterable[Span]) -> list[Span]:
+    """Resolve overlaps so that no character of any detected span is lost.
+
+    Regex spans go first: among themselves the longest wins and an exact tie
+    goes to the earlier entry in ``_PATTERNS`` (``sorted`` is stable). Soft
+    spans (LLM, encoder) follow, longest first. A span that overlaps one
+    already kept is cut to its uncovered parts (``trim_to_uncovered``)
+    rather than dropped, so in ``Juan 612 345 678`` an LLM ``PERSON`` over
+    ``Juan 612`` still yields ``Juan`` next to the regex ``PHONE``.
 
     Returns the survivors ordered by start offset.
     """
     ordered = sorted(
         spans,
-        key=lambda span: (-span.length, _DETECTOR_RANK[span.detector], span.start),
+        key=lambda span: (
+            span.detector is not Detector.REGEX,
+            -span.length,
+            _DETECTOR_RANK[span.detector],
+            span.start,
+        ),
     )
     kept: list[Span] = []
     for span in ordered:
-        if any(span.overlaps(other) for other in kept):
-            continue
-        kept.append(span)
+        kept.extend(
+            trim_to_uncovered(
+                span, [(other.start, other.end) for other in kept if span.overlaps(other)]
+            )
+        )
     return sorted(kept, key=lambda span: span.start)
 
 

@@ -188,8 +188,10 @@ sequenceDiagram
 
 ## 4. Hybrid detection
 
-Both layers run on every string leaf, and their spans are unioned. On an overlap the longest
-span wins; an exact tie goes to regex (`core/detector.py::merge_spans`).
+Both layers run on every string leaf, and their spans are unioned. On an overlap regex spans
+take precedence (among themselves the longest wins); an overlapping LLM or encoder span is
+trimmed to its uncovered parts instead of dropped, so no character either layer flagged goes
+out in clear (`core/detector.py::merge_spans`).
 
 **Deterministic layer (regex).** Covers `EMAIL`, `DNI`, `NIE`, `IBAN`, Spanish and
 international `PHONE`, `CARD`, `IP`. Check-digit validation is mandatory, not cosmetic — a
@@ -415,7 +417,7 @@ decoys: 6 false positive(s) (max allowed 0) — see §9
 ```
 
 Union recovers 100% recall on every structured (check-digit-provable) type — regex fills every
-LLM miss or mislabel via the longest-span/tie-to-regex merge rule — plus 97.6% recall on
+LLM miss or mislabel via the regex-first merge rule — plus 97.6% recall on
 `PERSON`, which no regex could ever provide. `--mode llm` alone (not reproduced in full here;
 see `--mode llm` in the table logic above) scores measurably worse per type on its own — e.g.
 DNI recall drops without regex backing it up — which is exactly the comparison this evaluation

@@ -374,10 +374,108 @@ def test_merge_prefers_the_longer_span() -> None:
     assert merge_spans([span(2, 5), span(0, 10)]) == [span(0, 10)]
 
 
-def test_merge_breaks_length_ties_in_favour_of_regex() -> None:
+def test_merge_trims_a_soft_span_that_overlaps_a_regex_span() -> None:
     llm = span(0, 4, Detector.LLM)
     regex = span(2, 6, Detector.REGEX)
-    assert merge_spans([llm, regex]) == [regex]
+    assert merge_spans([llm, regex]) == [span(0, 2, Detector.LLM), regex]
+
+
+def test_merge_gives_regex_precedence_over_a_longer_soft_span() -> None:
+    llm = span(0, 10, Detector.LLM)
+    regex = span(6, 8, Detector.REGEX)
+    assert merge_spans([llm, regex]) == [
+        span(0, 6, Detector.LLM),
+        regex,
+        span(8, 10, Detector.LLM),
+    ]
+
+
+def _soft(text: str, value: str, entity_type: EntityType, detector: Detector) -> Span:
+    start = text.index(value)
+    return Span(start, start + len(value), entity_type, value, detector)
+
+
+def _merged(text: str, *soft: Span) -> list[tuple[EntityType, str, Detector]]:
+    spans = merge_spans([*detect_regex(text), *soft])
+    assert all(text[s.start : s.end] == s.text for s in spans)
+    return [(s.entity_type, s.text, s.detector) for s in spans]
+
+
+def test_merge_keeps_the_name_part_of_a_person_span_over_a_phone() -> None:
+    text = "call Juan 612 345 678"
+    person = _soft(text, "Juan 612", EntityType.PERSON, Detector.LLM)
+
+    assert _merged(text, person) == [
+        (EntityType.PERSON, "Juan", Detector.LLM),
+        (EntityType.PHONE, "612 345 678", Detector.REGEX),
+    ]
+
+
+def test_merge_keeps_the_uncovered_part_of_a_shorter_soft_span() -> None:
+    text = "Ana Maria Lopez Garcia"
+    org = _soft(text, "Ana Maria", EntityType.ORG, Detector.LLM)
+    person = _soft(text, "Maria Lopez Garcia", EntityType.PERSON, Detector.LLM)
+
+    assert _merged(text, org, person) == [
+        (EntityType.ORG, "Ana", Detector.LLM),
+        (EntityType.PERSON, "Maria Lopez Garcia", Detector.LLM),
+    ]
+
+
+def test_merge_splits_an_encoder_org_around_a_plate() -> None:
+    text = "Courier van 5219 MDX"
+    org = _soft(text, text, EntityType.ORG, Detector.ENCODER)
+
+    assert _merged(text, org) == [
+        (EntityType.ORG, "Courier van", Detector.ENCODER),
+        (EntityType.PLATE, "5219 MDX", Detector.REGEX),
+    ]
+
+
+def test_merge_splits_an_llm_secret_around_a_regex_secret() -> None:
+    text = "password=g7bHSF33PO52FL"
+    llm_secret = _soft(text, text, EntityType.SECRET, Detector.LLM)
+
+    assert _merged(text, llm_secret) == [
+        (EntityType.SECRET, "password", Detector.LLM),
+        (EntityType.SECRET, "g7bHSF33PO52FL", Detector.REGEX),
+    ]
+
+
+def test_merge_drops_a_soft_span_inside_a_regex_span() -> None:
+    text = "mail maria.lopez@example.com"
+    person = _soft(text, "maria.lopez", EntityType.PERSON, Detector.LLM)
+
+    assert _merged(text, person) == [(EntityType.EMAIL, "maria.lopez@example.com", Detector.REGEX)]
+
+
+def test_merge_splits_a_soft_span_around_a_regex_span_inside_it() -> None:
+    text = "office at 10.0.0.5 Calle Mayor"
+    address = _soft(text, "office at 10.0.0.5 Calle Mayor", EntityType.ADDRESS, Detector.LLM)
+
+    assert _merged(text, address) == [
+        (EntityType.ADDRESS, "office at", Detector.LLM),
+        (EntityType.IP, "10.0.0.5", Detector.REGEX),
+        (EntityType.ADDRESS, "Calle Mayor", Detector.LLM),
+    ]
+
+
+def test_merge_drops_leftover_punctuation_of_a_trimmed_span() -> None:
+    text = "tel (612 345 678)"
+    phone = _soft(text, "(612 345 678)", EntityType.PHONE, Detector.LLM)
+
+    assert _merged(text, phone) == [(EntityType.PHONE, "612 345 678", Detector.REGEX)]
+
+
+def test_merge_keeps_card_digits_a_greedy_phone_overlaps() -> None:
+    text = "tel +34 612 345 678 4111 1111 1111 1111"
+
+    spans = merge_spans(detect_regex(text))
+
+    covered = {i for s in spans for i in range(s.start, s.end)}
+    card_start = text.index("4111")
+    card_digits = [i for i in range(card_start, len(text)) if text[i].isdigit()]
+    assert all(i in covered for i in card_digits)
 
 
 def test_merge_returns_spans_ordered_by_start() -> None:
@@ -385,7 +483,15 @@ def test_merge_returns_spans_ordered_by_start() -> None:
 
 
 def test_merge_is_idempotent() -> None:
-    once = merge_spans([span(0, 10), span(2, 5), span(12, 16)])
+    once = merge_spans(
+        [
+            span(0, 10),
+            span(2, 5),
+            span(12, 16),
+            span(8, 14, Detector.LLM),
+            span(15, 20, Detector.ENCODER),
+        ]
+    )
     assert merge_spans(once) == once
 
 
