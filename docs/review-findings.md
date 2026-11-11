@@ -472,7 +472,7 @@ both lines at start-up; the full turn took 51 s.
   gateway tokenized it (`PII_PERSON_0008`, `PII_EMAIL_0002`), so `ask.sh` does not leak; in
   hooks-only mode (`run_demo.sh`) that output reaches the model in clear. Fix: also register
   the hook for `PostToolUseFailure` if it can rewrite the output, else document the gap.
-- **S4. Hooks only cover `Bash`.** The environment advertises PowerShell as the primary
+- **S4. Hooks only cover `Bash`.** Fixed in 988270b (`SHELL_TOOLS`, matcher `Bash|PowerShell`). The environment advertises PowerShell as the primary
   shell, and the model used the `PowerShell` tool for its first two calls. Had it run the
   query there, the token would not have been resolved (and in hooks-only mode the result
   would not have been tokenized). Fix: match `Bash|PowerShell` in both hooks and the scope
@@ -482,13 +482,21 @@ both lines at start-up; the full turn took 51 s.
   `email` column name in the schema output became `PII_USERNAME_0001`. The model coped, but
   the panel shows a mangled prompt. Skill names in Claude Code's context became `PII_ORG_*`
   too (138 ORG tokens in one turn).
-- **S6. The Windows username leaks inconsistently.** `alfon` was tokenized as
+- **S6. The Windows username leaks inconsistently.** Fixed for the demo scripts in 91474aa (isolated Claude Code config, scratch dir under `C:/Users/Public`); the G7 root cause stays open. `alfon` was tokenized as
   `PII_PERSON_0002` in some paths and forwarded in clear in three others in `messages`
   (`C:\Users\alfon\.veil-cli-scratch\...`). Same root cause as G7: a value tokenized once is
   not replaced everywhere. Also: the user's global `~/.claude/CLAUDE.md`, memory path and
   skill list load into the demo request (not tokenized in `system` by design).
-- **S7. `ask.sh` waits 3 s for stdin.** `claude -p` prints "no stdin data received in 3s".
+- **S7. `ask.sh` waits 3 s for stdin.** Fixed in 7196c1e. `claude -p` prints "no stdin data received in 3s".
   Fix: `< /dev/null` on both invocations.
+- **S8. A synthetic company name reached the API.** In the S6 re-runs the row
+  `customer (2, 'Consultoría Guillen & Asociados S.Com.', ...)` was forwarded in clear twice
+  in a row: neither the post-hook nor the gateway (same qwen3 4b) tagged it as ORG, while the
+  first run, with a different output shape, did. Soft-layer recall gap on tuple-shaped
+  output; check whether the encoder or a larger model catches it.
+- **S9. The demo relied on the presenter's `bypassPermissions`.** With user settings no
+  longer loaded, `claude -p` refused the queries. Fixed in 91474aa with explicit allow rules in
+  the isolated demo settings.
 
 ---
 
