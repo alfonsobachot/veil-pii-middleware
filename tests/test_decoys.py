@@ -152,6 +152,7 @@ def test_evaluate_decoys_routes_through_detect_with_the_callers_flags(
         use_llm: bool = True,
         llm_client: LLMClient | None = None,
         encoder: object | None = None,
+        on_layer_error: object | None = None,
     ) -> list[Span]:
         calls.append((use_regex, use_llm, llm_client))
         return []

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -38,6 +39,7 @@ from veil_pii_middleware.core.detector import (
     LLM_BASE_URL_ENV_VAR,
     LLM_MODEL_ENV_VAR,
     STRUCTURED_TYPES,
+    LayerErrorHandler,
     LLMClient,
     Span,
     SpanEncoder,
@@ -159,6 +161,7 @@ def evaluate(
     mode: Mode = "regex",
     llm_client: LLMClient | None = None,
     encoder: SpanEncoder | None = None,
+    on_layer_error: LayerErrorHandler | None = None,
 ) -> Report:
     """Score the enabled layer(s) over every cell the manifest says holds PII.
 
@@ -190,7 +193,7 @@ def evaluate(
 
     total_cells = len(expected)
     for done, (cell, instances) in enumerate(sorted(expected.items()), start=1):
-        if done % 25 == 0 or done == total_cells:
+        if done == 1 or done % 25 == 0 or done == total_cells:
             # Progress on stderr: an LLM sweep takes minutes, never leave it silent.
             print(f"progress: {done}/{total_cells} cells", file=sys.stderr, flush=True)
         text = texts.get(cell)
@@ -203,6 +206,7 @@ def evaluate(
             use_llm=use_llm,
             llm_client=llm_client,
             encoder=active_encoder,
+            on_layer_error=on_layer_error,
         )
         seconds += time.perf_counter() - started
         # Each span is credited to at most one ground-truth value, so a single
@@ -374,6 +378,7 @@ def evaluate_decoys(
     use_llm: bool = False,
     llm_client: LLMClient | None = None,
     encoder: SpanEncoder | None = None,
+    on_layer_error: LayerErrorHandler | None = None,
 ) -> DecoyReport:
     """Score the enabled layer(s) against values that must never be detected.
 
@@ -393,14 +398,21 @@ def evaluate_decoys(
     texts = _load_texts(db_path, cells)
 
     hits: list[DecoyHit] = []
-    for decoy in decoys:
+    for done, decoy in enumerate(decoys, start=1):
+        if done == 1 or done % 25 == 0 or done == len(decoys):
+            print(f"progress: {done}/{len(decoys)} decoys", file=sys.stderr, flush=True)
         cell = (str(decoy["table"]), str(decoy["column"]), int(decoy["row_id"]))
         text = texts.get(cell)
         if text is None:
             raise ValueError(f"decoy points at a row that is not in the database: {cell}")
         offset, value = int(decoy["offset"]), str(decoy["value"])
         spans = detect(
-            text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client, encoder=encoder
+            text,
+            use_regex=use_regex,
+            use_llm=use_llm,
+            llm_client=llm_client,
+            encoder=encoder,
+            on_layer_error=on_layer_error,
         )
         # Any overlap is a hit: a span on part of a decoy ("billing department"
         # inside "the billing department") still tokenizes non-PII.
@@ -420,15 +432,15 @@ def evaluate_decoys(
     return DecoyReport(hits=hits)
 
 
-def _print_report(report: Report, min_recall: float) -> None:
+def _print_report(report: Report, min_recall: float, *, gated: bool = True) -> None:
     print(f"{'entity':<10}{'support':>9}{'found':>8}{'missed':>8}{'fp':>6}{'recall':>9}{'prec':>8}")
     print("-" * 58)
     for name, metrics in report.by_type.items():
-        gated = "" if name in STRUCTURED_TYPES else "  (not gated)"
+        note = "" if gated and name in STRUCTURED_TYPES else "  (not gated)"
         print(
             f"{name:<10}{metrics.support:>9}{metrics.true_positives:>8}"
             f"{metrics.false_negatives:>8}{metrics.false_positives:>6}"
-            f"{metrics.recall:>9.3f}{metrics.precision:>8.3f}{gated}"
+            f"{metrics.recall:>9.3f}{metrics.precision:>8.3f}{note}"
         )
 
     print()
@@ -447,13 +459,18 @@ def _print_report(report: Report, min_recall: float) -> None:
             )
 
     failing = report.failing_types(min_recall)
-    if failing:
+    if not gated:
+        below = f"below {min_recall:.2f} for: {', '.join(failing)}" if failing else "all met"
+        print(f"\nreport-only — structured recall {below} (only --mode regex gates)")
+    elif failing:
         print(f"\nFAIL — recall below {min_recall:.2f} for: {', '.join(failing)}")
     else:
         print(f"\nPASS — every structured entity type is at or above {min_recall:.2f} recall")
 
 
-def _print_decoy_report(decoy_report: DecoyReport, max_false_positives: int) -> None:
+def _print_decoy_report(
+    decoy_report: DecoyReport, max_false_positives: int, *, gated: bool = True
+) -> None:
     print(
         f"\ndecoys: {len(decoy_report.hits)} false positive(s) (max allowed {max_false_positives})"
     )
@@ -463,7 +480,9 @@ def _print_decoy_report(decoy_report: DecoyReport, max_false_positives: int) -> 
             f"{hit.value!r} -- {hit.reason}"
         )
 
-    if decoy_report.exceeds(max_false_positives):
+    if not gated:
+        print(f"report-only — {len(decoy_report.hits)} decoy(s) hit (only --mode regex gates)")
+    elif decoy_report.exceeds(max_false_positives):
         print(f"FAIL — {len(decoy_report.hits)} decoy(s) detected, budget is {max_false_positives}")
     else:
         print(f"PASS — decoys at or below the {max_false_positives} false-positive budget")
@@ -485,7 +504,36 @@ def llm_client_from_env() -> LLMClient:
     return client
 
 
+#: One sentence with a name, an organisation and an address, sent once before
+#: the sweep so an unreachable LLM endpoint or a broken encoder stops the run
+#: up front instead of after a full sweep of silently regex-only numbers.
+_PROBE_TEXT: Final = "Ana García Ruiz from Acme Logística lives at Calle Mayor 5, Madrid."
+
+#: Exit code when a detection layer failed: the numbers do not describe the mode.
+EXIT_LAYER_FAILED: Final = 2
+
+
+class _LayerFailures:
+    """Counts the failures ``detect()`` swallowed; prints the first one per layer."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._seen: set[str] = set()
+
+    def __call__(self, layer: str, exc: Exception) -> None:
+        self.count += 1
+        if layer not in self._seen:
+            self._seen.add(layer)
+            print(f"eval: {layer} layer failed ({type(exc).__name__}: {exc})", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Run the sweep and the decoy check for one mode.
+
+    Exit codes: 0 for a clean run, and always for a non-regex mode whose
+    layers all answered (report-only); 1 when ``--mode regex`` misses the
+    recall or decoy gate; 2 when any detection layer call failed.
+    """
     parser = argparse.ArgumentParser(description="Score the detector against the manifest.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
@@ -495,10 +543,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("regex", "llm", "union", "encoder", "regex+encoder"),
         default="regex",
         help=(
-            "Which layer(s) to score. Only 'regex' (the default) gates "
-            "--min-recall/--max-false-positives; 'llm'/'union' are report-only "
-            f"and read {LLM_BASE_URL_ENV_VAR}/{LLM_MODEL_ENV_VAR}; 'encoder'/'regex+encoder' "
-            "read VEIL_ENCODER or --encoder."
+            "Which layer(s) to score. Only 'regex' (the default) gates on "
+            "--min-recall/--max-false-positives; every other mode is report-only "
+            "and exits 0 unless a layer call fails (exit 2). 'llm'/'union' read "
+            f"{LLM_BASE_URL_ENV_VAR}/{LLM_MODEL_ENV_VAR}; 'encoder'/'regex+encoder' "
+            "read --encoder or VEIL_ENCODER."
         ),
     )
     parser.add_argument(
@@ -511,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
         "--encoder-threshold",
         type=float,
         default=None,
-        help="Confidence threshold for the encoder (default 0.4 or VEIL_ENCODER_THRESHOLD).",
+        help="Confidence threshold for the encoder (default VEIL_ENCODER_THRESHOLD, else 0.4).",
     )
     parser.add_argument(
         "--min-recall",
@@ -527,25 +576,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     mode: Mode = args.mode
+    # Decision 3 in docs/review-findings.md: only --mode regex gates.
+    gated = mode == "regex"
 
     use_regex = mode in REGEX_MODES
     use_llm = mode in LLM_MODES
     llm_client = llm_client_from_env() if use_llm else None
     encoder = _encoder_for(args) if mode in ENCODER_MODES else None
+    failures = _LayerFailures()
     try:
-        report = evaluate(args.db, args.manifest, mode=mode, llm_client=llm_client, encoder=encoder)
-        _print_report(report, args.min_recall)
+        if llm_client is not None or encoder is not None:
+            detect(
+                _PROBE_TEXT,
+                use_regex=False,
+                use_llm=use_llm,
+                llm_client=llm_client,
+                encoder=encoder,
+                on_layer_error=failures,
+            )
+            if failures.count:
+                print(
+                    f"eval: --mode {mode} cannot run, its detection layer did not answer "
+                    "the probe call; check the endpoint or encoder and retry",
+                    file=sys.stderr,
+                )
+                return EXIT_LAYER_FAILED
+
+        report = evaluate(
+            args.db,
+            args.manifest,
+            mode=mode,
+            llm_client=llm_client,
+            encoder=encoder,
+            on_layer_error=failures,
+        )
+        _print_report(report, args.min_recall, gated=gated)
         per_cell_ms = 1000 * report.seconds / report.cells if report.cells else 0.0
         print(
             f"\ntiming: {report.seconds:.1f}s over {report.cells} cells ({per_cell_ms:.1f} ms/cell)"
         )
 
-        # Same use_regex/use_llm/llm_client this run already resolved for
-        # evaluate() above -- previously this call
-        # always hardcoded detect_regex(), so an LLM hallucinating a decoy
-        # as valid PII went completely unmeasured in every --mode. Now
-        # --mode llm/union's decoy check exercises the LLM layer too, the
-        # same layer(s) that mode's recall numbers reflect.
+        # The decoy check scores the same layer(s) as the sweep above.
         decoy_report = evaluate_decoys(
             args.db,
             args.decoys,
@@ -553,41 +624,44 @@ def main(argv: list[str] | None = None) -> int:
             use_llm=use_llm,
             llm_client=llm_client,
             encoder=encoder,
+            on_layer_error=failures,
         )
-        _print_decoy_report(decoy_report, args.max_false_positives)
+        _print_decoy_report(decoy_report, args.max_false_positives, gated=gated)
     finally:
         if llm_client is not None:
             llm_client.close()
 
-    # The recall gate is scoped to --mode regex only (an LLM-only/union run
-    # is not expected to reach it and gating it would leave the gate
-    # permanently red). The decoy gate still runs and still fails the
-    # process in every mode, but it now scores
-    # whichever layer(s) that mode enabled (regex-only, LLM-only, or the
-    # union) -- symmetric with what that mode's recall numbers reflect,
-    # rather than always silently checking regex alone.
-    recall_failed = mode == "regex" and bool(report.failing_types(args.min_recall))
-    decoys_failed = decoy_report.exceeds(args.max_false_positives)
-    if mode != "regex":
+    if failures.count:
         print(
-            f"\n--mode {mode}'s recall is report-only (exit code reflects --mode regex's "
-            f"recall gate only); the decoy false-positive gate still applies, scored against "
-            f"--mode {mode}'s own enabled layer(s)."
+            f"\nFAIL — {failures.count} detection layer call(s) failed; these numbers "
+            f"understate --mode {mode} and must not be reported"
         )
+        return EXIT_LAYER_FAILED
+    if not gated:
+        return 0
+    recall_failed = bool(report.failing_types(args.min_recall))
+    decoys_failed = decoy_report.exceeds(args.max_false_positives)
     return 1 if recall_failed or decoys_failed else 0
 
 
 def _encoder_for(args: argparse.Namespace) -> SpanEncoder:
     # Lazy import: the encoder's heavy optional dependencies only load here.
-    from veil_pii_middleware.core.encoder import DEFAULT_THRESHOLD, build_encoder, encoder_from_env
+    from veil_pii_middleware.core.encoder import (
+        DEFAULT_THRESHOLD,
+        ENCODER_ENV_VAR,
+        ENCODER_THRESHOLD_ENV_VAR,
+        build_encoder,
+    )
 
-    if args.encoder:
-        threshold = args.encoder_threshold
-        return build_encoder(args.encoder, threshold=threshold or DEFAULT_THRESHOLD)
-    encoder = encoder_from_env()
-    if encoder is None:
+    spec = args.encoder or os.environ.get(ENCODER_ENV_VAR, "").strip()
+    if not spec:
         raise SystemExit("--mode encoder needs --encoder or VEIL_ENCODER")
-    return encoder
+    # `is None`, not `or`: an explicit --encoder-threshold 0 is a valid threshold.
+    threshold: float | None = args.encoder_threshold
+    if threshold is None:
+        raw = os.environ.get(ENCODER_THRESHOLD_ENV_VAR, "").strip()
+        threshold = float(raw) if raw else DEFAULT_THRESHOLD
+    return build_encoder(spec, threshold=threshold)
 
 
 if __name__ == "__main__":

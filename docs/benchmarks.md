@@ -5,8 +5,10 @@ models. Measured on 2026-11-10/11 with `demo/eval.py` against the seeded synthet
 
 > **Superseded corpus.** These numbers come from the first corpus (533 cells, only 6 instances
 > for ADDRESS/DOB/USERNAME/SENSITIVE). The corpus has since grown to 839 cells with at least
-> 100 instances per type and 194 decoys. All runs must be repeated on it before these figures
-> are presented.
+> 100 instances per type and 194 decoys. The scoring rules also changed (2026-11-11, see
+> Matching below): soft coverage went from one span covering half of the value to the union
+> of spans covering 90%, each span credits one value, and decoys count on any overlap. All
+> runs must be repeated before these figures are presented.
 
 ## Setup
 
@@ -20,12 +22,18 @@ models. Measured on 2026-11-10/11 with `demo/eval.py` against the seeded synthet
   - Encoders: `--mode regex+encoder --encoder <spec>`, threshold 0.4, GPU, batched.
 - **Matching:**
   - Structured types (DNI, IBAN, card, secret...) must match the exact span and type.
-  - Soft types match when one soft span covers at least half of the value, whatever its
-    label. For the soft layer the label is cosmetic: a company tagged `PERSON` is still
-    tokenized and never leaves the machine.
+  - Soft types match when the soft spans credited to the value together cover at least 90%
+    of its alphanumeric characters, whatever their label. For the soft layer the label is
+    cosmetic: a company tagged `PERSON` is still tokenized and never leaves the machine.
+  - Each span is credited to at most one value, so one span stretched over a name and a
+    diagnosis detects only one of them. A span on part of a real value that falls short of
+    90% is not a false positive.
 - **Decoys:** values that *look* like PII but are not (DNI with a wrong control letter,
   Luhn-failing card, IP with an octet over 255, a clock time, `password=********`, a plate
-  with vowels...). Any hit is a guaranteed false positive.
+  with vowels...). Any span overlapping a decoy is a guaranteed false positive.
+- **Exit codes:** only `--mode regex` gates (1 on a recall or decoy failure); every other
+  mode is report-only. Any mode exits 2 when a detection layer call failed, since its
+  numbers would silently be regex-only.
 
 ## Metrics
 

@@ -62,6 +62,7 @@ __all__ = [
     "Detector",
     "EntityType",
     "LLMClient",
+    "LayerErrorHandler",
     "SpanEncoder",
     "llm_client_from_env",
     "LLMDetectionError",
@@ -1295,6 +1296,20 @@ def clear_llm_cache() -> None:
     _person_confirmation_cache.clear()
 
 
+#: Receives a failure ``detect()`` swallowed, as ``(layer, exception)``.
+LayerErrorHandler = Callable[[str, Exception], None]
+
+
+def _layer_failed(
+    handler: LayerErrorHandler | None, layer: str, exc: Exception, message: str
+) -> None:
+    """Hand a swallowed layer failure to ``handler``, or log it (no PII) to stderr."""
+    if handler is not None:
+        handler(layer, exc)
+        return
+    print(f"veil detector: {message.format(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
+
+
 def detect(
     text: str,
     *,
@@ -1302,6 +1317,7 @@ def detect(
     use_llm: bool = True,
     llm_client: LLMClient | None = None,
     encoder: SpanEncoder | None = None,
+    on_layer_error: LayerErrorHandler | None = None,
 ) -> list[Span]:
     """Union the regex, LLM and encoder layers over ``text``, per the enabled flags.
 
@@ -1324,6 +1340,11 @@ def detect(
     ``encoder``, when supplied, adds an encoder-based NER model's spans
     (``core.encoder``) to the same union, independent of the LLM layer. A
     failure there is logged and skipped, like the LLM leg.
+
+    ``on_layer_error``, when supplied, receives every swallowed failure as
+    ``(layer, exception)`` (``layer`` is ``"llm"``, ``"llm-confirm"`` or
+    ``"encoder"``) instead of the stderr line, so a caller that must not
+    report numbers from a silently degraded run (``demo/eval.py``) can count them.
     """
     spans: list[Span] = []
     if use_regex:
@@ -1332,19 +1353,21 @@ def detect(
         try:
             spans.extend(detect_llm(text, llm_client))
         except Exception as exc:
-            print(
-                f"veil detector: LLM layer failed ({type(exc).__name__}: {exc}), "
-                "falling back to regex-only spans for this block",
-                file=sys.stderr,
+            _layer_failed(
+                on_layer_error,
+                "llm",
+                exc,
+                "LLM layer failed ({}), falling back to regex-only spans for this block",
             )
         else:
             try:
                 spans.extend(_confirm_missed_person_candidates(text, spans, llm_client))
             except Exception as exc:
-                print(
-                    f"veil detector: person-candidate confirmation failed "
-                    f"({type(exc).__name__}: {exc}), continuing without it",
-                    file=sys.stderr,
+                _layer_failed(
+                    on_layer_error,
+                    "llm-confirm",
+                    exc,
+                    "person-candidate confirmation failed ({}), continuing without it",
                 )
     if encoder is not None:
         try:
@@ -1354,9 +1377,10 @@ def detect(
                 if not (span.entity_type in _NAME_LIKE_TYPES and _is_known_non_pii_name(span.text))
             )
         except Exception as exc:
-            print(
-                f"veil detector: encoder layer failed ({type(exc).__name__}: {exc}), "
-                "continuing without it for this block",
-                file=sys.stderr,
+            _layer_failed(
+                on_layer_error,
+                "encoder",
+                exc,
+                "encoder layer failed ({}), continuing without it for this block",
             )
     return merge_spans(spans)

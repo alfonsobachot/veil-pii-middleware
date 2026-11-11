@@ -430,7 +430,8 @@ check-digit-provable types; `PERSON`/`ADDRESS` are reported (`not gated`) becaus
 could ever satisfy a 100%-recall gate for them, and hiding that number would misrepresent the
 system's actual guarantee. The decoy check (a set of deliberately invalid or PII-shaped
 non-PII values that must never be detected) is scored against whichever layer(s) the chosen
-`--mode` enables — see §9 for what the `--mode union`/`--mode llm` decoy failures above
+`--mode` enables; outside `--mode regex` it is report-only, and any mode exits 2 when a
+detection layer call fails — see §9 for what the `--mode union`/`--mode llm` decoy failures above
 actually mean.
 
 ---
