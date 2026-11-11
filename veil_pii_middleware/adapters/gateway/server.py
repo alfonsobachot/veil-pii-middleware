@@ -480,6 +480,45 @@ _HOP_BY_HOP = {
 }
 
 
+#: Largest body a panel endpoint accepts. Real ones are a few hundred bytes.
+_PANEL_MAX_BODY_BYTES: Final = 64_000
+
+#: Tool names a hook may report (Claude Code built-ins and `mcp__...`).
+_HOOK_TOOL_NAME_RE: Final = re.compile(r"^[A-Za-z0-9_.:\-]{1,128}$")
+
+#: Held while a metrics comparison runs; a second POST gets 409 instead of
+#: starting another multi-minute run that competes with live traffic.
+_comparison_lock = threading.Lock()
+
+
+class _PanelBodyError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _read_panel_body(handler: BaseHTTPRequestHandler) -> bytes:
+    """Read a panel request body, raising ``_PanelBodyError`` (400/413) if unusable.
+
+    On error the connection is marked for closing, since an unread body
+    would otherwise be parsed as the next request.
+    """
+    raw_length = handler.headers.get("Content-Length", "0") or "0"
+    try:
+        length = int(raw_length)
+    except ValueError:
+        handler.close_connection = True
+        raise _PanelBodyError(400, "Content-Length must be an integer") from None
+    if length < 0:
+        handler.close_connection = True
+        raise _PanelBodyError(400, "Content-Length must not be negative")
+    if length > _PANEL_MAX_BODY_BYTES:
+        handler.close_connection = True
+        raise _PanelBodyError(413, f"body larger than {_PANEL_MAX_BODY_BYTES} bytes")
+    return handler.rfile.read(length) if length else b""
+
+
 def _new_session_id() -> str:
     return f"gateway-{uuid.uuid4()}"
 
@@ -1662,17 +1701,26 @@ def make_handler(
             )
 
         def _serve_vault_reveal(self) -> None:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length else b""
+            try:
+                raw = _read_panel_body(self)
+            except _PanelBodyError as exc:
+                _write_json(self, exc.status, {"error": exc.message})
+                return
             try:
                 payload = json.loads(raw) if raw else {}
                 token = payload["token"]
                 if not isinstance(token, str) or not token:
                     raise ValueError("token must be a non-empty string")
+                session_id = payload.get("session_id") or self._default_session_id()
+                if not isinstance(session_id, str):
+                    raise ValueError("session_id must be a string")
             except Exception:
-                _write_json(self, 400, {"error": 'request body must be {"token": "..."}'})
+                _write_json(
+                    self,
+                    400,
+                    {"error": 'request body must be {"token": "...", "session_id"?: "..."}'},
+                )
                 return
-            session_id = payload.get("session_id") or self._default_session_id()
             VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with Vault(VAULT_DB_PATH, session_id) as vault:
@@ -1728,13 +1776,19 @@ def make_handler(
             # never automatically, by design. Persisted
             # so the result survives a gateway restart; the panel's default
             # view is whatever this last wrote, not a fresh run every time.
-            payload = {
-                "available": True,
-                "generated_at": datetime.now(UTC).isoformat(),
-                "modes": {mode: _run_comparison_mode(mode) for mode in _COMPARISON_MODES},
-                "encoder": _run_encoder_comparison(),
-            }
-            _write_metrics_comparison_cache(payload)
+            if not _comparison_lock.acquire(blocking=False):
+                _write_json(self, 409, {"error": "a comparison is already running"})
+                return
+            try:
+                payload = {
+                    "available": True,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                    "modes": {mode: _run_comparison_mode(mode) for mode in _COMPARISON_MODES},
+                    "encoder": _run_encoder_comparison(),
+                }
+                _write_metrics_comparison_cache(payload)
+            finally:
+                _comparison_lock.release()
             _write_json(self, 200, payload)
 
         def _serve_hook_event(self) -> None:
@@ -1754,8 +1808,10 @@ def make_handler(
             hook never inspects the response, matching its own best-effort
             contract (``adapters/hooks/_panel_report.py``).
             """
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length else b""
+            try:
+                raw = _read_panel_body(self)
+            except _PanelBodyError:
+                raw = b""
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -1775,7 +1831,7 @@ def make_handler(
                 or hook not in _ALLOWED_HOOK_NAMES
                 or phase not in _ALLOWED_HOOK_PHASES
                 or not isinstance(tool_name, str)
-                or not tool_name
+                or not _HOOK_TOOL_NAME_RE.match(tool_name)
             ):
                 return
             turn_request_id = pipeline_bus.open_turn_for_session(session_id)

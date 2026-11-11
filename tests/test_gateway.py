@@ -2266,3 +2266,80 @@ class TestEmptyResponseFraming:
         assert first.content == second.content == b""
         if status != 200:
             assert "transfer-encoding" not in first.headers
+
+
+class TestPanelBodyValidation:
+    @staticmethod
+    def _raw_post(url: str, content_length: str, body: bytes = b"") -> tuple[int, bytes]:
+        """Send a request with an arbitrary Content-Length header over a raw socket."""
+        parts = urlsplit(url)
+        request = (
+            f"POST {parts.path} HTTP/1.1\r\nHost: {parts.netloc}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {content_length}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode() + body
+        with socket.create_connection((parts.hostname, parts.port), timeout=10) as sock:
+            sock.sendall(request)
+            response = b""
+            while chunk := sock.recv(65536):
+                response += chunk
+        status = int(response.split(b" ", 2)[1])
+        return status, response.split(b"\r\n\r\n", 1)[1]
+
+    @pytest.mark.parametrize(
+        ("content_length", "status"), [("abc", 400), ("-1", 400), ("100000", 413)]
+    )
+    def test_reveal_rejects_a_bad_content_length(
+        self, servers: _Servers, content_length: str, status: int
+    ) -> None:
+        got, body = self._raw_post(f"{servers.gateway_url}/veil-panel/vault/reveal", content_length)
+
+        assert got == status
+        assert "error" in json.loads(body)
+
+    def test_reveal_rejects_a_non_string_session_id(self, servers: _Servers) -> None:
+        resp = httpx.post(
+            f"{servers.gateway_url}/veil-panel/vault/reveal",
+            json={"token": "PII_EMAIL_0001", "session_id": 7},
+            timeout=10,
+        )
+
+        assert resp.status_code == 400
+
+    def test_hook_event_with_a_bad_content_length_still_answers_204(
+        self, servers: _Servers
+    ) -> None:
+        status, _ = self._raw_post(f"{servers.gateway_url}/veil-panel/hook-event", "abc")
+
+        assert status == 204
+
+    @pytest.mark.parametrize("tool_name", ["x" * 129, "Bash; rm -rf /", "a\nb"])
+    def test_hook_event_with_an_invalid_tool_name_publishes_nothing(
+        self, servers: _Servers, tool_name: str
+    ) -> None:
+        _run_request_and_collect_pipeline_events(
+            servers, {"messages": [{"role": "user", "content": "run the query"}]}
+        )
+
+        resp = _post(
+            f"{servers.gateway_url}/veil-panel/hook-event",
+            json={
+                "session_id": HOOK_SESSION_ID,
+                "hook": "pre_tool_use",
+                "phase": "start",
+                "tool_name": tool_name,
+            },
+        )
+        assert resp.status_code == 204
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        assert not [e for e in _parse_sse_events("".join(chunks)) if e.get("kind") == "hook"]
+
+    def test_second_comparison_while_one_runs_gets_409(self, servers: _Servers) -> None:
+        assert gateway_server._comparison_lock.acquire(blocking=False)
+        try:
+            resp = httpx.post(f"{servers.gateway_url}/veil-panel/metrics/comparison", timeout=10)
+        finally:
+            gateway_server._comparison_lock.release()
+
+        assert resp.status_code == 409
