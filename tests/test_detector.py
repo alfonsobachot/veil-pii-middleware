@@ -1121,3 +1121,38 @@ def test_iban_of_any_length_is_detected_whole(text: str, iban: str) -> None:
     spans = detect_regex(text)
 
     assert [(span.entity_type, span.text) for span in spans] == [(EntityType.IBAN, iban)]
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("DB_PASSWORD=hunter2222", "hunter2222"),
+        ("POSTGRES_PASSWORD=Sup3rS3cret!", "Sup3rS3cret!"),
+        (
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ),
+        ("access_token=abcdef123456789", "abcdef123456789"),
+        ("token: abcdef123456789", "abcdef123456789"),
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+    ],
+)
+def test_common_secret_shapes_are_detected(text: str, secret: str) -> None:
+    spans = detect_regex(text)
+
+    assert [(span.entity_type, span.text) for span in spans] == [(EntityType.SECRET, secret)]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "retry=3",
+        "timeout=30s",
+        "key=value",
+        "password=<redacted>",
+        "tokens=1234567",
+        "token_count=123456",
+    ],
+)
+def test_config_lookalikes_are_not_secrets(text: str) -> None:
+    assert detect_regex(text) == []

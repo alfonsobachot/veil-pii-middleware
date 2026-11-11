@@ -473,9 +473,18 @@ _SECRET_PATTERNS: Final = (
         r"(?P<value>-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]+?"
         r"-----END (?:[A-Z]+ )*PRIVATE KEY-----)"
     ),
+    # `key = value` with a credential-like key. Any `_`/`-`/`.`-joined prefix
+    # is allowed (`DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`, `spring.x.password`)
+    # but only a `key`/`hash` suffix, so `token_count=` and `tokens=` stay clean.
     re.compile(
-        r"(?i)\b(?:password|passwd|pwd|secret|api[_\-]?key|access[_\-]?key|auth[_\-]?token|"
-        r"client[_\-]?secret|private[_\-]?key)[\"']?\s*[:=]\s*[\"']?(?P<value>[^\s\"',;&]{6,})"
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_\-.])*"
+        r"(?:password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|"
+        r"client[_\-]?secret|private[_\-]?key)(?:[_\-]?(?:key|hash))?"
+        r"[\"']?\s*[:=]\s*[\"']?(?P<value>[^\s\"',;&]{6,})"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])authorization[\"']?\s*[:=]\s*[\"']?(?:basic|bearer|token)\s+"
+        r"(?P<value>[^\s\"',;]{6,})"
     ),
     re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:(?P<value>[^\s@/]{3,})@"),
 )
