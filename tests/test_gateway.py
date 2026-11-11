@@ -1246,19 +1246,15 @@ class TestCycleKindClassification:
 
 
 class TestExcludedMetadataNeverTokenized:
-    """Live-reported: Claude-Code-injected metadata must never be tokenized.
+    """Only Anthropic's fixed commit-trailer address is excluded from tokenization.
 
-    Two distinct findings from the same live-testing session: (1) a
-    `<system-reminder>` block interleaved with the human's own typed text in
-    one message leaf carries injected metadata (e.g. the user's own account
-    email) that isn't anything the human wrote -- but the real human text
-    right next to it in that same leaf must still be scanned normally; (2)
-    Anthropic's own fixed commit-trailer address
-    (`noreply@anthropic.com`) is Claude Code's own static tool-instruction
-    text, never a real person's address.
+    Wrapper tags Claude Code injects (`<system-reminder>`, `<session>`, ...)
+    are stripped for display only. Their contents are tokenized: Claude Code
+    puts real file content inside `<system-reminder>`, and a tool result can
+    contain any of these tags verbatim.
     """
 
-    def test_email_inside_a_system_reminder_is_left_untouched(self, servers: _Servers) -> None:
+    def test_email_inside_a_system_reminder_is_tokenized(self, servers: _Servers) -> None:
         real_email = "customer@example.com"
         body = {
             "messages": [
@@ -1275,9 +1271,41 @@ class TestExcludedMetadataNeverTokenized:
         forwarded = json.loads(servers.upstream_state.requests[-1]["body"])
         forwarded_text = str(forwarded["messages"][0]["content"])
 
-        assert VALID_EMAIL in forwarded_text  # inside the reminder: untouched
-        assert real_email not in forwarded_text  # the human's own text: tokenized
+        assert VALID_EMAIL not in forwarded_text
+        assert real_email not in forwarded_text
         assert "PII_EMAIL_0001" in forwarded_text
+        assert "PII_EMAIL_0002" in forwarded_text
+
+    @pytest.mark.parametrize(
+        "wrapped",
+        [
+            "<session>row: maria.lopez@example.com 12345678Z</session>",
+            "<Session id=1>row: maria.lopez@example.com 12345678Z</session>",
+            "<system-reminder>row: maria.lopez@example.com 12345678Z</system-reminder>",
+        ],
+    )
+    def test_pii_inside_wrapper_tags_in_a_tool_result_is_tokenized(
+        self, servers: _Servers, wrapped: str
+    ) -> None:
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": wrapped}
+                    ],
+                },
+            ],
+        }
+
+        resp = _post(f"{servers.gateway_url}/v1/messages", json=body)
+        assert resp.status_code == 200
+        forwarded = servers.upstream_state.requests[-1]["body"].decode("utf-8")
+
+        assert "maria.lopez@example.com" not in forwarded
+        assert "12345678Z" not in forwarded
+        assert "PII_EMAIL_" in forwarded
+        assert "PII_DNI_" in forwarded
 
     def test_anthropic_commit_trailer_address_is_never_tokenized(self, servers: _Servers) -> None:
         body = {

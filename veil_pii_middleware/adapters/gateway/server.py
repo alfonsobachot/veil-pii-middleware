@@ -752,18 +752,14 @@ _ANTHROPIC_COMMIT_TRAILER_EMAIL: Final = "noreply@anthropic.com"
 def _excluded_ranges(text: str) -> list[tuple[int, int]]:
     """Ranges within one string leaf that must never be tokenized.
 
-    Passed as ``tokenize()``'s ``exclude`` callback (``core/tokenizer.py``):
-    unlike ``skip`` (all-or-nothing per leaf), this only carves out specific
-    known non-user substrings that can be *interleaved* with real,
-    human-authored content in the very same leaf -- exactly what a
-    `<system-reminder>` block prepended before the human's own typed text
-    is (the same wrapper set ``_strip_injected_wrapper_tags`` already
-    recognizes for *display*; here the same recognition also keeps its
-    contents, e.g. injected account/environment metadata, out of the
-    *substitution* pass) -- plus Anthropic's own fixed commit-trailer
-    address, wherever in a leaf it happens to appear.
+    Passed as ``tokenize()``'s ``exclude`` callback (``core/tokenizer.py``).
+    Only Anthropic's own fixed commit-trailer address is carved out.
+    Wrapper tags (``_INJECTED_WRAPPER_TAGS``) are stripped for *display*
+    only: their contents are tokenized like any other text, because Claude
+    Code puts real file content, IDE selections and hook context inside
+    `<system-reminder>`, and a tool result can contain any of these tags.
     """
-    ranges = [(m.start(), m.end()) for m in _INJECTED_WRAPPER_TAG_RE.finditer(text)]
+    ranges = []
     start = text.find(_ANTHROPIC_COMMIT_TRAILER_EMAIL)
     while start != -1:
         ranges.append((start, start + len(_ANTHROPIC_COMMIT_TRAILER_EMAIL)))
