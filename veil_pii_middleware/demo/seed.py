@@ -33,9 +33,13 @@ from veil_pii_middleware.core.detector import (
     EntityType,
     detect_regex,
     valid_card,
+    valid_cif,
     valid_dni,
     valid_iban,
+    valid_ipv4,
+    valid_ipv6,
     valid_nie,
+    valid_nss,
     valid_spanish_phone,
 )
 
@@ -64,6 +68,10 @@ N_LOG_LINES: Final = 200
 #: recorded so the evaluation reports them as misses until the LLM layer lands.
 PERSON: Final = "PERSON"
 ORG: Final = "ORG"
+ADDRESS: Final = "ADDRESS"
+DOB: Final = "DOB"
+USERNAME: Final = "USERNAME"
+SENSITIVE: Final = "SENSITIVE"
 
 _VALIDATORS: Final[dict[str, Callable[[str], bool]]] = {
     EntityType.DNI: valid_dni,
@@ -71,6 +79,9 @@ _VALIDATORS: Final[dict[str, Callable[[str], bool]]] = {
     EntityType.IBAN: valid_iban,
     EntityType.CARD: valid_card,
     EntityType.PHONE: valid_spanish_phone,
+    EntityType.CIF: valid_cif,
+    EntityType.NSS: valid_nss,
+    EntityType.IP: lambda v: valid_ipv4(v) or valid_ipv6(v),
 }
 
 SCHEMA: Final = """
@@ -102,6 +113,9 @@ CREATE TABLE webhooks (
 );
 CREATE TABLE decoy_samples (
     id INTEGER PRIMARY KEY, category TEXT NOT NULL, note TEXT NOT NULL
+);
+CREATE TABLE crm_notes (
+    id INTEGER PRIMARY KEY, author TEXT NOT NULL, body TEXT NOT NULL
 );
 """
 
@@ -155,6 +169,33 @@ class _Corpus:
         offset = text.find(value)
         if offset < 0:
             raise ValueError(f"{entity_type} {value!r} is not present in {table}.{column}")
+        self.instances.append(
+            Instance(
+                table=table,
+                column=column,
+                row_id=row_id,
+                offset=offset,
+                entity_type=entity_type,
+                value=value,
+            )
+        )
+
+    def note_at(
+        self,
+        table: str,
+        column: str,
+        row_id: int,
+        text: str,
+        value: str,
+        entity_type: str,
+        offset: int,
+    ) -> None:
+        """Like ``note``, for a value located at a known ``offset``."""
+        validator = _VALIDATORS.get(entity_type)
+        if validator is not None and not validator(value):
+            raise ValueError(f"generated {entity_type} fails its own check digit: {value!r}")
+        if text[offset : offset + len(value)] != value:
+            raise ValueError(f"{entity_type} {value!r} is not at offset {offset} in {table}")
         self.instances.append(
             Instance(
                 table=table,
@@ -268,10 +309,10 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         customer_id = (invoice_id % N_CUSTOMERS) + 1
         if invoice_id % 3 == 0:
             phone = corpus.phone(invoice_id)
-            notes = f"Contacto de facturacion: {phone}. Revisar antes de emitir."
+            notes = f"Billing contact: {phone}. Check before issuing."
         else:
             phone = ""
-            notes = "Sin incidencias."
+            notes = "No issues."
         cursor.execute(
             "INSERT INTO invoices VALUES (?, ?, ?, ?)",
             (invoice_id, customer_id, round(faker.random_int(10, 5000) + 0.99, 2), notes),
@@ -306,20 +347,27 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         else:
             rendered = shown
         card = faker.credit_card_number()
+        extra, extra_notes = _ticket_extra(corpus, ticket_id)
         body = (
-            f"El cliente escribio desde {rendered} pidiendo la factura. "
-            f"Dice que le cobraron en la tarjeta {card} por error."
+            f"Customer wrote from {rendered} asking for the invoice. "
+            f"Says they were charged on card {card} by mistake. {extra}"
         )
         cursor.execute(
             "INSERT INTO support_tickets VALUES (?, ?, ?, ?)",
-            (ticket_id, customer_id, "Cobro duplicado", body),
+            (ticket_id, customer_id, "Duplicate charge", body),
         )
         corpus.note("support_tickets", "body", ticket_id, body, shown, EntityType.EMAIL)
         corpus.note("support_tickets", "body", ticket_id, body, card, EntityType.CARD)
+        for value, extra_type in extra_notes:
+            corpus.note("support_tickets", "body", ticket_id, body, value, extra_type)
 
     # --- logs: a name that exists only inside a stack trace, plus an IP ---
     for log_id in range(1, N_LOG_LINES + 1):
-        ip = ".".join(str(faker.random_int(1, 254)) for _ in range(4))
+        ip = (
+            faker.ipv6()
+            if log_id % 4 == 1
+            else ".".join(str(faker.random_int(1, 254)) for _ in range(4))
+        )
         holder = faker.name()
         message = (
             f"Traceback (most recent call last):\n"
@@ -327,24 +375,137 @@ def _build(corpus: _Corpus, connection: sqlite3.Connection) -> None:
             f"    raise BillingError(f'card holder {holder} declined')\n"
             f"BillingError: declined from {ip}"
         )
+        log_extra: list[tuple[str, str]] = []
+        if log_id % 4 == 2:
+            mac = faker.mac_address()
+            message += f"\nDEBUG device {mac} dropped from the session"
+            log_extra.append((mac, EntityType.MAC))
+        if log_id % 10 == 3:
+            line, secret = _secret_line(corpus, log_id)
+            message += f"\nDEBUG loaded config: {line}"
+            log_extra.append((secret, EntityType.SECRET))
         cursor.execute(
             "INSERT INTO error_logs VALUES (?, ?, ?)",
             (log_id, faker.random_element(("ERROR", "WARN")), message),
         )
         corpus.note("error_logs", "message", log_id, message, ip, EntityType.IP)
         corpus.note("error_logs", "message", log_id, message, holder, PERSON)
+        for value, extra_type in log_extra:
+            corpus.note("error_logs", "message", log_id, message, value, extra_type)
 
     # --- webhooks: a national id inside a JSON payload --------------------
     for webhook_id in range(1, N_TICKETS + 1):
         national_id = faker.nif()
+        cif = _cif(corpus)
+        nss = _nss(corpus, webhook_id)
         payload = json.dumps(
-            {"event": "customer.updated", "data": {"tax_id": national_id, "source": "portal"}},
+            {
+                "event": "customer.updated",
+                "data": {
+                    "tax_id": national_id,
+                    "company_tax_id": cif,
+                    "social_security": nss,
+                    "source": "portal",
+                },
+            },
             sort_keys=True,
         )
         cursor.execute(
             "INSERT INTO webhooks VALUES (?, ?, ?)", (webhook_id, "customer.updated", payload)
         )
         corpus.note("webhooks", "payload", webhook_id, payload, national_id, EntityType.DNI)
+        corpus.note("webhooks", "payload", webhook_id, payload, cif, EntityType.CIF)
+        corpus.note("webhooks", "payload", webhook_id, payload, nss, EntityType.NSS)
+
+
+#: (sentence fragment, the sensitive term the ground truth records). The
+#: manifest records the core term; soft layers are scored by overlap, so a
+#: model returning the whole phrase still counts.
+_CONDITIONS: Final = (
+    ("is diabetic", "diabetic"),
+    ("is undergoing chemotherapy", "chemotherapy"),
+    ("uses a wheelchair", "wheelchair"),
+    ("has a severe hearing impairment", "hearing impairment"),
+    ("is on sick leave for depression", "depression"),
+    ("is pregnant", "pregnant"),
+)
+_PLATE_LETTERS: Final = "BCDFGHJKLMNPRSTVWXYZ"
+_ALNUM: Final = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _random_string(corpus: _Corpus, alphabet: str, length: int) -> str:
+    return "".join(corpus.faker.random_element(alphabet) for _ in range(length))
+
+
+def _ticket_extra(corpus: _Corpus, ticket_id: int) -> tuple[str, list[tuple[str, str]]]:
+    """One extra sentence per ticket, rotating through the newer categories."""
+    faker = corpus.faker
+    kind = ticket_id % 5
+    if kind == 0:
+        person = faker.name()
+        dob = faker.date_of_birth(minimum_age=18, maximum_age=90).strftime("%d/%m/%Y")
+        return f"Contact person: {person}, born {dob}.", [(person, PERSON), (dob, DOB)]
+    if kind == 1:
+        address = f"{faker.street_address()}, {faker.postcode()} {faker.city()}"
+        return f"Please ship the corrected invoice to {address}.", [(address, ADDRESS)]
+    if kind == 2:
+        username = f"{faker.user_name()}{faker.random_int(10, 99)}"
+        return f"Their portal username is {username}.", [(username, USERNAME)]
+    if kind == 3:
+        person = faker.name()
+        phrase, term = _CONDITIONS[ticket_id % len(_CONDITIONS)]
+        return (
+            f"Note from the agent: {person} {phrase}, please handle with priority.",
+            [(person, PERSON), (term, SENSITIVE)],
+        )
+    plate = f"{faker.random_int(1000, 9999)} {_random_string(corpus, _PLATE_LETTERS, 3)}"
+    lat = f"{faker.random_int(36, 43)}.{faker.random_int(100000, 999999)}"
+    lon = f"-{faker.random_int(1, 8)}.{faker.random_int(100000, 999999)}"
+    gps = f"{lat}, {lon}"
+    return (
+        f"Courier van {plate} reported its last location at {gps}.",
+        [(plate, EntityType.PLATE), (gps, EntityType.GPS)],
+    )
+
+
+def _secret_line(corpus: _Corpus, log_id: int) -> tuple[str, str]:
+    """A config line leaking one credential, cycling through common shapes."""
+    kind = (log_id // 10) % 4
+    if kind == 0:
+        password = _random_string(corpus, _ALNUM, 14)
+        return f"DATABASE_URL=postgres://billing:{password}@db.internal:5432/app", password
+    if kind == 1:
+        key = "AKIA" + _random_string(corpus, "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", 16)
+        return f"aws_access_key_id={key}", key
+    if kind == 2:
+        body = _random_string(corpus, _ALNUM, 24)
+        signature = _random_string(corpus, _ALNUM, 32)
+        jwt = f"eyJhbGciOiJIUzI1NiJ9.eyJ{body}.{signature}"
+        return f"Authorization: Bearer {jwt}", jwt
+    key = "sk_live_" + _random_string(corpus, _ALNUM, 24)
+    return f"stripe.api_key = {key}", key
+
+
+def _cif(corpus: _Corpus) -> str:
+    """A valid company tax ID (letter B: limited company, numeric control)."""
+    digits = "".join(str(corpus.faker.random_digit()) for _ in range(7))
+    for control in "0123456789":
+        candidate = f"B{digits}{control}"
+        if valid_cif(candidate):
+            return candidate
+    raise ValueError(f"no valid CIF control for {digits!r}")  # pragma: no cover
+
+
+def _nss(corpus: _Corpus, row: int) -> str:
+    """A valid social security number, alternately compact and slash-separated."""
+    province = corpus.faker.random_int(1, 52)
+    number = corpus.faker.random_int(10_000_000, 99_999_999)
+    head = f"{province:02d}{number:08d}"
+    control = int(head) % 97
+    compact = f"{head}{control:02d}"
+    if not valid_nss(compact):  # pragma: no cover - same rule as the validator
+        raise ValueError(f"generated NSS fails its own check: {compact!r}")
+    return compact if row % 2 else f"{head[:2]}/{head[2:]}/{control:02d}"
 
 
 # --------------------------------------------------------------------------
@@ -418,6 +579,258 @@ def _bad_mod97_ibans(faker: Faker, count: int) -> list[str]:
     return values
 
 
+def _bad_cifs(corpus: _Corpus, count: int) -> list[str]:
+    """CIF-shaped values whose control digit is deliberately wrong."""
+    values: list[str] = []
+    for _ in range(count):
+        good = _cif(corpus)
+        bad = good[:-1] + str((int(good[-1]) + 1) % 10)
+        if valid_cif(bad):  # pragma: no cover - one control per digit set
+            raise ValueError(f"could not construct an invalid CIF from {good!r}")
+        values.append(bad)
+    return values
+
+
+def _bad_nss(corpus: _Corpus, count: int) -> list[str]:
+    """NSS-shaped values whose control digits are deliberately wrong."""
+    values: list[str] = []
+    for row in range(count):
+        bad = ""
+        while not bad or valid_card(bad):  # a 12-digit run can pass Luhn by chance
+            good = _nss(corpus, 1).replace("/", "")
+            bad = f"{good[:10]}{(int(good[10:]) + 1) % 97:02d}"
+        if valid_nss(bad):  # pragma: no cover - mod 97 changes on +1
+            raise ValueError(f"could not construct an invalid NSS from {good!r}")
+        values.append(bad if row % 2 else f"{bad[:2]}/{bad[2:10]}/{bad[10:]}")
+    return values
+
+
+def _bad_nies(corpus: _Corpus, count: int) -> list[str]:
+    """NIE-shaped values whose control letter is deliberately wrong."""
+    values: list[str] = []
+    for _ in range(count):
+        good = corpus.faker.nie()
+        for letter in _DNI_DECOY_LETTERS:
+            candidate = good[:-1] + letter
+            if not valid_nie(candidate):
+                values.append(candidate)
+                break
+    return values
+
+
+# --------------------------------------------------------------------------
+# CRM notes: free-text agent notes, four sentences each, mixing entity types.
+# Exists to give every type at least ~100 ground-truth instances -- with a
+# handful per type, a 100% score is statistically meaningless (6/6 is
+# compatible with a true recall as low as 61%).
+# --------------------------------------------------------------------------
+
+#: Extra instances per type the notes add on top of the base corpus, chosen so
+#: every type reaches at least 100.
+NOTE_QUOTAS: Final[dict[str, int]] = {
+    ADDRESS: 94,
+    DOB: 94,
+    USERNAME: 94,
+    SENSITIVE: 94,
+    EntityType.PLATE: 94,
+    EntityType.GPS: 94,
+    ORG: 80,
+    EntityType.SECRET: 80,
+    EntityType.NIE: 96,
+    EntityType.CIF: 70,
+    EntityType.NSS: 70,
+    EntityType.CARD: 70,
+    EntityType.PHONE: 67,
+    EntityType.DNI: 54,
+    EntityType.MAC: 50,
+    EntityType.EMAIL: 20,
+}
+SENTENCES_PER_NOTE: Final = 4
+
+#: (phrase as written, core term the ground truth records) -- health,
+#: disability, religion, sexual orientation, political and union affiliation.
+_SENSITIVE_FACTS: Final = (
+    ("is diabetic", "diabetic"),
+    ("is undergoing chemotherapy", "chemotherapy"),
+    ("uses a wheelchair", "wheelchair"),
+    ("has a severe hearing impairment", "hearing impairment"),
+    ("is on sick leave for depression", "depression"),
+    ("is pregnant", "pregnant"),
+    ("was diagnosed with epilepsy", "epilepsy"),
+    ("is HIV positive", "HIV positive"),
+    ("has multiple sclerosis", "multiple sclerosis"),
+    ("is recovering from a heart attack", "heart attack"),
+    ("suffers from chronic anxiety", "chronic anxiety"),
+    ("is visually impaired", "visually impaired"),
+    ("is in treatment for alcohol addiction", "alcohol addiction"),
+    ("has bipolar disorder", "bipolar disorder"),
+    ("is autistic", "autistic"),
+    ("had a kidney transplant", "kidney transplant"),
+    ("is a practising Muslim", "practising Muslim"),
+    ("is a Jehovah's Witness", "Jehovah's Witness"),
+    ("is an observant Jew", "observant Jew"),
+    ("is a devout Catholic", "devout Catholic"),
+    ("is openly gay", "gay"),
+    ("is transgender", "transgender"),
+    ("is bisexual", "bisexual"),
+    ("is a member of the CCOO union", "member of the CCOO union"),
+    ("is a UGT union delegate", "UGT union delegate"),
+    ("is a Vox party member", "Vox party member"),
+    ("is a Podemos activist", "Podemos activist"),
+    ("has a criminal record", "criminal record"),
+)
+_DOB_FORMATS: Final = ("%d/%m/%Y", "%Y-%m-%d", "%d %B %Y", "%d-%m-%Y")
+
+
+def _note_sentence(corpus: _Corpus, entity: str, index: int) -> tuple[str, list[tuple[str, str]]]:
+    """One sentence carrying one instance of ``entity`` (plus a PERSON when natural)."""
+    faker = corpus.faker
+    variant = index % 4
+    if entity == ADDRESS:
+        address = f"{faker.street_address()}, {faker.postcode()} {faker.city()}"
+        if variant == 1:
+            address = f"{faker.street_address()}, {faker.city()}"
+        templates = (
+            "Ship the replacement card to {v}.",
+            "Customer moved; new address is {v}.",
+            "Billing address on file: {v}.",
+            "Technician visit booked at {v}.",
+        )
+        return templates[variant].format(v=address), [(address, ADDRESS)]
+    if entity == DOB:
+        dob = faker.date_of_birth(minimum_age=18, maximum_age=90).strftime(
+            _DOB_FORMATS[index % len(_DOB_FORMATS)]
+        )
+        person = faker.name()
+        templates = (
+            "{p} was born on {v}.",
+            "Identity check for {p}: DOB {v}.",
+            "{p}'s date of birth is {v}, verified by phone.",
+            "KYC record for {p} (born {v}) updated.",
+        )
+        return templates[variant].format(p=person, v=dob), [(person, PERSON), (dob, DOB)]
+    if entity == USERNAME:
+        username = (
+            f"{faker.user_name()}{faker.random_int(10, 99)}",
+            f"@{faker.user_name()}",
+            f"{faker.first_name().lower()}.{faker.last_name().lower()}{faker.random_int(1, 9)}",
+            f"{faker.user_name()}_{faker.random_int(100, 999)}",
+        )[variant]
+        templates = (
+            "Their portal username is {v}.",
+            "Customer complained publicly as {v} on social media.",
+            "Login {v} locked after five failed attempts.",
+            "Reset the 2FA device for account {v}.",
+        )
+        return templates[variant].format(v=username), [(username, USERNAME)]
+    if entity == SENSITIVE:
+        phrase, term = _SENSITIVE_FACTS[index % len(_SENSITIVE_FACTS)]
+        person = faker.name()
+        templates = (
+            "Agent note: {p} {f}, please handle with care.",
+            "{p} mentioned that they {f2}.",
+            "Escalated because {p} {f} and needs flexible payment dates.",
+            "Do not call {p} before noon; they {f2}.",
+        )
+        # "they is ..." reads badly; keep the third-person phrase for 0/2 only.
+        sentence = templates[variant].format(p=person, f=phrase, f2=phrase)
+        return sentence, [(person, PERSON), (term, SENSITIVE)]
+    if entity == EntityType.PLATE:
+        plate = f"{faker.random_int(1000, 9999)}{' ' if variant % 2 else '-'}" + _random_string(
+            corpus, _PLATE_LETTERS, 3
+        )
+        templates = (
+            "Courier van {v} delivered the package late.",
+            "Parking fine for vehicle {v} disputed by the customer.",
+            "Rental car {v} returned with a scratch.",
+            "Insurance claim filed for car {v}.",
+        )
+        return templates[variant].format(v=plate), [(plate, EntityType.PLATE)]
+    if entity == EntityType.GPS:
+        lat = f"{faker.random_int(36, 43)}.{faker.random_int(100000, 999999)}"
+        lon = f"-{faker.random_int(1, 8)}.{faker.random_int(100000, 999999)}"
+        gps = f"{lat}, {lon}" if variant % 2 else f"{lat},{lon}"
+        templates = (
+            "The app reported the device location at {v}.",
+            "Last known GPS position: {v}.",
+            "Driver coordinates {v} logged at handover.",
+            "Geo fix for the tracker: {v}.",
+        )
+        return templates[variant].format(v=gps), [(gps, EntityType.GPS)]
+    if entity == ORG:
+        org = faker.company()
+        templates = (
+            "Invoice disputed by {v} after the merger.",
+            "{v} asked to add a second billing contact.",
+            "Contract with {v} renews next quarter.",
+            "Payment from {v} bounced twice.",
+        )
+        return templates[variant].format(v=org), [(org, ORG)]
+    if entity == EntityType.SECRET:
+        line, secret = _secret_line(corpus, index * 10)
+        return f"Customer pasted a config snippet: {line}", [(secret, EntityType.SECRET)]
+    if entity == EntityType.NIE:
+        nie = faker.nie()
+        return f"Foreign resident ID (NIE) {nie} attached to the claim.", [(nie, EntityType.NIE)]
+    if entity == EntityType.DNI:
+        dni = faker.nif()
+        return f"Holder identified with DNI {dni} at the branch.", [(dni, EntityType.DNI)]
+    if entity == EntityType.CIF:
+        cif = _cif(corpus)
+        return f"Company tax ID {cif} must appear on the invoice.", [(cif, EntityType.CIF)]
+    if entity == EntityType.NSS:
+        nss = _nss(corpus, index)
+        return f"Payroll lists social security number {nss}.", [(nss, EntityType.NSS)]
+    if entity == EntityType.CARD:
+        card = faker.credit_card_number()
+        return f"Refund goes back to card {card} within five days.", [(card, EntityType.CARD)]
+    if entity == EntityType.PHONE:
+        phone = corpus.phone(index)
+        return f"Call back on {phone} after 6 pm.", [(phone, EntityType.PHONE)]
+    if entity == EntityType.EMAIL:
+        email = faker.free_email() if variant % 2 else faker.company_email()
+        return f"Send the statement to {email} instead.", [(email, EntityType.EMAIL)]
+    if entity == EntityType.MAC:
+        mac = faker.mac_address()
+        if variant % 2:
+            mac = mac.replace(":", "-").upper()
+        return f"Router {mac} keeps dropping the connection.", [(mac, EntityType.MAC)]
+    raise ValueError(f"no note template for {entity}")  # pragma: no cover
+
+
+def _build_notes(corpus: _Corpus, connection: sqlite3.Connection) -> None:
+    """Insert ``crm_notes`` rows, four mixed-type sentences each, meeting ``NOTE_QUOTAS``."""
+    queue: list[tuple[str, int]] = []
+    remaining = dict(NOTE_QUOTAS)
+    index = 0
+    while any(remaining.values()):
+        for entity in NOTE_QUOTAS:
+            if remaining[entity]:
+                queue.append((entity, index))
+                remaining[entity] -= 1
+                index += 1
+    cursor = connection.cursor()
+    for note_id, start in enumerate(range(0, len(queue), SENTENCES_PER_NOTE), start=1):
+        sentences: list[str] = []
+        notes: list[tuple[str, str]] = []
+        for entity, i in queue[start : start + SENTENCES_PER_NOTE]:
+            sentence, found = _note_sentence(corpus, entity, i)
+            sentences.append(sentence)
+            notes.extend(found)
+        body = " ".join(sentences)
+        author = corpus.faker.random_element(("agent", "supervisor", "billing", "fraud"))
+        cursor.execute("INSERT INTO crm_notes VALUES (?, ?, ?)", (note_id, author, body))
+        cursor_pos = 0
+        for value, entity in notes:
+            # Locate each value after the previous one so a repeated substring
+            # (e.g. a short username inside a later sentence) gets its own offset.
+            offset = body.find(value, cursor_pos)
+            if offset < 0:
+                raise ValueError(f"{entity} {value!r} is not present in crm_notes.body")
+            corpus.note_at("crm_notes", "body", note_id, body, value, entity, offset)
+            cursor_pos = offset + len(value)
+
+
 def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
     """Insert every decoy into its own table and record it as a known-negative.
 
@@ -433,7 +846,7 @@ def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         samples.append(
             (
                 "DNI_BAD_LETTER",
-                f"DNI del solicitante: {dni} (verificar antes de aprobar).",
+                f"Applicant DNI: {dni} (verify before approving).",
                 dni,
             )
         )
@@ -441,7 +854,7 @@ def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         samples.append(
             (
                 "CARD_BAD_LUHN",
-                f"Referencia de cobro rechazada, la tarjeta {card} no coincide.",
+                f"Charge reference rejected, card {card} does not match.",
                 card,
             )
         )
@@ -449,7 +862,7 @@ def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         samples.append(
             (
                 "IBAN_BAD_MOD97",
-                f"IBAN provisional pendiente de confirmar: {iban}.",
+                f"Provisional IBAN pending confirmation: {iban}.",
                 iban,
             )
         )
@@ -457,18 +870,103 @@ def _build_decoys(corpus: _Corpus, connection: sqlite3.Connection) -> None:
         samples.append(
             (
                 "THOUSANDS_SEPARATOR",
-                f"El importe acumulado asciende a {number} euros.",
+                f"The accumulated amount comes to {number} euros.",
                 number,
             )
         )
     for version in _VERSION_DECOYS:
-        samples.append(("VERSION_STRING", f"Cliente actualizado a la version {version}.", version))
+        samples.append(("VERSION_STRING", f"Client updated to version {version}.", version))
     for account in _ZERO_PADDED_DECOYS:
         samples.append(
-            ("ZERO_PADDED_ACCOUNT", f"Cuenta de referencia {account} sin movimientos.", account)
+            ("ZERO_PADDED_ACCOUNT", f"Reference account {account} has no activity.", account)
         )
     for ip in _INVALID_OCTET_IP_DECOYS:
-        samples.append(("INVALID_OCTET_IP", f"Direccion de origen registrada: {ip}.", ip))
+        samples.append(("INVALID_OCTET_IP", f"Recorded source address: {ip}.", ip))
+    for cif in _bad_cifs(corpus, 2):
+        samples.append(("CIF_BAD_CONTROL", f"Supplier tax ID on file: {cif}.", cif))
+    for nss in _bad_nss(corpus, 2):
+        samples.append(("NSS_BAD_CONTROL", f"Employee social security number: {nss}.", nss))
+    samples.append(("FLOAT_PAIR", "Model weights 3.14159, 2.71828 loaded.", "3.14159, 2.71828"))
+    samples.append(("CLOCK_TIME", "Batch started at 12:30:45 and ended late.", "12:30:45"))
+    samples.append(("CPP_SCOPE", "Crash inside std::vector::at during export.", "std::vector"))
+    samples.append(("MASKED_PASSWORD", "Login failed, password=******** was rejected.", "********"))
+    samples.append(("PLATE_WITH_VOWELS", "Parking spot 1234 AEI is reserved.", "1234 AEI"))
+
+    # --- larger decoy set ------------------------------------------------
+    for dni in _bad_dni_letters(faker, 16):
+        samples.append(("DNI_BAD_LETTER", f"Applicant DNI {dni} rejected by the registry.", dni))
+    for nie in _bad_nies(corpus, 16):
+        samples.append(("NIE_BAD_LETTER", f"Resident card {nie} failed validation.", nie))
+    for card in _bad_luhn_cards(faker, 16):
+        samples.append(("CARD_BAD_LUHN", f"Gateway declined {card}: invalid number.", card))
+    for iban in _bad_mod97_ibans(faker, 16):
+        samples.append(("IBAN_BAD_MOD97", f"Transfer to {iban} bounced, check digits wrong.", iban))
+    for cif in _bad_cifs(corpus, 16):
+        samples.append(("CIF_BAD_CONTROL", f"Vendor registered as {cif} (typo suspected).", cif))
+    for nss in _bad_nss(corpus, 16):
+        samples.append(("NSS_BAD_CONTROL", f"Rejected SS number {nss} on the payslip.", nss))
+    for ip in ("300.12.4.1", "10.256.0.1", "1.2.3.999", "256.256.256.256", "192.168.0.300"):
+        samples.append(("INVALID_OCTET_IP", f"Malformed address {ip} in the access log.", ip))
+    for version in ("2.14.1", "v3.0.12", "1.0.0-rc1", "4.18.2"):
+        samples.append(("VERSION_STRING", f"Upgraded the SDK to {version} last night.", version))
+    for clock in ("09:15:00", "23:59:59", "07:30:12", "18:45:03"):
+        samples.append(("CLOCK_TIME", f"Cron job ran at {clock} without errors.", clock))
+    for _ in range(6):
+        uuid = corpus.faker.uuid4()
+        samples.append(("UUID", f"Request {uuid} timed out upstream.", uuid))
+    for _ in range(6):
+        digest = corpus.faker.sha1()
+        samples.append(("HEX_HASH", f"Deployed commit {digest} to production.", digest))
+    for plate in ("4821 AEB", "9033 OUA", "1500 EIO", "7777 KIA"):
+        samples.append(("PLATE_WITH_VOWELS", f"Warehouse bay {plate} is full.", plate))
+    for masked in ("password=********", "api_key: <redacted>", "secret=xxxxxx", "token: [hidden]"):
+        value = masked.split("=")[-1].split(": ")[-1]
+        samples.append(("MASKED_SECRET", f"Config dump shows {masked} as expected.", value))
+    for order in ("512345678", "412300987", "123456789", "300200100"):
+        samples.append(("ORDER_NUMBER", f"Order {order} shipped from Zaragoza.", order))
+    for pair in ("0.7512, 0.2488", "12.5000, 7.2500", "1.4142, 1.7320", "98.6000, 37.0000"):
+        samples.append(("FLOAT_PAIR", f"Model scores {pair} were logged.", pair))
+    for scope in ("os::path", "std::string", "Foo::bar", "boost::asio"):
+        samples.append(("CPP_SCOPE", f"Stack frame in {scope} during shutdown.", scope))
+    # Soft-layer decoys: proper nouns and phrases that are not personal data.
+    # The regex layer never claims them; they measure LLM/encoder over-flagging.
+    for product in (
+        "Microsoft Teams",
+        "Visual Studio Code",
+        "PostgreSQL",
+        "Claude Code",
+        "Google Chrome",
+        "Amazon Web Services",
+        "Salesforce",
+        "Jira",
+        "Slack",
+        "Kubernetes",
+        "GitHub Actions",
+        "Microsoft Excel",
+        "Zoom",
+        "Stripe Dashboard",
+    ):
+        samples.append(("SOFTWARE_NAME", f"The issue started after updating {product}.", product))
+    for role in (
+        "the account manager",
+        "our support team",
+        "the billing department",
+        "the on-call engineer",
+        "the legal team",
+        "a senior developer",
+    ):
+        samples.append(("ROLE_PHRASE", f"Please forward this to {role} today.", role))
+    for date in (
+        "12/03/2024",
+        "2026-01-15",
+        "30/06/2025",
+        "2025-11-02",
+        "01/09/2026",
+        "2024-12-31",
+    ):
+        samples.append(("NON_BIRTH_DATE", f"Invoice dated {date} is still unpaid.", date))
+    for tech in ("health check", "memory leak", "disk failure", "cold start"):
+        samples.append(("TECH_HEALTH", f"The server {tech} alert fired twice.", tech))
 
     for row_id, (category, note, value) in enumerate(samples, start=1):
         cursor.execute("INSERT INTO decoy_samples VALUES (?, ?, ?)", (row_id, category, note))
@@ -501,6 +999,7 @@ def seed_demo(
     with sqlite3.connect(db_path) as connection:
         connection.executescript(SCHEMA)
         _build(corpus, connection)
+        _build_notes(corpus, connection)
         _build_decoys(corpus, connection)
         connection.commit()
 

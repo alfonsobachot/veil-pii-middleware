@@ -23,7 +23,7 @@
 # commands (which cd into it themselves) gives both at once. The message is
 # given the repo's absolute path automatically, since the demo db is no
 # longer reachable via a relative path from the session's own cwd:
-#   scripts/ask.sh --demo-db "consulta demo/veil_demo.db para el email..."
+#   scripts/ask.sh --demo-db "query demo/veil_demo.db for the email..."
 #
 # Set VEIL_APPEND_SYSTEM_PROMPT to pass --append-system-prompt through to
 # claude (only meaningful with --demo-db) for extra reinforcement if needed.
@@ -100,7 +100,7 @@ if [ "$demo_db" -eq 1 ]; then
   # (the vault's own mapping table showed the tokens were in fact
   # consistent), not a real defect to surface. VEIL_APPEND_SYSTEM_PROMPT, if
   # set, is appended after this baseline rather than replacing it.
-  BASE_SYSTEM_PROMPT="Vas a ver identificadores con forma PII_<TIPO>_<NNNN> (por ejemplo PII_EMAIL_0001) en lugar de valores reales de email, nombre, DNI, dirección, etc. Esto es intencional: una capa de middleware externa a ti sustituye los valores reales por estos tokens antes de que lleguen a tu contexto, y otra capa distinta los revierte a sus valores reales cuando hace falta ejecutar una herramienta local (por ejemplo una consulta SQL) o mostrarlos en pantalla al usuario. Tú no tienes ni necesitas tener acceso a los valores reales, y no puedes verificar por ti mismo la correspondencia entre un token y el valor que representa -- eso ya está garantizado por el sistema. Trata estos tokens como si fueran los valores reales: úsalos con normalidad en tus consultas y respuestas, sin añadir advertencias, notas de fiabilidad ni dudas sobre si corresponden al dato correcto."
+  BASE_SYSTEM_PROMPT="You will see identifiers shaped like PII_<TYPE>_<NNNN> (for example PII_EMAIL_0001) instead of real emails, names, national IDs, addresses and so on. This is intentional: a middleware layer outside you replaces real values with these tokens before they reach your context, and a separate layer turns them back into the real values whenever a local tool needs them (for example a SQL query) or when they are shown to the user on screen. You do not have, and do not need, access to the real values, and you cannot verify the mapping between a token and the value it stands for -- the system already guarantees it. Treat these tokens as if they were the real values: use them normally in your queries and answers, without adding warnings, reliability notes or doubts about whether they match the right data. Always answer in English."
   if [ -n "${VEIL_APPEND_SYSTEM_PROMPT:-}" ]; then
     SYSTEM_PROMPT="$BASE_SYSTEM_PROMPT"$'\n\n'"$VEIL_APPEND_SYSTEM_PROMPT"
   else

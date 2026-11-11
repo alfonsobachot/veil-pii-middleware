@@ -7,7 +7,6 @@ values on the way back in.
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from collections.abc import Callable
@@ -16,11 +15,11 @@ from typing import TypeAlias
 
 from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.detector import (
-    LLM_BASE_URL_ENV_VAR,
-    LLM_MODEL_ENV_VAR,
     LLMClient,
     Span,
+    SpanEncoder,
     detect,
+    llm_client_from_env,
 )
 from veil_pii_middleware.core.vault import TokenNotFoundError, Vault, VaultIntegrityError
 
@@ -68,16 +67,11 @@ class TokenFormatOverflowError(ValueError):
 def _default_llm_client() -> LLMClient | None:
     """Build an ``LLMClient`` from the environment, or ``None`` if unconfigured.
 
-    Both ``LLM_BASE_URL_ENV_VAR`` and ``LLM_MODEL_ENV_VAR`` must be set and
-    non-empty; otherwise the LLM layer is off, matching today's regex-only
-    behavior exactly -- no partial attempt at a network call with half a
-    configuration. The base URL is never defaulted to a fixed host/port.
+    See ``core.detector.llm_client_from_env``: without both
+    ``LLM_BASE_URL_ENV_VAR`` and ``LLM_MODEL_ENV_VAR`` the LLM layer is off,
+    matching regex-only behavior exactly.
     """
-    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
-    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
-    if not base_url or not model:
-        return None
-    return LLMClient(base_url, model)
+    return llm_client_from_env()
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +85,7 @@ class _TokenizeContext:
     """
 
     llm_client: LLMClient | None
+    encoder: SpanEncoder | None
     audit_log: AuditLog | None
     adapter: str | None
     span_sink: list[Span] | None
@@ -109,6 +104,7 @@ def tokenize(
     skip: Callable[[str], bool] | None = None,
     exclude: Callable[[str], list[tuple[int, int]]] | None = None,
     use_llm: bool = True,
+    encoder: SpanEncoder | None = None,
 ) -> JSONValue:
     """Replace every PII span ``detect()`` finds in ``value`` with a vault token.
 
@@ -176,6 +172,7 @@ def tokenize(
         client = llm_client if llm_client is not None else _default_llm_client()
     context = _TokenizeContext(
         llm_client=client,
+        encoder=encoder if use_llm else None,
         audit_log=audit_log,
         adapter=adapter,
         span_sink=span_sink,
@@ -215,7 +212,7 @@ def _tokenize_text(text: str, vault: Vault, context: _TokenizeContext) -> str:
     # Routes through detect() rather than assuming regex is the only source
     # of spans -- this is where the LLM layer's spans union in, gated by
     # whether llm_client is set (see tokenize()'s docstring).
-    spans = detect(text, llm_client=context.llm_client)
+    spans = detect(text, llm_client=context.llm_client, encoder=context.encoder)
     # Claude Code resends the full conversation history (including old
     # tool_result blocks a previous PostToolUse hook already tokenized) on
     # every turn, so a leaf handed to tokenize() here is not always fresh,

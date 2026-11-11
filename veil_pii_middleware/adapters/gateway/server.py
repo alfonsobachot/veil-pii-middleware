@@ -120,11 +120,11 @@ import httpx
 
 from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.detector import (
-    LLM_BASE_URL_ENV_VAR,
-    LLM_MODEL_ENV_VAR,
     LLMClient,
     Span,
+    SpanEncoder,
     detect,
+    llm_client_from_env,
 )
 from veil_pii_middleware.core.tokenizer import (
     IncrementalDetokenizer,
@@ -666,11 +666,7 @@ def _default_llm_client_for_display() -> LLMClient | None:
     so reusing the instance is what makes that second call a cache hit
     instead of a second network round trip.
     """
-    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
-    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
-    if not base_url or not model:
-        return None
-    return LLMClient(base_url, model)
+    return llm_client_from_env()
 
 
 #: Substring of Claude Code's own system prompt for its dedicated
@@ -786,6 +782,16 @@ def _excluded_ranges(text: str) -> list[tuple[int, int]]:
 _TOKENIZED_FIELDS: Final = frozenset({"messages"})
 
 
+#: Same variable ``core.encoder`` reads (duplicated so this module can check
+#: it without importing the heavy optional encoder dependencies).
+ENCODER_ENV_VAR: Final = "VEIL_ENCODER"
+
+#: Encoder NER detector (``core.encoder``) shared by every request, loaded
+#: once in ``main()`` when ``VEIL_ENCODER`` is set -- loading a model takes
+#: seconds, so it must never happen per request. ``None`` means off.
+_ENCODER: SpanEncoder | None = None
+
+
 def _tokenize_request(
     parsed: JSONValue,
     vault: Vault,
@@ -803,6 +809,7 @@ def _tokenize_request(
             adapter="gateway",
             skip=_skip_reserved_anthropic_metadata,
             exclude=_excluded_ranges,
+            encoder=_ENCODER,
         )
 
     if not isinstance(parsed, dict):
@@ -919,6 +926,7 @@ def _tokenize_body(
                 use_regex=True,
                 use_llm=display_client is not None,
                 llm_client=display_client,
+                encoder=_ENCODER,
             )
             if received_text
             else []
@@ -1216,7 +1224,25 @@ def _serialize_report(report: eval_module.Report) -> dict[str, Any]:
     return {
         "by_type": {name: _serialize_metrics(m) for name, m in report.by_type.items()},
         "by_detector": {name: _serialize_metrics(m) for name, m in report.by_detector.items()},
+        "seconds": report.seconds,
+        "cells": report.cells,
     }
+
+
+def _run_encoder_comparison() -> dict[str, Any]:
+    """The separate encoder section: ``regex+encoder`` with the loaded encoder.
+
+    Reported apart from the regex/LLM/union grid so the two soft-layer
+    approaches (generative LLM vs encoder NER) can be compared side by side,
+    timing included. Never raises, like ``_run_comparison_mode``.
+    """
+    if _ENCODER is None:
+        return {"available": False, "reason": f"{ENCODER_ENV_VAR} is not set"}
+    try:
+        report = eval_module.evaluate(mode="regex+encoder", encoder=_ENCODER)
+        return {"available": True, "model": _ENCODER.identity, **_serialize_report(report)}
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
 
 
 def _run_comparison_mode(mode: eval_module.Mode) -> dict[str, Any]:
@@ -1641,6 +1667,7 @@ def make_handler(
                 "available": True,
                 "generated_at": datetime.now(UTC).isoformat(),
                 "modes": {mode: _run_comparison_mode(mode) for mode in _COMPARISON_MODES},
+                "encoder": _run_encoder_comparison(),
             }
             _write_metrics_comparison_cache(payload)
             _write_json(self, 200, payload)
@@ -1731,6 +1758,13 @@ def main(argv: list[str] | None = None) -> int:
     port = int(argv[0]) if argv else _DEFAULT_PORT
     upstream = os.environ.get(UPSTREAM_ENV_VAR, _DEFAULT_UPSTREAM)
     fallback_session_id = _new_session_id()
+
+    global _ENCODER
+    if os.environ.get(ENCODER_ENV_VAR, "").strip():
+        # Lazy import: torch/gliner only load when an encoder is configured.
+        from veil_pii_middleware.core.encoder import encoder_from_env
+
+        _ENCODER = encoder_from_env()
 
     client = httpx.Client(timeout=httpx.Timeout(300.0))
     handler_cls = make_handler(fallback_session_id, client, upstream)

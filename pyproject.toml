@@ -38,6 +38,19 @@ dev = [
   "faker~=40.38",
 ]
 
+# Optional encoder-based NER detectors (core/encoder.py). Heavy: torch must be
+# installed first from the PyTorch CUDA wheel index for GPU inference, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+ner = [
+  "gliner==0.2.30",
+  "gliner2[local]==2.1.0",
+  "transformers>=4.51.3,<5.23",
+  # mDeBERTa tokenizers need these under transformers 5.x.
+  "sentencepiece>=0.2",
+  "tiktoken>=0.7",
+  "protobuf>=5",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["veil_pii_middleware"]
 

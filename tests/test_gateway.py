@@ -1177,7 +1177,7 @@ class TestCycleKindClassification:
                 {
                     "role": "user",
                     "content": "<system-reminder>\ntoken budget: 42\n</system-reminder>\n"
-                    "Soy Alfonso, mi DNI es 12345678A",
+                    "I'm Alfonso, my DNI is 12345678A",
                 },
             ],
         }
@@ -1204,7 +1204,7 @@ class TestCycleKindClassification:
                 {
                     "role": "user",
                     "content": "<session>\nprior context\n</session>\n"
-                    "Soy Alfonso, mi DNI es 12345678A",
+                    "I'm Alfonso, my DNI is 12345678A",
                 },
             ],
         }
@@ -1387,9 +1387,9 @@ class TestMessageTextExtraction:
         A real Claude Code turn interleaves `<system-reminder>` (and
         occasionally `<session>`) framing with the human's own text in the
         very same message. The Input pane must show exactly what the human
-        typed -- "ni mas ni menos" -- not that framing.
+        typed -- "no more, no less" -- not that framing.
         """
-        human_text = "Soy Alfonso, mi DNI es 12345678A"
+        human_text = "I'm Alfonso, my DNI is 12345678A"
         body = {
             "messages": [
                 {

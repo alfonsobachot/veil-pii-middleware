@@ -24,8 +24,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-import os
 import sqlite3
+import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +38,11 @@ from veil_pii_middleware.core.detector import (
     STRUCTURED_TYPES,
     LLMClient,
     Span,
+    SpanEncoder,
     detect,
+)
+from veil_pii_middleware.core.detector import (
+    llm_client_from_env as _detector_llm_client_from_env,
 )
 from veil_pii_middleware.demo.seed import (
     DEFAULT_DB_PATH,
@@ -47,7 +52,12 @@ from veil_pii_middleware.demo.seed import (
 
 #: Which layers a run enables. "regex" is today's default and the only mode
 #: the recall gate is bound to; "llm"/"union" report, they do not gate.
-Mode = Literal["regex", "llm", "union"]
+Mode = Literal["regex", "llm", "union", "encoder", "regex+encoder"]
+
+#: Modes that need an LLM client / an encoder.
+LLM_MODES: Final = frozenset({"llm", "union"})
+ENCODER_MODES: Final = frozenset({"encoder", "regex+encoder"})
+REGEX_MODES: Final = frozenset({"regex", "union", "regex+encoder"})
 
 __all__ = [
     "DecoyHit",
@@ -99,6 +109,9 @@ class Report:
     by_type: dict[str, Metrics]
     by_detector: dict[str, Metrics]
     misses: list[Miss]
+    #: Wall-clock seconds the detection calls took, and how many cells.
+    seconds: float = 0.0
+    cells: int = 0
 
     def failing_types(self, min_recall: float) -> list[str]:
         """Structured types whose recall falls below the gate threshold."""
@@ -143,6 +156,7 @@ def evaluate(
     *,
     mode: Mode = "regex",
     llm_client: LLMClient | None = None,
+    encoder: SpanEncoder | None = None,
 ) -> Report:
     """Score the enabled layer(s) over every cell the manifest says holds PII.
 
@@ -151,10 +165,13 @@ def evaluate(
     result is cached per content block by ``core.detector``, so a value
     repeated across cells is only sent to the model once.
     """
-    if mode != "regex" and llm_client is None:
+    if mode in LLM_MODES and llm_client is None:
         raise ValueError(f"mode={mode!r} requires an llm_client")
-    use_regex = mode in ("regex", "union")
-    use_llm = mode in ("llm", "union")
+    if mode in ENCODER_MODES and encoder is None:
+        raise ValueError(f"mode={mode!r} requires an encoder")
+    use_regex = mode in REGEX_MODES
+    use_llm = mode in LLM_MODES
+    active_encoder = encoder if mode in ENCODER_MODES else None
 
     manifest: list[dict[str, Any]] = json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -167,14 +184,25 @@ def evaluate(
     type_counts: dict[str, dict[str, int]] = defaultdict(dict)
     detector_counts: dict[str, dict[str, int]] = defaultdict(dict)
     misses: list[Miss] = []
+    seconds = 0.0
 
-    for cell, instances in sorted(expected.items()):
+    total_cells = len(expected)
+    for done, (cell, instances) in enumerate(sorted(expected.items()), start=1):
+        if done % 25 == 0 or done == total_cells:
+            # Progress on stderr: an LLM sweep takes minutes, never leave it silent.
+            print(f"progress: {done}/{total_cells} cells", file=sys.stderr, flush=True)
         text = texts.get(cell)
         if text is None:
             raise ValueError(f"manifest points at a row that is not in the database: {cell}")
+        started = time.perf_counter()
         spans: list[Span] = detect(
-            text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client
+            text,
+            use_regex=use_regex,
+            use_llm=use_llm,
+            llm_client=llm_client,
+            encoder=active_encoder,
         )
+        seconds += time.perf_counter() - started
         # (offset, value) is the identity of a detection, matching how the
         # manifest records ground truth.
         found: set[tuple[int, str]] = {(span.start, span.text) for span in spans}
@@ -185,11 +213,19 @@ def evaluate(
             entity_type = str(instance["entity_type"])
             key = (int(instance["offset"]), str(instance["value"]))
             _bump(type_counts, entity_type, "support")
-            if key in found and claimed[key].entity_type == entity_type:
+            hit: tuple[int, str] | None = None
+            if key in found and _type_matches(entity_type, str(claimed[key].entity_type)):
+                hit = key
+            elif entity_type not in STRUCTURED_TYPES:
+                hit = _soft_overlap(key, claimed)
+            if hit is not None:
                 _bump(type_counts, entity_type, "true_positives")
-                _bump(detector_counts, str(claimed[key].detector), "true_positives")
-                _bump(detector_counts, str(claimed[key].detector), "support")
-                matched.add(key)
+                _bump(detector_counts, str(claimed[hit].detector), "true_positives")
+                _bump(detector_counts, str(claimed[hit].detector), "support")
+                matched.add(hit)
+                # Every other soft span inside the same value (e.g. a model
+                # splitting a name in two) is part of the hit, not a false positive.
+                matched.update(_soft_overlaps(key, claimed))
             else:
                 misses.append(
                     Miss(
@@ -208,7 +244,64 @@ def evaluate(
 
     by_type = {name: Metrics(**counts) for name, counts in sorted(type_counts.items())}
     by_detector = {name: Metrics(**counts) for name, counts in sorted(detector_counts.items())}
-    return Report(by_type=by_type, by_detector=by_detector, misses=misses)
+    return Report(
+        by_type=by_type,
+        by_detector=by_detector,
+        misses=misses,
+        seconds=seconds,
+        cells=len(expected),
+    )
+
+
+#: A soft ground-truth value counts as detected when one soft span covers at
+#: least this share of it. Soft layers disagree on boundaries ("is diabetic"
+#: vs "diabetic", a trailing city on an address); requiring half keeps a
+#: first-name-only hit on a full name ("Rosendo" of "Rosendo Cifuentes Rojas")
+#: a miss, since it would still forward the surnames.
+_SOFT_MIN_COVERAGE: Final = 0.5
+
+
+def _soft_overlaps(
+    key: tuple[int, str], claimed: dict[tuple[int, str], Span]
+) -> list[tuple[int, str]]:
+    start, value = key
+    end = start + len(value)
+    return [
+        span_key
+        for span_key, span in claimed.items()
+        if str(span.entity_type) not in STRUCTURED_TYPES and span.start < end and start < span.end
+    ]
+
+
+def _soft_overlap(
+    key: tuple[int, str], claimed: dict[tuple[int, str], Span]
+) -> tuple[int, str] | None:
+    """The soft span covering most of a soft ground-truth value, if it covers enough."""
+    start, value = key
+    end = start + len(value)
+    best: tuple[int, str] | None = None
+    best_cover = 0
+    for span_key in _soft_overlaps(key, claimed):
+        span = claimed[span_key]
+        cover = min(end, span.end) - max(start, span.start)
+        if cover > best_cover:
+            best, best_cover = span_key, cover
+    if best is None or best_cover < _SOFT_MIN_COVERAGE * len(value):
+        return None
+    return best
+
+
+def _type_matches(expected: str, claimed: str) -> bool:
+    """Structured types must match exactly; soft types match each other.
+
+    For the soft layer the label is cosmetic -- a company tagged PERSON is
+    still tokenized and never leaves the machine -- so any soft label on the
+    right span counts as detected. Structured types keep the strict check:
+    a DNI labelled NIE is a real defect in a check-digit-provable type.
+    """
+    if expected in STRUCTURED_TYPES or claimed in STRUCTURED_TYPES:
+        return expected == claimed
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +337,7 @@ def evaluate_decoys(
     use_regex: bool = True,
     use_llm: bool = False,
     llm_client: LLMClient | None = None,
+    encoder: SpanEncoder | None = None,
 ) -> DecoyReport:
     """Score the enabled layer(s) against values that must never be detected.
 
@@ -269,7 +363,9 @@ def evaluate_decoys(
         if text is None:
             raise ValueError(f"decoy points at a row that is not in the database: {cell}")
         offset, value = int(decoy["offset"]), str(decoy["value"])
-        spans = detect(text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client)
+        spans = detect(
+            text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client, encoder=encoder
+        )
         for span in spans:
             if span.start == offset and span.text == value:
                 hits.append(
@@ -335,19 +431,19 @@ def _print_decoy_report(decoy_report: DecoyReport, max_false_positives: int) -> 
 
 
 def llm_client_from_env() -> LLMClient:
-    """Build an ``LLMClient`` from the environment, or raise if unconfigured.
+    """Build an ``LLMClient`` from the environment, or exit if unconfigured.
 
-    Shared by ``main()``'s ``--mode llm``/``--mode union`` and the gateway's
-    ``/veil-panel/metrics/comparison`` endpoint, so both read the same two
-    env vars the same way rather than duplicating this a third time.
+    Shared by ``main()``'s LLM modes and the gateway's
+    ``/veil-panel/metrics/comparison`` endpoint; wraps
+    ``core.detector.llm_client_from_env`` so every caller reads the same
+    variables (including the optional reasoning-effort and timeout ones).
     """
-    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
-    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
-    if not base_url or not model:
+    client = _detector_llm_client_from_env()
+    if client is None:
         raise SystemExit(
             f"--mode requires both {LLM_BASE_URL_ENV_VAR} and {LLM_MODEL_ENV_VAR} to be set"
         )
-    return LLMClient(base_url, model)
+    return client
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -357,13 +453,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decoys", type=Path, default=DEFAULT_DECOYS_PATH)
     parser.add_argument(
         "--mode",
-        choices=("regex", "llm", "union"),
+        choices=("regex", "llm", "union", "encoder", "regex+encoder"),
         default="regex",
         help=(
             "Which layer(s) to score. Only 'regex' (the default) gates "
             "--min-recall/--max-false-positives; 'llm'/'union' are report-only "
-            f"and read {LLM_BASE_URL_ENV_VAR}/{LLM_MODEL_ENV_VAR}."
+            f"and read {LLM_BASE_URL_ENV_VAR}/{LLM_MODEL_ENV_VAR}; 'encoder'/'regex+encoder' "
+            "read VEIL_ENCODER or --encoder."
         ),
+    )
+    parser.add_argument(
+        "--encoder",
+        default=None,
+        help="Encoder spec '<backend>:<model id>' (overrides VEIL_ENCODER), e.g. "
+        "gliner:urchade/gliner_multi_pii-v1.",
+    )
+    parser.add_argument(
+        "--encoder-threshold",
+        type=float,
+        default=None,
+        help="Confidence threshold for the encoder (default 0.4 or VEIL_ENCODER_THRESHOLD).",
     )
     parser.add_argument(
         "--min-recall",
@@ -380,12 +489,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     mode: Mode = args.mode
 
-    use_regex = mode in ("regex", "union")
-    use_llm = mode in ("llm", "union")
-    llm_client = llm_client_from_env() if mode != "regex" else None
+    use_regex = mode in REGEX_MODES
+    use_llm = mode in LLM_MODES
+    llm_client = llm_client_from_env() if use_llm else None
+    encoder = _encoder_for(args) if mode in ENCODER_MODES else None
     try:
-        report = evaluate(args.db, args.manifest, mode=mode, llm_client=llm_client)
+        report = evaluate(args.db, args.manifest, mode=mode, llm_client=llm_client, encoder=encoder)
         _print_report(report, args.min_recall)
+        per_cell_ms = 1000 * report.seconds / report.cells if report.cells else 0.0
+        print(
+            f"\ntiming: {report.seconds:.1f}s over {report.cells} cells ({per_cell_ms:.1f} ms/cell)"
+        )
 
         # Same use_regex/use_llm/llm_client this run already resolved for
         # evaluate() above -- previously this call
@@ -394,7 +508,12 @@ def main(argv: list[str] | None = None) -> int:
         # --mode llm/union's decoy check exercises the LLM layer too, the
         # same layer(s) that mode's recall numbers reflect.
         decoy_report = evaluate_decoys(
-            args.db, args.decoys, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client
+            args.db,
+            args.decoys,
+            use_regex=use_regex,
+            use_llm=use_llm,
+            llm_client=llm_client,
+            encoder=encoder,
         )
         _print_decoy_report(decoy_report, args.max_false_positives)
     finally:
@@ -417,6 +536,19 @@ def main(argv: list[str] | None = None) -> int:
             f"--mode {mode}'s own enabled layer(s)."
         )
     return 1 if recall_failed or decoys_failed else 0
+
+
+def _encoder_for(args: argparse.Namespace) -> SpanEncoder:
+    # Lazy import: the encoder's heavy optional dependencies only load here.
+    from veil_pii_middleware.core.encoder import DEFAULT_THRESHOLD, build_encoder, encoder_from_env
+
+    if args.encoder:
+        threshold = args.encoder_threshold
+        return build_encoder(args.encoder, threshold=threshold or DEFAULT_THRESHOLD)
+    encoder = encoder_from_env()
+    if encoder is None:
+        raise SystemExit("--mode encoder needs --encoder or VEIL_ENCODER")
+    return encoder
 
 
 if __name__ == "__main__":

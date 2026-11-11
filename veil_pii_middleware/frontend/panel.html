@@ -879,9 +879,15 @@ function VaultInspector() {
 }
 
 function ModeReport({ mode, report }) {
+  const timing =
+    report && report.available && report.cells
+      ? `${report.seconds.toFixed(1)} s total · ${((1000 * report.seconds) / report.cells).toFixed(1)} ms per cell`
+      : null;
   return (
     <div className="pane">
       <h2>{mode}</h2>
+      {timing && <p className="sub">{timing}</p>}
+      {report && report.model && <p className="sub">{report.model}</p>}
       {!report ? (
         <p>&hellip;</p>
       ) : !report.available ? (
@@ -980,6 +986,14 @@ function MetricsTab() {
           <ModeReport mode="llm" report={comparison.modes.llm} />
           <ModeReport mode="union" report={comparison.modes.union} />
         </div>
+      )}
+      {hasResult && comparison.encoder && (
+        <>
+          <h2 style={{ marginTop: "24px" }}>Encoder NER (alternative soft layer)</h2>
+          <div className="mode-grid">
+            <ModeReport mode="regex + encoder" report={comparison.encoder} />
+          </div>
+        </>
       )}
     </div>
   );

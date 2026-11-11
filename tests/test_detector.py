@@ -39,9 +39,14 @@ from veil_pii_middleware.core.detector import (
     detect_regex,
     merge_spans,
     valid_card,
+    valid_cif,
     valid_dni,
+    valid_gps,
     valid_iban,
+    valid_ipv6,
     valid_nie,
+    valid_nss,
+    valid_secret,
     valid_spanish_phone,
 )
 
@@ -51,6 +56,8 @@ VALID_DNI = "12345678Z"
 VALID_NIE = "X1234567L"
 VALID_IBAN = "ES9121000418450200051332"
 VALID_CARD = "4111111111111111"
+VALID_CIF = "B12345674"
+VALID_NSS = "28/12345678/40"
 
 
 # --------------------------------------------------------------------------
@@ -110,10 +117,12 @@ def test_spanish_phone_prefix_and_leading_digit() -> None:
 # --------------------------------------------------------------------------
 
 CORPUS = (
-    "El cliente Customer1@Project.com abrio la incidencia. Su DNI es "
-    f"{VALID_DNI} y el NIE del administrador es {VALID_NIE}. Cobramos en "
-    f"{VALID_IBAN} con la tarjeta {VALID_CARD}. Telefono +34 612 345 678, "
-    "servidor 192.168.1.15."
+    "Customer Customer1@Project.com opened the ticket. Their DNI is "
+    f"{VALID_DNI} and the administrator's NIE is {VALID_NIE}. We charge "
+    f"{VALID_IBAN} to card {VALID_CARD}. Company CIF {VALID_CIF}, NSS "
+    f"{VALID_NSS}, plate 1234 BCD, MAC 00:1A:2B:3C:4D:5E, password=Hunter2Secret "
+    "and GPS location 40.416775, -3.703790. Phone +34 612 345 678, "
+    "server 192.168.1.15."
 )
 
 
@@ -141,6 +150,12 @@ def test_structured_types_excludes_llm_only_entities() -> None:
         EntityType.PHONE,
         EntityType.CARD,
         EntityType.IP,
+        EntityType.SECRET,
+        EntityType.CIF,
+        EntityType.NSS,
+        EntityType.PLATE,
+        EntityType.MAC,
+        EntityType.GPS,
     } == STRUCTURED_TYPES
     assert EntityType.PERSON not in STRUCTURED_TYPES
     assert EntityType.ADDRESS not in STRUCTURED_TYPES
@@ -164,10 +179,10 @@ def test_every_span_is_attributed_to_the_regex_layer() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "El DNI 12345678A no es valido.",
-        "El NIE X1234567M no es valido.",
-        "La cuenta ES9121000418450200051333 no es valida.",
-        "La tarjeta 4111111111111112 no es valida.",
+        "The DNI 12345678A is not valid.",
+        "The NIE X1234567M is not valid.",
+        "The account ES9121000418450200051333 is not valid.",
+        "The card 4111111111111112 is not valid.",
     ],
 )
 def test_failed_check_digit_yields_no_span(text: str) -> None:
@@ -176,20 +191,20 @@ def test_failed_check_digit_yields_no_span(text: str) -> None:
 
 
 def test_plain_prose_yields_nothing() -> None:
-    assert detect_regex("El pedido se entrego sin incidencias en el almacen.") == []
+    assert detect_regex("The order was delivered to the warehouse without incident.") == []
 
 
 def test_version_string_is_not_an_ip() -> None:
-    spans = detect_regex("Actualizado a la version 1.2.3 del cliente")
+    spans = detect_regex("Updated the client to version 1.2.3")
     assert [s for s in spans if s.entity_type is EntityType.IP] == []
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "Fallo en 192.168.1.15.",
-        "Fallo en 192.168.1.15",
-        "Fallo en 192.168.1.15, reintentando",
+        "Failure at 192.168.1.15.",
+        "Failure at 192.168.1.15",
+        "Failure at 192.168.1.15, retrying",
         "(192.168.1.15)",
     ],
 )
@@ -204,14 +219,14 @@ def test_ip_is_found_regardless_of_trailing_punctuation(text: str) -> None:
 
 
 def test_longer_dotted_number_is_not_read_as_an_ip() -> None:
-    spans = detect_regex("build 192.168.1.15.7 interna")
+    spans = detect_regex("build 192.168.1.15.7 internal")
     assert [s for s in spans if s.entity_type is EntityType.IP] == []
 
 
 def test_zero_padded_octets_are_still_an_ip() -> None:
     """Log exporters emit them; refusing to recognise one forwards it in clear."""
     spans = [
-        s for s in detect_regex("IP 192.168.001.001 detectada") if s.entity_type is EntityType.IP
+        s for s in detect_regex("IP 192.168.001.001 detected") if s.entity_type is EntityType.IP
     ]
     assert [s.text for s in spans] == ["192.168.001.001"]
 
@@ -223,13 +238,13 @@ def test_octet_above_255_is_not_an_ip() -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("Telefono 912345678", "912345678"),
-        ("Telefono 912 345 678", "912 345 678"),
+        ("Phone 912345678", "912345678"),
+        ("Phone 912 345 678", "912 345 678"),
         # 2-3-2-2 is simply how a Madrid landline is printed. Hard-coding the
         # 3-3-3 grouping made it invisible.
-        ("Telefono 91 234 56 78", "91 234 56 78"),
-        ("Telefono 912 34 56 78", "912 34 56 78"),
-        ("Telefono 91-234-56-78", "91-234-56-78"),
+        ("Phone 91 234 56 78", "91 234 56 78"),
+        ("Phone 912 34 56 78", "912 34 56 78"),
+        ("Phone 91-234-56-78", "91-234-56-78"),
     ],
 )
 def test_phone_is_found_in_any_grouping(text: str, expected: str) -> None:
@@ -240,12 +255,12 @@ def test_phone_is_found_in_any_grouping(text: str, expected: str) -> None:
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("Telefono +34 612 345 678", "+34 612 345 678"),
-        ("Telefono +34 91 234 56 78", "+34 91 234 56 78"),
+        ("Phone +34 612 345 678", "+34 612 345 678"),
+        ("Phone +34 91 234 56 78", "+34 91 234 56 78"),
         # Any country, not a hard-coded +34.
-        ("Telefono +44 20 7946 0958", "+44 20 7946 0958"),
-        ("Telefono +1 415 555 2671", "+1 415 555 2671"),
-        ("Telefono 0034 612345678", "0034 612345678"),
+        ("Phone +44 20 7946 0958", "+44 20 7946 0958"),
+        ("Phone +1 415 555 2671", "+1 415 555 2671"),
+        ("Phone 0034 612345678", "0034 612345678"),
     ],
 )
 def test_international_phone_keeps_its_country_code(text: str, expected: str) -> None:
@@ -257,9 +272,9 @@ def test_international_phone_keeps_its_country_code(text: str, expected: str) ->
 @pytest.mark.parametrize(
     "text",
     [
-        "El importe asciende a 912.345.678 euros",
-        "Stock de 912.345.678 unidades",
-        "Referencia 612.345.678 del pedido",
+        "The amount comes to 912.345.678 euros",
+        "Stock of 912.345.678 units",
+        "Reference 612.345.678 of the order",
     ],
 )
 def test_spanish_thousands_separator_is_not_a_phone(text: str) -> None:
@@ -275,13 +290,13 @@ def test_spanish_thousands_separator_is_not_a_phone(text: str) -> None:
 
 def test_zero_padded_account_number_is_not_a_phone() -> None:
     """`00` alone is a weak signal; the legacy prefix needs one more digit."""
-    assert detect_regex("Cuenta 0012345678 del banco") == []
+    assert detect_regex("Account 0012345678 at the bank") == []
 
 
 def test_dot_separated_card_is_not_claimed() -> None:
     """Cards are not written with dots, and Luhn alone is a weak filter."""
     spans = [
-        s for s in detect_regex("Tarjeta 4111.1111.1111.1111") if s.entity_type is EntityType.CARD
+        s for s in detect_regex("Card 4111.1111.1111.1111") if s.entity_type is EntityType.CARD
     ]
     assert spans == []
 
@@ -325,12 +340,12 @@ def test_validators_agree_with_the_patterns_about_dots() -> None:
 
 def test_dotted_address_is_not_claimed_as_a_card() -> None:
     """A four-group dotted number within 0-255 is an address, not a short PAN."""
-    spans = detect_regex("Origen 192.168.001.001 registrado")
+    spans = detect_regex("Source 192.168.001.001 logged")
     assert [(s.entity_type, s.text) for s in spans] == [(EntityType.IP, "192.168.001.001")]
 
 
 def test_iban_beats_the_digit_runs_inside_it() -> None:
-    spans = detect_regex(f"Cuenta {VALID_IBAN} confirmada")
+    spans = detect_regex(f"Account {VALID_IBAN} confirmed")
     assert len(spans) == 1
     assert spans[0].entity_type is EntityType.IBAN
     assert spans[0].text == VALID_IBAN
@@ -498,7 +513,7 @@ def _reset_llm_cache() -> Iterator[None]:
 class TestDetectLLM:
     def test_happy_path_finds_person_and_address(self, fake_llm: tuple[_FakeLLMState, str]) -> None:
         state, base_url = fake_llm
-        text = "Contacta a Ana Garcia en Calle Mayor 5, Madrid."
+        text = "Contact Ana Garcia at Calle Mayor 5, Madrid."
         state.completion_content = json.dumps(
             {
                 "spans": [
@@ -520,7 +535,7 @@ class TestDetectLLM:
     def test_prompt_requests_every_entity_type(self, fake_llm: tuple[_FakeLLMState, str]) -> None:
         state, base_url = fake_llm
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
-            detect_llm("hola", client)
+            detect_llm("hello", client)
 
         system_prompt = str(state.requests[0]["messages"][0]["content"])
         for entity_type in EntityType:
@@ -539,7 +554,7 @@ class TestDetectLLM:
         """
         state, base_url = fake_llm
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
-            detect_llm("hola", client)
+            detect_llm("hello", client)
 
         system_prompt = str(state.requests[0]["messages"][0]["content"]).upper()
         assert "NO LEADING" in system_prompt or "NEVER STARTS WITH A LETTER" in system_prompt
@@ -550,7 +565,7 @@ class TestDetectLLM:
     ) -> None:
         state, base_url = fake_llm
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
-            detect_llm("hola", client)
+            detect_llm("hello", client)
 
         system_prompt = str(state.requests[0]["messages"][0]["content"])
         assert "0 and 255" in system_prompt
@@ -567,7 +582,7 @@ class TestDetectLLM:
         """
         state, base_url = fake_llm
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
-            detect_llm("hola", client)
+            detect_llm("hello", client)
 
         assert "response_format" not in state.requests[0]
 
@@ -575,7 +590,7 @@ class TestDetectLLM:
         self, fake_llm: tuple[_FakeLLMState, str]
     ) -> None:
         state, base_url = fake_llm
-        text = "Ana Garcia llamo. Luego Ana Garcia colgo."
+        text = "Ana Garcia called. Then Ana Garcia hung up."
         state.completion_content = json.dumps(
             {
                 "spans": [
@@ -595,21 +610,43 @@ class TestDetectLLM:
     ) -> None:
         state, base_url = fake_llm
         state.completion_content = json.dumps(
-            {"spans": [{"value": "Nombre Que No Existe", "entity_type": "PERSON"}]}
+            {"spans": [{"value": "Name That Does Not Exist", "entity_type": "PERSON"}]}
         )
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
-            spans = detect_llm("texto sin ese nombre", client)
+            spans = detect_llm("text without that name", client)
 
         assert spans == []
 
-    def test_unknown_entity_type_raises(self, fake_llm: tuple[_FakeLLMState, str]) -> None:
+    def test_unknown_entity_type_is_kept_as_other(
+        self, fake_llm: tuple[_FakeLLMState, str]
+    ) -> None:
+        """An invented label still marks an identifying value: keep it, don't fail the block."""
         state, base_url = fake_llm
         state.completion_content = json.dumps({"spans": [{"value": "x", "entity_type": "BOGUS"}]})
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            spans = detect_llm("x appears here", client)
+
+        assert [(s.entity_type, s.text) for s in spans] == [(EntityType.OTHER, "x")]
+
+    def test_non_string_entity_type_raises(self, fake_llm: tuple[_FakeLLMState, str]) -> None:
+        state, base_url = fake_llm
+        state.completion_content = json.dumps({"spans": [{"value": "x", "entity_type": 7}]})
         with (
             LLMClient(base_url, "test-model", timeout_seconds=2.0) as client,
             pytest.raises(LLMDetectionError),
         ):
             detect_llm("x appears here", client)
+
+    def test_structured_span_failing_its_check_digit_is_dropped(
+        self, fake_llm: tuple[_FakeLLMState, str]
+    ) -> None:
+        """The model accepts invalid control digits; the regex validator has the last word."""
+        state, base_url = fake_llm
+        state.completion_content = json.dumps(
+            {"spans": [{"value": "12345678A", "entity_type": "DNI"}]}
+        )
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            assert detect_llm("DNI 12345678A on file", client) == []
 
     def test_flat_string_span_entry_raises_without_leaking_its_content(
         self, fake_llm: tuple[_FakeLLMState, str]
@@ -620,13 +657,13 @@ class TestDetectLLM:
         the raised exception's message, since that message is later logged.
         """
         state, base_url = fake_llm
-        secret = "secreto-de-cliente@example.com"
+        secret = "customer-secret@example.com"
         state.completion_content = json.dumps({"spans": [secret]})
         with (
             LLMClient(base_url, "test-model", timeout_seconds=2.0) as client,
             pytest.raises(LLMDetectionError) as exc_info,
         ):
-            detect_llm(f"correo {secret}", client)
+            detect_llm(f"email {secret}", client)
 
         assert secret not in str(exc_info.value)
 
@@ -635,7 +672,7 @@ class TestDetectLLM:
     ) -> None:
         """An entry with a non-string 'value' must not echo whatever else it carries."""
         state, base_url = fake_llm
-        secret = "otro-secreto@example.com"
+        secret = "other-secret@example.com"
         state.completion_content = json.dumps(
             {"spans": [{"value": 12345, "entity_type": "PERSON", "note": secret}]}
         )
@@ -643,7 +680,7 @@ class TestDetectLLM:
             LLMClient(base_url, "test-model", timeout_seconds=2.0) as client,
             pytest.raises(LLMDetectionError) as exc_info,
         ):
-            detect_llm(f"correo {secret}", client)
+            detect_llm(f"email {secret}", client)
 
         assert secret not in str(exc_info.value)
 
@@ -658,7 +695,7 @@ class TestDetectLLM:
         overlap -- ``detect_llm`` itself must locate and return both candidates.
         """
         state, base_url = fake_llm
-        text = "Vive en Calle Mayor 5, Madrid."
+        text = "Lives at Calle Mayor 5, Madrid."
         state.completion_content = json.dumps(
             {
                 "spans": [
@@ -755,7 +792,9 @@ class TestDetectLLM:
             spans = detect_llm("recoverable text", client)
 
         assert spans == []
-        assert len(state.requests) == 2
+        # The failing call is retried once on a 5xx (Ollama reloading a model),
+        # then the recovered call goes through: 2 + 1 requests.
+        assert len(state.requests) == 3
 
 
 class TestDetectUnion:
@@ -788,7 +827,7 @@ class TestDetectUnion:
         assert (EntityType.DNI, Detector.REGEX) in kinds
 
     def test_fail_closed_on_dead_endpoint_still_returns_regex_spans(self) -> None:
-        text = f"DNI {VALID_DNI} y correo cliente@example.com"
+        text = f"DNI {VALID_DNI} and email customer@example.com"
         with LLMClient(_closed_port_url(), "test-model", timeout_seconds=1.0) as client:
             spans = detect(text, llm_client=client)
 
@@ -830,9 +869,9 @@ class TestDetectUnion:
         assert {s.entity_type for s in spans} == {EntityType.DNI}
 
     def test_fail_closed_path_logs_no_pii(self, capsys: pytest.CaptureFixture[str]) -> None:
-        secret_email = "secreto-de-cliente@example.com"
+        secret_email = "customer-secret@example.com"
         with LLMClient(_closed_port_url(), "test-model", timeout_seconds=1.0) as client:
-            detect(f"correo {secret_email}", llm_client=client)
+            detect(f"email {secret_email}", llm_client=client)
 
         captured = capsys.readouterr()
         assert secret_email not in captured.err
@@ -875,7 +914,7 @@ class _StubLLM(LLMClient):
 
 def test_llm_org_span_is_returned_as_org() -> None:
     clear_llm_cache()
-    text = "Empresa: Familia Aguado S.A. (cliente)"
+    text = "Company: Familia Aguado S.A. (customer)"
     client = _StubLLM([{"value": "Familia Aguado S.A.", "entity_type": "ORG"}])
 
     spans = detect_llm(text, client)
@@ -897,6 +936,140 @@ def test_non_pii_name_filter_only_matches_the_whole_span() -> None:
     clear_llm_cache()
     client = _StubLLM([{"value": "Claude Rodriguez", "entity_type": "PERSON"}])
 
-    spans = detect_llm("Cliente Claude Rodriguez", client)
+    spans = detect_llm("Customer Claude Rodriguez", client)
 
     assert [s.text for s in spans] == ["Claude Rodriguez"]
+
+
+# --- rule-based additions: SECRET, CIF, NSS, PLATE, MAC, GPS, IPv6 ------------
+
+_GITHUB_TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+_JWT = (
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+)
+_PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+
+
+@pytest.mark.parametrize(
+    ("validator", "good", "bad"),
+    [
+        (valid_cif, VALID_CIF, "B12345675"),
+        (valid_nss, VALID_NSS, "28/12345678/41"),
+        (valid_ipv6, "2001:db8::8a2e:370:7334", "12:30:45"),
+        (valid_gps, "40.416775, -3.703790", "95.000000, -3.703790"),
+        (valid_secret, "S3cr3tPass", "********"),
+    ],
+)
+def test_new_validators_accept_valid_and_reject_corrupted(
+    validator: object, good: str, bad: str
+) -> None:
+    assert callable(validator)
+    assert validator(good) is True
+    assert validator(bad) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "entity"),
+    [
+        (
+            "Deploy failed: AWS key AKIAIOSFODNN7EXAMPLE was rejected.",
+            "AKIAIOSFODNN7EXAMPLE",
+            EntityType.SECRET,
+        ),
+        (f"CI leaked {_GITHUB_TOKEN} in the build log", _GITHUB_TOKEN, EntityType.SECRET),
+        (f"Request header carried {_JWT} before the 401", _JWT, EntityType.SECRET),
+        (f"Found in repo:\n{_PRIVATE_KEY}\nrotate it", _PRIVATE_KEY, EntityType.SECRET),
+        ("settings.yaml has api_key: 'q9X2mL7vR4tZ' committed", "q9X2mL7vR4tZ", EntityType.SECRET),
+        (f"Invoice issued to CIF {VALID_CIF} last month.", VALID_CIF, EntityType.CIF),
+        (f"Employee NSS {VALID_NSS} is on file.", VALID_NSS, EntityType.NSS),
+        ("Vehicle 1234 BCD was towed from the depot.", "1234 BCD", EntityType.PLATE),
+        ("Vehicle 1234-BCD was towed from the depot.", "1234-BCD", EntityType.PLATE),
+        ("Device 00:1A:2B:3C:4D:5E went offline.", "00:1A:2B:3C:4D:5E", EntityType.MAC),
+        ("Device 00-1a-2b-3c-4d-5e went offline.", "00-1a-2b-3c-4d-5e", EntityType.MAC),
+        (
+            "Last known location: 40.416775, -3.703790 at the depot",
+            "40.416775, -3.703790",
+            EntityType.GPS,
+        ),
+        ("Driver reported GPS 40.416775,-3.703790.", "40.416775,-3.703790", EntityType.GPS),
+        (
+            "Connection from 2001:db8::8a2e:370:7334 refused",
+            "2001:db8::8a2e:370:7334",
+            EntityType.IP,
+        ),
+        ("Firewall blocked 2001:db8::1.", "2001:db8::1", EntityType.IP),
+        (
+            "Link-local peer fe80::1ff:fe23:4567:890a dropped",
+            "fe80::1ff:fe23:4567:890a",
+            EntityType.IP,
+        ),
+    ],
+)
+def test_rule_based_entity_is_found_with_its_exact_span(
+    text: str, expected: str, entity: EntityType
+) -> None:
+    spans = detect_regex(text)
+    assert [(s.entity_type, s.text) for s in spans] == [(entity, expected)]
+    for s in spans:
+        assert text[s.start : s.end] == s.text
+
+
+@pytest.mark.parametrize(
+    ("text", "entity"),
+    [
+        ("Invoice issued to CIF B12345675 last month.", EntityType.CIF),
+        ("Employee NSS 28/12345678/41 is on file.", EntityType.NSS),
+    ],
+)
+def test_rule_based_failed_check_digit_yields_no_span(text: str, entity: EntityType) -> None:
+    assert [s for s in detect_regex(text) if s.entity_type is entity] == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Job finished at 12:30:45 without errors.",
+        "Use std::vector instead of a raw array.",
+        "Request id 550e8400-e29b-41d4-a716-446655440000 timed out.",
+        "Convergence ratio 3.14159, 2.71828 between runs.",
+        "password=********",
+        "password: <redacted>",
+        "Batch 1234 AEI processed overnight.",
+        "Release 2024 BCD-55 shipped.",
+    ],
+)
+def test_rule_based_lookalikes_are_not_detected(text: str) -> None:
+    assert detect_regex(text) == []
+
+
+def test_secret_in_connection_string_beats_the_overlapping_email() -> None:
+    """Without the SECRET-over-EMAIL rule, `S3cr3tPass@db.internal` wins as an EMAIL."""
+    text = "postgres://billing:S3cr3tPass@db.internal:5432/app"
+    spans = detect_regex(text)
+    assert [(s.entity_type, s.text) for s in spans] == [(EntityType.SECRET, "S3cr3tPass")]
+    assert all(s.entity_type is not EntityType.EMAIL for s in spans)
+
+
+def test_nss_beats_card_on_an_exact_tie() -> None:
+    """A 12-digit run passing both mod-97 and Luhn is reported as NSS, not CARD."""
+    value = "281000000824"
+    assert valid_nss(value) is True
+    assert valid_card(value) is True
+    spans = detect_regex(f"Payroll record {value} updated")
+    assert [(s.entity_type, s.text) for s in spans] == [(EntityType.NSS, value)]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Pay ES9121000418450200051332 with care",
+        "Pay ES91 2100 0418 4502 0005 1332 with care",
+        "IBAN ES9121000418450200051332 from your account",
+    ],
+)
+def test_iban_followed_by_a_four_letter_word_is_still_found(text: str) -> None:
+    """The greedy group pattern swallowed a trailing word and the IBAN leaked."""
+    spans = [s for s in detect_regex(text) if s.entity_type is EntityType.IBAN]
+    assert len(spans) == 1
+    assert valid_iban(spans[0].text)
+    assert spans[0].text.replace(" ", "").endswith("1332")

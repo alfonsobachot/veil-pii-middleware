@@ -87,13 +87,29 @@ def test_every_decoy_category_is_present(corpus: tuple[Path, Path, Path]) -> Non
         d["reason"].split(":", 1)[0] for d in json.loads(decoys_path.read_text(encoding="utf-8"))
     }
     assert reasons == {
-        "DNI_BAD_LETTER",
         "CARD_BAD_LUHN",
+        "CIF_BAD_CONTROL",
+        "CLOCK_TIME",
+        "CPP_SCOPE",
+        "DNI_BAD_LETTER",
+        "FLOAT_PAIR",
+        "HEX_HASH",
         "IBAN_BAD_MOD97",
+        "INVALID_OCTET_IP",
+        "MASKED_PASSWORD",
+        "MASKED_SECRET",
+        "NIE_BAD_LETTER",
+        "NON_BIRTH_DATE",
+        "NSS_BAD_CONTROL",
+        "ORDER_NUMBER",
+        "PLATE_WITH_VOWELS",
+        "ROLE_PHRASE",
+        "SOFTWARE_NAME",
+        "TECH_HEALTH",
         "THOUSANDS_SEPARATOR",
+        "UUID",
         "VERSION_STRING",
         "ZERO_PADDED_ACCOUNT",
-        "INVALID_OCTET_IP",
     }
 
 
@@ -135,6 +151,7 @@ def test_evaluate_decoys_routes_through_detect_with_the_callers_flags(
         use_regex: bool = True,
         use_llm: bool = True,
         llm_client: LLMClient | None = None,
+        encoder: object | None = None,
     ) -> list[Span]:
         calls.append((use_regex, use_llm, llm_client))
         return []

@@ -68,7 +68,7 @@ class TestSingleValueSubstitution:
 
 class TestMultiTypeSubstitution:
     def test_three_entity_types_in_one_call(self, vault: Vault) -> None:
-        text = f"Cliente {VALID_EMAIL}, DNI {VALID_DNI}, telefono {VALID_PHONE}, resto intacto."
+        text = f"Customer {VALID_EMAIL}, DNI {VALID_DNI}, phone {VALID_PHONE}, rest untouched."
         result = tokenize(text, vault)
         assert isinstance(result, str)
 
@@ -77,7 +77,7 @@ class TestMultiTypeSubstitution:
         assert "PII_PHONE_0001" in result
         assert VALID_EMAIL not in result
         assert VALID_DNI not in result
-        assert "resto intacto." in result
+        assert "rest untouched." in result
 
     def test_surrounding_text_preserved(self, vault: Vault) -> None:
         text = f"HEAD: {VALID_EMAIL} MID: {VALID_DNI} TAIL"
@@ -485,7 +485,7 @@ class TestLLMLayerWiring:
     ) -> None:
         monkeypatch.delenv(LLM_BASE_URL_ENV_VAR, raising=False)
         monkeypatch.delenv(LLM_MODEL_ENV_VAR, raising=False)
-        text = f"Ana Garcia, correo {VALID_EMAIL}"
+        text = f"Ana Garcia, email {VALID_EMAIL}"
 
         result = tokenize(text, vault)
 
@@ -503,7 +503,7 @@ class TestLLMLayerWiring:
         state.completion_content = json.dumps(
             {"spans": [{"value": "Ana Garcia", "entity_type": "PERSON"}]}
         )
-        text = f"Ana Garcia, correo {VALID_EMAIL}"
+        text = f"Ana Garcia, email {VALID_EMAIL}"
         client = LLMClient(base_url, "test-model", timeout_seconds=2.0)
 
         try:
@@ -552,7 +552,7 @@ class TestLLMLayerWiring:
         state.status = 500
         monkeypatch.setenv(LLM_BASE_URL_ENV_VAR, base_url)
         monkeypatch.setenv(LLM_MODEL_ENV_VAR, "test-model")
-        text = f"Ana Garcia, correo {VALID_EMAIL}"
+        text = f"Ana Garcia, email {VALID_EMAIL}"
 
         result = tokenize(text, vault)
 
@@ -583,7 +583,7 @@ class TestAuditLogWiring:
     def test_one_entry_per_substituted_span(self, vault: Vault, tmp_path: Path) -> None:
         log_path = tmp_path / "audit.jsonl"
         log = AuditLog(log_path)
-        text = f"Cliente {VALID_EMAIL}, DNI {VALID_DNI}"
+        text = f"Customer {VALID_EMAIL}, DNI {VALID_DNI}"
 
         tokenize(text, vault, audit_log=log, adapter="test")
 
@@ -615,7 +615,7 @@ class TestAuditLogWiring:
 
 class TestSpanSinkForThePipelinePanel:
     def test_span_sink_receives_every_span_before_substitution(self, vault: Vault) -> None:
-        text = f"Cliente {VALID_EMAIL}, DNI {VALID_DNI}"
+        text = f"Customer {VALID_EMAIL}, DNI {VALID_DNI}"
         spans: list[Span] = []
 
         result = tokenize(text, vault, span_sink=spans)

@@ -41,13 +41,15 @@ are addresses, unambiguously.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import os
 import re
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import httpx
 
@@ -59,6 +61,8 @@ __all__ = [
     "Detector",
     "EntityType",
     "LLMClient",
+    "SpanEncoder",
+    "llm_client_from_env",
     "LLMDetectionError",
     "Span",
     "clear_llm_cache",
@@ -67,11 +71,16 @@ __all__ = [
     "detect_regex",
     "merge_spans",
     "valid_card",
+    "valid_cif",
     "valid_dni",
+    "valid_gps",
     "valid_iban",
     "valid_international_phone",
     "valid_ipv4",
+    "valid_ipv6",
     "valid_nie",
+    "valid_nss",
+    "valid_secret",
     "valid_spanish_phone",
 ]
 
@@ -96,8 +105,32 @@ class EntityType(StrEnum):
     PERSON = "PERSON"
     ADDRESS = "ADDRESS"
     #: A company / organization name (a customer's business, a counterparty).
-    #: Like ``PERSON`` and ``ADDRESS`` it is produced only by the LLM layer.
+    #: Like ``PERSON`` and ``ADDRESS`` it is produced only by the soft layers.
     ORG = "ORG"
+    #: Soft, free-form identifiers (LLM / encoder layers only): a date of
+    #: birth, a username or handle, and GDPR special-category data (health,
+    #: religion, sexual orientation...) mentioned in free text.
+    DOB = "DOB"
+    USERNAME = "USERNAME"
+    SENSITIVE = "SENSITIVE"
+    #: Any other free-form identifier a soft layer reports under a label we
+    #: do not define. Kept rather than dropped: for the soft layer the label
+    #: is cosmetic, and discarding the span would forward the value in clear.
+    OTHER = "OTHER"
+    #: Rule-based additions to the regex layer. ``SECRET`` covers credentials
+    #: (API keys, tokens, passwords in configs or connection strings, private
+    #: keys) -- not personal data, but the worst thing a production incident
+    #: transcript can leak. ``CIF`` (company tax ID) and ``NSS`` (Spanish
+    #: social security number) carry check digits like DNI; ``PLATE`` is a
+    #: current-format Spanish licence plate; ``MAC`` a network hardware
+    #: address; ``GPS`` a decimal latitude/longitude pair. IPv6 addresses are
+    #: reported as ``IP``.
+    SECRET = "SECRET"
+    CIF = "CIF"
+    NSS = "NSS"
+    PLATE = "PLATE"
+    MAC = "MAC"
+    GPS = "GPS"
 
 
 class Detector(StrEnum):
@@ -105,6 +138,7 @@ class Detector(StrEnum):
 
     REGEX = "REGEX"
     LLM = "LLM"
+    ENCODER = "ENCODER"
 
 
 #: The seven check-digit-provable types the deterministic layer guarantees.
@@ -121,6 +155,12 @@ STRUCTURED_TYPES: Final = frozenset(
         EntityType.PHONE,
         EntityType.CARD,
         EntityType.IP,
+        EntityType.SECRET,
+        EntityType.CIF,
+        EntityType.NSS,
+        EntityType.PLATE,
+        EntityType.MAC,
+        EntityType.GPS,
     }
 )
 
@@ -168,6 +208,7 @@ _NIE_PREFIX: Final = {"X": "0", "Y": "1", "Z": "2"}
 # cannot disagree with the detector: no pattern proposes a dotted candidate,
 # so no validator should accept one. See the separator policy in the docstring.
 _SEPARATORS: Final = re.compile(r"[\s\-]")
+_SLASHES: Final = re.compile(r"/")
 
 
 def _compact(value: str) -> str:
@@ -243,6 +284,90 @@ def valid_ipv4(value: str) -> bool:
     return all(part.isdigit() and len(part) <= 3 and int(part) <= 255 for part in parts)
 
 
+def valid_ipv6(value: str) -> bool:
+    """A real IPv6 address per ``ipaddress`` (rejects clock times like ``12:30:45``)."""
+    # At least four hex digits: rules out C++ scopes (`a::b`) and other
+    # double-colon text that happens to parse; real addresses have more.
+    if value.count(":") < 2 or sum(c.isalnum() for c in value) < 4:
+        return False
+    try:
+        ipaddress.IPv6Address(value)
+    except ValueError:
+        return False
+    return True
+
+
+_CIF_LETTER_CONTROL: Final = "JABCDEFGHI"
+#: Entity letters whose control must be a letter / must be a digit; the rest
+#: accept either form.
+_CIF_LETTER_ONLY: Final = frozenset("KPQRSNW")
+_CIF_DIGIT_ONLY: Final = frozenset("ABEH")
+
+
+def valid_cif(value: str) -> bool:
+    """Spanish company tax ID: entity letter, 7 digits, control digit or letter.
+
+    Sum the digits in even positions, add the digit-sum of twice each digit
+    in odd positions; the control digit is ``(10 - total % 10) % 10`` and the
+    control letter is ``"JABCDEFGHI"[digit]``.
+    """
+    compact = _compact(value).upper()
+    if len(compact) != 9 or compact[0] not in "ABCDEFGHJKLMNPQRSUVW":
+        return False
+    digits, control = compact[1:8], compact[8]
+    if not digits.isdigit():
+        return False
+    total = 0
+    for index, char in enumerate(digits):
+        n = int(char)
+        if index % 2 == 0:  # 1-based odd positions 1, 3, 5, 7
+            n *= 2
+            n = n // 10 + n % 10
+        total += n
+    digit = (10 - total % 10) % 10
+    letter = _CIF_LETTER_CONTROL[digit]
+    if compact[0] in _CIF_LETTER_ONLY:
+        return control == letter
+    if compact[0] in _CIF_DIGIT_ONLY:
+        return control == str(digit)
+    return control in (letter, str(digit))
+
+
+def valid_nss(value: str) -> bool:
+    """Spanish social security number: 2-digit province, 8 digits, 2 control digits.
+
+    Official two-case rule: when the 8-digit number is below 10,000,000 the
+    base is ``province * 10**7 + number``, otherwise it is the first ten
+    digits read as one integer; the control is ``base % 97``.
+    """
+    compact = _SLASHES.sub("", _compact(value))
+    if len(compact) != 12 or not compact.isdigit():
+        return False
+    province, number, control = int(compact[:2]), int(compact[2:10]), int(compact[10:])
+    if not 1 <= province <= 53:
+        return False
+    base = province * 10**7 + number if number < 10**7 else int(compact[:10])
+    return base % 97 == control
+
+
+def valid_gps(value: str) -> bool:
+    """A ``lat, lon`` pair within range (-90..90, -180..180)."""
+    try:
+        lat_raw, lon_raw = value.split(",")
+        lat, lon = float(lat_raw), float(lon_raw)
+    except ValueError:
+        return False
+    return -90 <= lat <= 90 and -180 <= lon <= 180
+
+
+def valid_secret(value: str) -> bool:
+    """Reject placeholders a ``key=value`` match can catch (``****``, ``<redacted>``...)."""
+    if value.startswith("PII_") or len(set(value)) <= 2:
+        return False
+    lowered = value.lower().strip("<>[]{}()")
+    return lowered not in {"redacted", "hidden", "none", "null", "changeme", "xxxxxx"}
+
+
 def valid_spanish_phone(value: str) -> bool:
     """Nine digits starting 6, 7 or 9, with an optional +34 / 0034 prefix.
 
@@ -308,6 +433,47 @@ _CARD = re.compile(r"(?<![0-9])(?P<value>[0-9](?:[ \-]?[0-9]){11,18})(?![0-9])")
 # missed every IP written at the end of a line, which is where logs put them.
 _IP = re.compile(r"(?<![0-9.])(?P<value>(?:[0-9]{1,3}\.){3}[0-9]{1,3})(?![0-9])(?!\.[0-9])")
 
+_IPV6 = re.compile(r"(?<![\w:.])(?P<value>(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})(?![\w:])")
+_CIF = re.compile(
+    r"(?<![0-9A-Za-z])(?P<value>[ABCDEFGHJKLMNPQRSUVW][ \-]?[0-9]{7}[0-9A-J])(?![0-9A-Za-z])"
+)
+_NSS = re.compile(r"(?<![0-9/])(?P<value>[0-9]{2}[ /\-]?[0-9]{8}[ /\-]?[0-9]{2})(?![0-9/])")
+# Current Spanish format (since 2000): 4 digits + 3 consonants, no vowels, no Q/Ñ.
+_PLATE = re.compile(
+    r"(?<![0-9A-Za-z])(?P<value>[0-9]{4}[ \-]?[BCDFGHJKLMNPRSTVWXYZ]{3})(?![0-9A-Za-z\-])"
+)
+_MAC = re.compile(
+    r"(?<![0-9A-Fa-f:\-])(?P<value>[0-9A-Fa-f]{2}([:\-])(?:[0-9A-Fa-f]{2}\2){4}[0-9A-Fa-f]{2})"
+    r"(?![0-9A-Fa-f:\-])"
+)
+# Four or more decimals on both halves, and a location keyword shortly
+# before: a bare pair of decimals is as often a ratio or a weight.
+_GPS = re.compile(
+    r"(?i)\b(?:lat|lon|lng|location|coords?|coordinates|gps|geo|position)\w*[^\n]{0,30}?"
+    r"(?<![0-9.\-])(?P<value>-?[0-9]{1,2}\.[0-9]{4,},\s?-?[0-9]{1,3}\.[0-9]{4,})(?![0-9])(?!\.[0-9])"
+)
+# Credentials. Vendor key shapes are unambiguous on their own; a generic
+# `password=...`/`api_key: ...` assignment and the password in a
+# `scheme://user:password@host` URL need their context to anchor, which stays
+# outside the `value` group so only the secret itself is tokenized.
+_SECRET_PATTERNS: Final = (
+    re.compile(r"(?P<value>\bAKIA[0-9A-Z]{16}\b)"),
+    re.compile(r"(?P<value>\bgh[pousr]_[A-Za-z0-9]{30,}\b)"),
+    re.compile(r"(?P<value>\bxox[baprs]-[A-Za-z0-9\-]{10,})"),
+    re.compile(r"(?P<value>\bsk[-_](?:live|test|ant|proj)[-_][A-Za-z0-9_\-]{16,})"),
+    re.compile(r"(?P<value>\bsk-[A-Za-z0-9]{32,}\b)"),
+    re.compile(r"(?P<value>\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})"),
+    re.compile(
+        r"(?P<value>-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]+?"
+        r"-----END (?:[A-Z]+ )*PRIVATE KEY-----)"
+    ),
+    re.compile(
+        r"(?i)\b(?:password|passwd|pwd|secret|api[_\-]?key|access[_\-]?key|auth[_\-]?token|"
+        r"client[_\-]?secret|private[_\-]?key)[\"']?\s*[:=]\s*[\"']?(?P<value>[^\s\"',;&]{6,})"
+    ),
+    re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:(?P<value>[^\s@/]{3,})@"),
+)
+
 _Validator = Callable[[str], bool]
 
 _PATTERNS: Final[tuple[tuple[EntityType, re.Pattern[str], _Validator | None], ...]] = (
@@ -319,11 +485,29 @@ _PATTERNS: Final[tuple[tuple[EntityType, re.Pattern[str], _Validator | None], ..
     # merge_spans keeps the longer one, so the country code is not dropped.
     (EntityType.PHONE, _PHONE_ES, valid_spanish_phone),
     (EntityType.PHONE, _PHONE_INTL, valid_international_phone),
+    # NSS before CARD: on an exact tie (a 12-digit run passing both checks)
+    # the earlier pattern wins, and mod-97 is the far more specific check.
+    (EntityType.NSS, _NSS, valid_nss),
     (EntityType.CARD, _CARD, valid_card),
     (EntityType.IP, _IP, valid_ipv4),
+    (EntityType.IP, _IPV6, valid_ipv6),
+    (EntityType.CIF, _CIF, valid_cif),
+    (EntityType.PLATE, _PLATE, None),
+    (EntityType.MAC, _MAC, None),
+    (EntityType.GPS, _GPS, valid_gps),
+    *((EntityType.SECRET, pattern, valid_secret) for pattern in _SECRET_PATTERNS),
 )
 
-_DETECTOR_RANK: Final = {Detector.REGEX: 0, Detector.LLM: 1}
+_DETECTOR_RANK: Final = {Detector.REGEX: 0, Detector.LLM: 1, Detector.ENCODER: 2}
+
+
+class SpanEncoder(Protocol):
+    """An encoder-based NER detector (see ``core.encoder``), plugged into ``detect()``."""
+
+    @property
+    def identity(self) -> str: ...
+
+    def detect_spans(self, text: str) -> list[Span]: ...
 
 
 # --------------------------------------------------------------------------
@@ -352,6 +536,16 @@ def merge_spans(spans: Iterable[Span]) -> list[Span]:
     return sorted(kept, key=lambda span: span.start)
 
 
+def _trim_iban(value: str, validator: _Validator) -> str | None:
+    """Drop trailing 4-char groups (and their separator) until the IBAN validates."""
+    candidate = value
+    while len(_compact(candidate)) > 15:
+        candidate = candidate[:-4].rstrip(" -")
+        if validator(candidate):
+            return candidate
+    return None
+
+
 def detect_regex(text: str) -> list[Span]:
     """Find every structured entity in ``text``, offsets into ``text`` itself.
 
@@ -362,9 +556,18 @@ def detect_regex(text: str) -> list[Span]:
     for entity_type, pattern, validator in _PATTERNS:
         for match in pattern.finditer(text):
             value = match.group("value")
-            if validator is not None and not validator(value):
-                continue
             start, end = match.span("value")
+            if validator is not None and not validator(value):
+                if entity_type is not EntityType.IBAN:
+                    continue
+                # The IBAN pattern is greedy over 4-char groups, so a following
+                # 4-letter word ("... 1332 with care") gets swallowed as one more
+                # group, the check digit fails, and the whole IBAN would leak.
+                # Retry with trailing groups dropped before giving up.
+                trimmed = _trim_iban(value, validator)
+                if trimmed is None:
+                    continue
+                value, end = trimmed, start + len(trimmed)
             found.append(
                 Span(
                     start=start,
@@ -374,6 +577,17 @@ def detect_regex(text: str) -> list[Span]:
                     detector=Detector.REGEX,
                 )
             )
+    # A credential beats an email it overlaps: in `scheme://user:pass@host`
+    # the email pattern would otherwise claim `pass@host` (longer, so it would
+    # win the merge) and leave the password half-recognised.
+    secrets = [span for span in found if span.entity_type is EntityType.SECRET]
+    if secrets:
+        found = [
+            span
+            for span in found
+            if span.entity_type is not EntityType.EMAIL
+            or not any(span.overlaps(secret) for secret in secrets)
+        ]
     return merge_spans(found)
 
 
@@ -397,6 +611,14 @@ LLM_MODEL_ENV_VAR: Final = "VEIL_LLM_MODEL"
 #: cache-miss block if the endpoint is genuinely down, but a LAN-local host
 #: under light load should comfortably finish well inside this.
 DEFAULT_LLM_TIMEOUT_SECONDS: Final = 10.0
+
+#: Optional overrides for larger/reasoning models. ``VEIL_LLM_REASONING_EFFORT``
+#: is passed through as the OpenAI-compatible ``reasoning_effort`` field
+#: (Ollama maps ``"none"`` to ``think: false``), so a model that thinks by
+#: default answers with the JSON directly. ``VEIL_LLM_TIMEOUT`` (seconds)
+#: raises the per-call timeout for a 20-30B model.
+LLM_REASONING_EFFORT_ENV_VAR: Final = "VEIL_LLM_REASONING_EFFORT"
+LLM_TIMEOUT_ENV_VAR: Final = "VEIL_LLM_TIMEOUT"
 
 _ENTITY_TYPE_NAMES: Final = tuple(entity_type.value for entity_type in EntityType)
 
@@ -445,13 +667,13 @@ _SYSTEM_PROMPT: Final = (
     "indirect reference that identifies a specific person (for example "
     '"the son of the Acme administrator") as a PERSON match on the phrase '
     "that identifies them, not a separate category. A first-person "
-    'self-introduction -- "Soy Alfonso", "Me llamo Ana Garcia", "My name is '
-    'John Smith", "This is Maria speaking" -- names the speaker just as much '
+    'self-introduction -- "I\'m Alfonso", "My name is Ana Garcia", "John '
+    'Smith here", "This is Maria speaking" -- names the speaker just as much '
     "as a third-person mention names someone else: match the name in these "
     "just as you would if someone else said it about them. Never skip a name "
     "merely because the person speaking is naming themselves. Match only the "
-    'name itself, never a leading verb or introductory phrase -- in "Soy '
-    'Alfonso" the match is "Alfonso", not "Soy Alfonso". When a person has '
+    "name itself, never a leading verb or introductory phrase -- in \"I'm "
+    'Alfonso" the match is "Alfonso", not "I\'m Alfonso". When a person has '
     "multiple name parts (a given name plus one or more surnames), return "
     "them together as ONE span covering the full name, never one span per "
     'word -- in "Alfonso Garcia" the match is "Alfonso Garcia", not '
@@ -463,7 +685,20 @@ _SYSTEM_PROMPT: Final = (
     "NOT report as PERSON or ORG: software products, tools, programming "
     "languages, AI models or assistants (Claude, Claude Code, Anthropic...), "
     "technology vendors, or generic role words -- only organizations that "
-    "identify a real-world customer or business relationship."
+    "identify a real-world customer or business relationship. "
+    "ADDRESS is a postal address or a specific location tied to someone "
+    "(street, number, postcode, city), as ONE span. "
+    'DOB is a date of birth (e.g. "born 12/03/1985", "DOB: 1985-03-12"): '
+    "match the date itself. "
+    'USERNAME is a login, account name or social handle (e.g. "@maria_g", '
+    '"user: jdoe85"): match the handle itself. '
+    "SENSITIVE is special-category personal data stated about a specific "
+    "person in free text -- a health condition, diagnosis, disability, "
+    "religion, sexual orientation, political or union affiliation (e.g. "
+    '"is diabetic", "undergoing chemotherapy"): match the shortest phrase '
+    "that states it. "
+    "When in doubt whether a free-form value identifies someone, report it: "
+    "the exact label matters less than not missing it."
 )
 
 
@@ -525,6 +760,40 @@ def _is_known_non_pii_name(text: str) -> bool:
     return " ".join(text.split()).casefold() in _NON_PII_NAMES
 
 
+def _parse_json_object(content: str) -> Any:
+    """Parse a model reply as JSON, tolerating a markdown fence or stray prose.
+
+    Larger models sometimes wrap the object in ```json fences or prefix a
+    sentence despite the prompt; the object itself is still the outermost
+    ``{...}``. Raises ``json.JSONDecodeError`` when no object can be parsed.
+    """
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start, end = content.find("{"), content.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(content[start : end + 1])
+
+
+def llm_client_from_env() -> LLMClient | None:
+    """Build an ``LLMClient`` from the environment, or ``None`` if unconfigured.
+
+    Needs both ``VEIL_LLM_BASE_URL`` and ``VEIL_LLM_MODEL``; the optional
+    ``VEIL_LLM_REASONING_EFFORT`` and ``VEIL_LLM_TIMEOUT`` tune larger models.
+    The single place every adapter builds its client from, so they all read
+    the same variables the same way.
+    """
+    base_url = os.environ.get(LLM_BASE_URL_ENV_VAR, "").strip()
+    model = os.environ.get(LLM_MODEL_ENV_VAR, "").strip()
+    if not base_url or not model:
+        return None
+    effort = os.environ.get(LLM_REASONING_EFFORT_ENV_VAR, "").strip() or None
+    timeout_raw = os.environ.get(LLM_TIMEOUT_ENV_VAR, "").strip()
+    timeout = float(timeout_raw) if timeout_raw else DEFAULT_LLM_TIMEOUT_SECONDS
+    return LLMClient(base_url, model, timeout_seconds=timeout, reasoning_effort=effort)
+
+
 class LLMDetectionError(Exception):
     """Raised when the LLM layer's response cannot be trusted as spans.
 
@@ -552,9 +821,11 @@ class LLMClient:
         model: str,
         *,
         timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._client = httpx.Client(base_url=self._base_url, timeout=httpx.Timeout(timeout_seconds))
 
     @property
@@ -564,6 +835,32 @@ class LLMClient:
         cached result for the same text (see ``_cache_key``).
         """
         return f"{self._base_url}|{self._model}"
+
+    def _chat(self, system: str, user: str) -> str:
+        """POST one chat completion and return the assistant message content."""
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
+        response = self._client.post("/v1/chat/completions", json=payload)
+        if response.status_code >= 500:
+            # One retry: Ollama answers 500 while it evicts/reloads a model
+            # under VRAM pressure, and the very next request usually succeeds.
+            response = self._client.post("/v1/chat/completions", json=payload)
+        response.raise_for_status()
+        try:
+            content = response.json()["choices"][0]["message"]["content"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
+        if not isinstance(content, str):
+            raise LLMDetectionError(f"message content is not a string ({type(content).__name__})")
+        return content
 
     def complete_spans(self, text: str) -> list[dict[str, Any]]:
         """POST one chat-completion request; return the raw parsed ``spans`` list.
@@ -584,22 +881,9 @@ class LLMClient:
         (``detect``) catch every exception from this method and fail closed
         to the regex layer's spans.
         """
-        response = self._client.post(
-            "/v1/chat/completions",
-            json={
-                "model": self._model,
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Text:\n{text}"},
-                ],
-            },
-        )
-        response.raise_for_status()
+        content = self._chat(_SYSTEM_PROMPT, f"Text:\n{text}")
         try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            parsed = _parse_json_object(content)
             spans = parsed["spans"]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
@@ -624,22 +908,9 @@ class LLMClient:
         propagate.
         """
         numbered = "\n".join(f"{i}. {candidate}" for i, candidate in enumerate(candidates, 1))
-        response = self._client.post(
-            "/v1/chat/completions",
-            json={
-                "model": self._model,
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": _PERSON_CONFIRMATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": numbered},
-                ],
-            },
-        )
-        response.raise_for_status()
+        content = self._chat(_PERSON_CONFIRMATION_SYSTEM_PROMPT, numbered)
         try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            parsed = _parse_json_object(content)
             persons = parsed["persons"]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
@@ -692,6 +963,25 @@ def _locate_next(text: str, value: str, taken_starts: set[int]) -> int | None:
     return None
 
 
+def _without_dots(validator: _Validator) -> _Validator:
+    """Accept the dotted ``12.345.678-Z`` form the regex layer leaves to the LLM."""
+    return lambda value: validator(value.replace(".", ""))
+
+
+_LLM_STRUCTURED_VALIDATORS: Final[dict[EntityType, _Validator]] = {
+    EntityType.DNI: _without_dots(valid_dni),
+    EntityType.NIE: _without_dots(valid_nie),
+    EntityType.IBAN: valid_iban,
+    EntityType.CARD: valid_card,
+    EntityType.CIF: _without_dots(valid_cif),
+    EntityType.NSS: valid_nss,
+    EntityType.IP: lambda value: valid_ipv4(value) or valid_ipv6(value),
+    EntityType.GPS: valid_gps,
+    EntityType.PLATE: lambda value: _PLATE.fullmatch(value) is not None,
+    EntityType.MAC: lambda value: _MAC.fullmatch(value) is not None,
+}
+
+
 def detect_llm(text: str, client: LLMClient) -> list[Span]:
     """Ask ``client`` for spans over ``text``, validated and offset into it.
 
@@ -728,18 +1018,29 @@ def detect_llm(text: str, client: LLMClient) -> list[Span]:
             raise LLMDetectionError(
                 f"span entry's 'value' must be a non-empty string (got {type(value).__name__})"
             )
-        if entity_type_raw not in valid_types:
+        if not isinstance(entity_type_raw, str) or not entity_type_raw:
             raise LLMDetectionError(
-                f"span entry has an unrecognized entity_type (got {type(entity_type_raw).__name__})"
+                f"span entry's 'entity_type' must be a non-empty string "
+                f"(got {type(entity_type_raw).__name__})"
             )
+        # An invented label still marks something the model judged
+        # identifying; keep it as OTHER instead of failing the whole block.
+        entity_type = (
+            EntityType(entity_type_raw) if entity_type_raw in valid_types else EntityType.OTHER
+        )
+        if entity_type in _NAME_LIKE_TYPES and _is_known_non_pii_name(value):
+            continue
+        # Check-digit types are the regex layer's job: the model accepts
+        # invalid control digits as real PII (measured with the decoy set), so
+        # a structured span it reports must pass the same validator.
+        llm_validator = _LLM_STRUCTURED_VALIDATORS.get(entity_type)
+        if llm_validator is not None and not llm_validator(value):
+            continue
         taken_starts = taken_starts_by_value.setdefault(value, set())
         start = _locate_next(text, value, taken_starts)
         if start is None:
             continue
         taken_starts.add(start)
-        entity_type = EntityType(entity_type_raw)
-        if entity_type in _NAME_LIKE_TYPES and _is_known_non_pii_name(value):
-            continue
         found.append(
             Span(
                 start=start,
@@ -857,8 +1158,9 @@ def detect(
     use_regex: bool = True,
     use_llm: bool = True,
     llm_client: LLMClient | None = None,
+    encoder: SpanEncoder | None = None,
 ) -> list[Span]:
-    """Union the regex and LLM layers over ``text``, per the enabled flags.
+    """Union the regex, LLM and encoder layers over ``text``, per the enabled flags.
 
     ``use_llm`` has no effect unless ``llm_client`` is also supplied -- this
     is the "switchable off" entry point: a caller with no client (e.g.
@@ -875,6 +1177,10 @@ def detect(
     caught and logged the same way as the main LLM leg, falling back to
     whatever was already found rather than propagating -- this step can only
     ever add spans, never remove ones the main call already returned.
+
+    ``encoder``, when supplied, adds an encoder-based NER model's spans
+    (``core.encoder``) to the same union, independent of the LLM layer. A
+    failure there is logged and skipped, like the LLM leg.
     """
     spans: list[Span] = []
     if use_regex:
@@ -897,4 +1203,13 @@ def detect(
                     f"({type(exc).__name__}: {exc}), continuing without it",
                     file=sys.stderr,
                 )
+    if encoder is not None:
+        try:
+            spans.extend(encoder.detect_spans(text))
+        except Exception as exc:
+            print(
+                f"veil detector: encoder layer failed ({type(exc).__name__}: {exc}), "
+                "continuing without it for this block",
+                file=sys.stderr,
+            )
     return merge_spans(spans)
