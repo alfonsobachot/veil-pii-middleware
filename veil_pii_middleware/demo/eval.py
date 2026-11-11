@@ -4,10 +4,12 @@ Sweeps queries against the demo database, runs the results through the
 detector and reports metrics per entity type and per detector, including the
 concrete list of misses.
 
-Matching is strict: a manifest instance counts as detected only when a span
-starts at the recorded offset and carries the recorded value. Anything looser
-would score a detector that finds *roughly* the right region, and the
-tokenizer needs the exact one.
+Structured matching is strict: a structured instance (email, DNI, card...)
+counts as detected only when a span starts at the recorded offset, carries the
+recorded value and has the recorded type. Soft instances (names,
+organisations, addresses...) count as detected when the soft spans credited to
+them cover at least 90% of their alphanumeric characters, since soft layers
+disagree on boundaries. Each span is credited to at most one instance.
 
 Person names are in the manifest on purpose. No regex can prove them, so they
 report as misses in regex-only mode — false
@@ -203,42 +205,42 @@ def evaluate(
             encoder=active_encoder,
         )
         seconds += time.perf_counter() - started
-        # (offset, value) is the identity of a detection, matching how the
-        # manifest records ground truth.
-        found: set[tuple[int, str]] = {(span.start, span.text) for span in spans}
-        claimed: dict[tuple[int, str], Span] = {(span.start, span.text): span for span in spans}
-
-        matched: set[tuple[int, str]] = set()
+        # Each span is credited to at most one ground-truth value, so a single
+        # span stretched over several values (or a whole cell) cannot collect
+        # recall for all of them.
+        credited: set[int] = set()
+        soft_instances: list[dict[str, Any]] = []
         for instance in instances:
             entity_type = str(instance["entity_type"])
-            key = (int(instance["offset"]), str(instance["value"]))
             _bump(type_counts, entity_type, "support")
-            hit: tuple[int, str] | None = None
-            if key in found and _type_matches(entity_type, str(claimed[key].entity_type)):
-                hit = key
-            elif entity_type not in STRUCTURED_TYPES:
-                hit = _soft_overlap(key, claimed)
-            if hit is not None:
-                _bump(type_counts, entity_type, "true_positives")
-                _bump(detector_counts, str(claimed[hit].detector), "true_positives")
-                _bump(detector_counts, str(claimed[hit].detector), "support")
-                matched.add(hit)
-                # Every other soft span inside the same value (e.g. a model
-                # splitting a name in two) is part of the hit, not a false positive.
-                matched.update(_soft_overlaps(key, claimed))
-            else:
-                misses.append(
-                    Miss(
-                        table=cell[0],
-                        column=cell[1],
-                        row_id=cell[2],
-                        entity_type=entity_type,
-                        value=str(instance["value"]),
-                    )
-                )
+            if entity_type not in STRUCTURED_TYPES:
+                soft_instances.append(instance)
+                continue
+            exact = _exact_structured_span(instance, spans, credited)
+            if exact is None:
+                misses.append(_miss(cell, instance))
+                continue
+            credited.add(exact)
+            _bump(type_counts, entity_type, "true_positives")
+            _bump(detector_counts, str(spans[exact].detector), "true_positives")
+            _bump(detector_counts, str(spans[exact].detector), "support")
 
-        for key, span in claimed.items():
-            if key not in matched:
+        assigned = _assign_soft_spans(soft_instances, spans, credited)
+        for index, instance in enumerate(soft_instances):
+            own = assigned.get(index, [])
+            # A span on a real value is never a false positive, even when it
+            # covers too little of it for the value to count as detected.
+            credited.update(own)
+            if not own or _soft_coverage(instance, [spans[i] for i in own]) < _SOFT_MIN_COVERAGE:
+                misses.append(_miss(cell, instance))
+                continue
+            _bump(type_counts, str(instance["entity_type"]), "true_positives")
+            for detector in sorted({str(spans[i].detector) for i in own}):
+                _bump(detector_counts, detector, "true_positives")
+                _bump(detector_counts, detector, "support")
+
+        for index, span in enumerate(spans):
+            if index not in credited:
                 _bump(type_counts, str(span.entity_type), "false_positives")
                 _bump(detector_counts, str(span.detector), "false_positives")
 
@@ -253,42 +255,76 @@ def evaluate(
     )
 
 
-#: A soft ground-truth value counts as detected when one soft span covers at
-#: least this share of it. Soft layers disagree on boundaries ("is diabetic"
-#: vs "diabetic", a trailing city on an address); requiring half keeps a
-#: first-name-only hit on a full name ("Rosendo" of "Rosendo Cifuentes Rojas")
-#: a miss, since it would still forward the surnames.
-_SOFT_MIN_COVERAGE: Final = 0.5
+#: A soft ground-truth value counts as detected when the soft spans credited
+#: to it, together, cover at least this share of its alphanumeric characters.
+#: Soft layers disagree on boundaries ("is diabetic" vs "diabetic"), so the
+#: union of spans is what counts: a name split into "Rosendo" and "Cifuentes
+#: Rojas" is detected, while "Rosendo Cifuentes" alone leaves the second
+#: surname to leak and is a miss.
+_SOFT_MIN_COVERAGE: Final = 0.9
 
 
-def _soft_overlaps(
-    key: tuple[int, str], claimed: dict[tuple[int, str], Span]
-) -> list[tuple[int, str]]:
-    start, value = key
-    end = start + len(value)
-    return [
-        span_key
-        for span_key, span in claimed.items()
-        if str(span.entity_type) not in STRUCTURED_TYPES and span.start < end and start < span.end
-    ]
+def _miss(cell: tuple[str, str, int], instance: dict[str, Any]) -> Miss:
+    return Miss(
+        table=cell[0],
+        column=cell[1],
+        row_id=cell[2],
+        entity_type=str(instance["entity_type"]),
+        value=str(instance["value"]),
+    )
 
 
-def _soft_overlap(
-    key: tuple[int, str], claimed: dict[tuple[int, str], Span]
-) -> tuple[int, str] | None:
-    """The soft span covering most of a soft ground-truth value, if it covers enough."""
-    start, value = key
-    end = start + len(value)
-    best: tuple[int, str] | None = None
-    best_cover = 0
-    for span_key in _soft_overlaps(key, claimed):
-        span = claimed[span_key]
-        cover = min(end, span.end) - max(start, span.start)
-        if cover > best_cover:
-            best, best_cover = span_key, cover
-    if best is None or best_cover < _SOFT_MIN_COVERAGE * len(value):
-        return None
-    return best
+def _exact_structured_span(
+    instance: dict[str, Any], spans: list[Span], credited: set[int]
+) -> int | None:
+    """Index of an uncredited span with the instance's exact offset, value and type."""
+    offset, value = int(instance["offset"]), str(instance["value"])
+    entity_type = str(instance["entity_type"])
+    for index, span in enumerate(spans):
+        if (
+            index not in credited
+            and span.start == offset
+            and span.text == value
+            and _type_matches(entity_type, str(span.entity_type))
+        ):
+            return index
+    return None
+
+
+def _assign_soft_spans(
+    instances: list[dict[str, Any]], spans: list[Span], credited: set[int]
+) -> dict[int, list[int]]:
+    """Give each uncredited soft span to the soft value it overlaps most.
+
+    Returns, per index into ``instances``, the indexes of the spans assigned
+    to it. A span that overlaps no soft value is left unassigned and later
+    counts as a false positive. Ties go to the earlier value.
+    """
+    assigned: dict[int, list[int]] = defaultdict(list)
+    for span_index, span in enumerate(spans):
+        if span_index in credited or str(span.entity_type) in STRUCTURED_TYPES:
+            continue
+        best: int | None = None
+        best_overlap = 0
+        for instance_index, instance in enumerate(instances):
+            start = int(instance["offset"])
+            end = start + len(str(instance["value"]))
+            overlap = min(end, span.end) - max(start, span.start)
+            if overlap > best_overlap:
+                best, best_overlap = instance_index, overlap
+        if best is not None:
+            assigned[best].append(span_index)
+    return assigned
+
+
+def _soft_coverage(instance: dict[str, Any], spans: list[Span]) -> float:
+    """Share of the value's alphanumeric characters covered by the union of ``spans``."""
+    start, value = int(instance["offset"]), str(instance["value"])
+    positions = [start + i for i, char in enumerate(value) if char.isalnum()]
+    if not positions:
+        positions = list(range(start, start + len(value)))
+    covered = sum(1 for pos in positions if any(s.start <= pos < s.end for s in spans))
+    return covered / len(positions)
 
 
 def _type_matches(expected: str, claimed: str) -> bool:
