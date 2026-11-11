@@ -1233,7 +1233,7 @@ def _build_demo_incident(corpus: _Corpus, connection: sqlite3.Connection) -> Non
 
     crm = (
         f"Call with {_DEMO_NAME} about the double charge on invoice {charged_twice}. She is "
-        "on medical leave and asked to be contacted by email only. Born 14/03/1986, "
+        "on sick leave for depression and asked to be contacted by email only. Born 14/03/1986, "
         f"identity checked against DNI {_DEMO_DNI}."
     )
     add(
@@ -1242,7 +1242,7 @@ def _build_demo_incident(corpus: _Corpus, connection: sqlite3.Connection) -> Non
         {
             "body": [
                 (_DEMO_NAME, PERSON),
-                ("medical leave", SENSITIVE),
+                ("depression", SENSITIVE),
                 ("14/03/1986", DOB),
                 (_DEMO_DNI, EntityType.DNI),
             ]

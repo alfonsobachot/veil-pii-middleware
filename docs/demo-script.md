@@ -3,6 +3,24 @@
 The live turn for the presentation on 2026-11-13. Every value below is synthetic: the demo
 customer is hand-written in `veil_pii_middleware/demo/seed.py` (`_build_demo_incident`).
 
+## Setup
+
+Both terminals (Git Bash) need the LLM layer configured. The hooks only use it when
+`VEIL_LLM_*` is exported in the shell that runs `ask.sh`, because they inherit that shell's
+environment, not the gateway's:
+
+```bash
+export VEIL_LLM_BASE_URL=http://127.0.0.1:11434
+export VEIL_LLM_MODEL=qwen3:4b-instruct-2507-q4_K_M
+scripts/run-gateway.sh          # terminal 1; both warm-up lines must print
+scripts/ask.sh --demo-db "..."  # terminal 2
+```
+
+Both scripts default `VEIL_LLM_TIMEOUT` to 120 s. The model sometimes dumps a whole table
+(`select * from users`, ~8 KB), which takes qwen3 4b about 45 s; with the old 30 s timeout
+the call failed, detection fell back to regex-only and every name, birth date and address in
+the dump reached the API (first live run, 2026-11-11).
+
 ## Prompts
 
 Main:
@@ -35,7 +53,7 @@ support ticket, an error log, a webhook and a CRM note all point at it.
 | `support_tickets` | 31 | name, DNI, email, two IBANs, card, phone, colleague's name and email |
 | `error_logs` | 201 | email, IBAN, IP |
 | `webhooks` | 31 | email, IBAN, IP |
-| `crm_notes` | 307 | name, health data (`medical leave`), date of birth, DNI |
+| `crm_notes` | 307 | name, health data (`depression`), date of birth, DNI |
 
 The first five tables follow from the email by foreign keys, so a normal investigation
 (user → customer → invoices → payments → tickets) returns at least 19 distinct PII values
@@ -77,7 +95,7 @@ ES9820385778983000760236
 ES6100811532610001286377
 4532014876239153
 88.12.45.201
-medical leave
+depression
 ```
 
 City names (`Valladolid` on its own) and amounts are not PII and are expected in clear.
