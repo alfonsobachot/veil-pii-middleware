@@ -298,7 +298,7 @@ With `VEIL_LLM_BASE_URL`/`VEIL_LLM_MODEL` set, `run-gateway.sh` first runs
 loaded (`keep_alive: -1`; Ollama otherwise unloads it after five idle minutes and the reload
 outlasts the timeout), then sends one probe through the detector and prints a loud warning if
 the LLM layer did not answer, since the gateway would then run regex-only. The scripts also
-default `VEIL_LLM_TIMEOUT` to 30 s.
+default `VEIL_LLM_TIMEOUT` to 120 s: a 52-row table dump takes qwen3 4b about 45 s.
 
 `--demo-db` is the one that exercises the target scenario end to end: it tokenizes the message
 before it reaches the model, lets the model query `demo/veil_demo.db` with only a token

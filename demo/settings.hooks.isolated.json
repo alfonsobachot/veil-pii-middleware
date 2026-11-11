@@ -9,6 +9,8 @@
       "Bash(python -c*)",
       "Bash(python3 -c*)",
       "Bash(python -I -c*)",
+      "Bash(python - *)",
+      "Bash(python3 - *)",
       "PowerShell(sqlite3*)",
       "PowerShell(python -c*)",
       "PowerShell(python -I -c*)"

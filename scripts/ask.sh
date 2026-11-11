@@ -64,7 +64,7 @@ export VEIL_GATEWAY_URL="${VEIL_GATEWAY_URL:-http://127.0.0.1:8787}"
 # `claude` is not always on Git Bash's PATH: try PATH, the native installer's
 # ~/.local/bin, then the VSCode extension's bundled binary.
 if command -v claude >/dev/null 2>&1; then
-  CLAUDE_BIN=claude
+  CLAUDE_BIN="$(command -v claude)"
 elif [ -x "$HOME/.local/bin/claude.exe" ]; then
   CLAUDE_BIN="$HOME/.local/bin/claude.exe"
 elif [ -x "$HOME/.local/bin/claude" ]; then
@@ -78,6 +78,14 @@ else
     exit 1
   fi
 fi
+
+# Drop PATH entries under $HOME (resolved above, so the binary is still
+# found): the model probes with `which python3`, and on Windows that prints
+# the per-user WindowsApps alias, username included. When the probe fails
+# PostToolUse never runs, and the gateway's soft layer missed the username
+# inside the path (live run, 2026-11-11).
+PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -i "^$HOME" | paste -sd ':' -)"
+export PATH
 
 if [ "$demo_db" -eq 1 ]; then
   ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -108,7 +116,7 @@ if [ "$demo_db" -eq 1 ]; then
   # resolve the shared vault against *this*, not the scratch dir below).
   export VEIL_REPO_ROOT="$ROOT"
   # Same per-call LLM timeout as run-gateway.sh: the hooks call the LLM too.
-  export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-30}"
+  export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-120}"
   # The model's `python -c` queries run on Windows with a cp1252 stdout by default;
   # Claude Code reads Bash output as UTF-8, so accents came back as U+FFFD
   # ("Consultorï¿½a"). Force UTF-8 for every child process.
