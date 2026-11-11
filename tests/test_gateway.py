@@ -2200,3 +2200,45 @@ class TestThinkingIsNeverDetokenized:
         assert content[0]["thinking"] == f"look up {token}"
         assert content[1]["text"] == f"found {VALID_EMAIL}"
         assert content[2]["input"] == {"q": token}
+
+
+class TestPanelTurnBoundaries:
+    def test_tool_result_with_only_a_system_reminder_is_not_real_text(self) -> None:
+        parsed: Any = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "42"},
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>\nupdate your todo list\n</system-reminder>",
+                        },
+                    ],
+                }
+            ]
+        }
+
+        assert gateway_server._last_user_content_has_text(parsed) is False
+
+    def test_real_text_next_to_a_system_reminder_still_counts(self) -> None:
+        parsed: Any = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>x</system-reminder>\nhello"},
+                    ],
+                }
+            ]
+        }
+
+        assert gateway_server._last_user_content_has_text(parsed) is True
+
+    def test_bodyless_request_publishes_no_panel_stages(self, servers: _Servers) -> None:
+        resp = httpx.get(f"{servers.gateway_url}/v1/models", timeout=10.0)
+        assert resp.status_code == 200
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+
+        assert _parse_sse_events("".join(chunks)) == []

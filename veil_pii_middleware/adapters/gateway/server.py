@@ -607,14 +607,18 @@ def _last_user_content_has_text(parsed: JSONValue) -> bool:
     """
     content = _find_last_user_message_content(parsed)
     if isinstance(content, str):
-        return bool(content)
+        return bool(_strip_injected_wrapper_tags(content))
     if not isinstance(content, list):
         return False
     for block in content:
         if not isinstance(block, dict):
             continue
         field = _TEXT_CONTENT_BLOCK_FIELDS.get(str(block.get("type")))
-        if field is not None and isinstance(block.get(field), str):
+        value = block.get(field) if field is not None else None
+        # A continuation often carries a `<system-reminder>` text block (todo
+        # reminders, hook context); only text left after stripping wrappers
+        # counts, or the continuation would pose as a new turn.
+        if isinstance(value, str) and _strip_injected_wrapper_tags(value):
             return True
     return False
 
@@ -1489,30 +1493,24 @@ def make_handler(
                             raw_text, out_text = _relay_sse_response(self, upstream, vault)
                     else:
                         raw_text, out_text = _relay_buffered_response(self, upstream, session_id)
-                    _publish_stage(
-                        pipeline_bus,
-                        request_id,
-                        "response_received",
-                        raw_text,
-                        kind=cycle_kind,
-                        session_id=session_id,
-                    )
-                    _publish_stage(
-                        pipeline_bus,
-                        request_id,
-                        "detokenized",
-                        out_text,
-                        kind=cycle_kind,
-                        session_id=session_id,
-                    )
-                    _publish_stage(
-                        pipeline_bus,
-                        request_id,
-                        "displayed",
-                        out_text,
-                        kind=cycle_kind,
-                        session_id=session_id,
-                    )
+                    # A bodyless request (a GET such as `/v1/models`) is not a
+                    # turn: publishing only its response stages would create
+                    # a panel cycle keyed by the response text and steal the
+                    # session's open-turn pointer.
+                    if raw_body:
+                        for stage, text in (
+                            ("response_received", raw_text),
+                            ("detokenized", out_text),
+                            ("displayed", out_text),
+                        ):
+                            _publish_stage(
+                                pipeline_bus,
+                                request_id,
+                                stage,
+                                text,
+                                kind=cycle_kind,
+                                session_id=session_id,
+                            )
             except Exception:
                 if not response_started:
                     _write_error(self, 502, "upstream request failed")
