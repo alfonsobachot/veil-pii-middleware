@@ -88,10 +88,11 @@ if [ "$demo_db" -eq 1 ]; then
   # session looped trying to make sense of the mangled result. A hard link
   # needs no elevated privilege on NTFS (unlike a symlink) and keeps the
   # message itself free of any machine-specific or personal text.
-  if [ ! -e "demo/veil_demo.db" ]; then
-    ln "$ROOT/demo/veil_demo.db" "demo/veil_demo.db" 2>/dev/null \
-      || cp "$ROOT/demo/veil_demo.db" "demo/veil_demo.db"
-  fi
+  # Re-linked on every run: demo/seed.py deletes and recreates the database,
+  # which breaks an existing hard link and leaves the scratch copy stale.
+  rm -f "demo/veil_demo.db"
+  ln "$ROOT/demo/veil_demo.db" "demo/veil_demo.db" 2>/dev/null \
+    || cp "$ROOT/demo/veil_demo.db" "demo/veil_demo.db"
   # Reassures the model that seeing PII_<TYPE>_<NNNN> tokens instead of real
   # values is expected and correct, not something to flag or hedge about --
   # observed live (2026-09-08): without this, the model added disclaimers
