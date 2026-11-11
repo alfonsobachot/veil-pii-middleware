@@ -226,7 +226,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R3. Detokenized thinking can break its signature on the next turn
 
-- [x] Done (aeada75)
+- [x] Done (aeada75). Verified live in the 2026-11-11 smoke test (S1).
 - **Where:** `adapters/gateway/server.py:971-974` (`_TEXT_BEARING_DELTA_FIELDS`).
 - **Evidence (read-only, needs one live check):** `thinking_delta` is detokenized, so Claude
   Code stores thinking with real values. Next turn the gateway re-tokenizes it; if the result
@@ -366,7 +366,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
     should say the untokenized output will reach the model. In hooks-only mode
     (`run_demo.sh`) the hook also runs regex-only unless `VEIL_LLM_*` are exported, and a
     Bash call with exit ≠ 0 probably fires `PostToolUseFailure` instead of PostToolUse
-    (verify live). Still to verify in the end-to-end smoke test. Have `run_demo.sh` warn when `VEIL_LLM_*` are missing. The gateway covers
+    (verify live). Verified 2026-11-11: it does, see S3. Have `run_demo.sh` warn when `VEIL_LLM_*` are missing. The gateway covers
     all of this in `ask.sh`.
 
 ### R14. Ollama model unload and timeouts during the demo
@@ -454,6 +454,41 @@ regex-detectable PII in evaluated cells.
 - **Evidence (confirmed):** 0.51 s teardown per test in about 78 detector tests; two servers
   shut down in sequence in about 79 gateway tests. Roughly 1–1.5 min of the suite.
 - **Fix:** `serve_forever(poll_interval=0.02)` and `server_close()` in the `finally`.
+
+## Smoke test 2026-11-11
+
+Gateway via `scripts/run-gateway.sh` (Ollama qwen3 4b), three `ask.sh --demo-db` turns, with a
+recording proxy between the gateway and the API (`VEIL_GATEWAY_UPSTREAM`). Warm-up printed
+both lines at start-up; the full turn took 51 s.
+
+- **S1. Thinking passes intact (R3 confirmed).** Claude Code sends `thinking: adaptive`. Five
+  thinking blocks were sent back over the turn; each was byte-identical (text and signature)
+  to the one the API emitted, and all six calls returned 200.
+- **S2. No synthetic PII reached the API.** The email, name and company looked up never
+  appeared upstream; the query ran on the real email (pre-hook) and the result came back as
+  `PII_PERSON_0003` / `PII_ORG_0138` (post-hook).
+- **S3. A failing Bash call skips PostToolUse.** `sys.exit(3)` after printing a row: no
+  `hooks:post_tool_use` audit entry, the result reached the model as `is_error: true`. The
+  gateway tokenized it (`PII_PERSON_0008`, `PII_EMAIL_0002`), so `ask.sh` does not leak; in
+  hooks-only mode (`run_demo.sh`) that output reaches the model in clear. Fix: also register
+  the hook for `PostToolUseFailure` if it can rewrite the output, else document the gap.
+- **S4. Hooks only cover `Bash`.** The environment advertises PowerShell as the primary
+  shell, and the model used the `PowerShell` tool for its first two calls. Had it run the
+  query there, the token would not have been resolved (and in hooks-only mode the result
+  would not have been tokenized). Fix: match `Bash|PowerShell` in both hooks and the scope
+  check, or tell the model to use Bash in the demo system prompt.
+- **S5. Over-tokenization of the prompt by the LLM layer.** "Python's sqlite3 module",
+  `demo/veil_demo.db` and the table names became `PII_OTHER_*` / `PII_ORG_*`, and the
+  `email` column name in the schema output became `PII_USERNAME_0001`. The model coped, but
+  the panel shows a mangled prompt. Skill names in Claude Code's context became `PII_ORG_*`
+  too (138 ORG tokens in one turn).
+- **S6. The Windows username leaks inconsistently.** `alfon` was tokenized as
+  `PII_PERSON_0002` in some paths and forwarded in clear in three others in `messages`
+  (`C:\Users\alfon\.veil-cli-scratch\...`). Same root cause as G7: a value tokenized once is
+  not replaced everywhere. Also: the user's global `~/.claude/CLAUDE.md`, memory path and
+  skill list load into the demo request (not tokenized in `system` by design).
+- **S7. `ask.sh` waits 3 s for stdin.** `claude -p` prints "no stdin data received in 3s".
+  Fix: `< /dev/null` on both invocations.
 
 ---
 
