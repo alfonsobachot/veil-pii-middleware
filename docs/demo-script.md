@@ -5,29 +5,57 @@ customer is hand-written in `veil_pii_middleware/demo/seed.py` (`_build_demo_inc
 
 ## Setup
 
-Both terminals (Git Bash) need the LLM layer configured. The hooks only use it when
-`VEIL_LLM_*` is exported in the shell that runs `ask.sh`, because they inherit that shell's
-environment, not the gateway's:
+Run everything from Git Bash.
 
-```bash
-export VEIL_LLM_BASE_URL=http://127.0.0.1:11434
-export VEIL_LLM_MODEL=qwen3:4b-instruct-2507-q4_K_M
-scripts/run-gateway.sh          # terminal 1; both warm-up lines must print
-scripts/ask.sh --demo-db "..."  # terminal 2
-```
+1. Reload the Ollama model first. The runner's RAM grows with use (prompt cache): after a
+   few hours of requests it held 6.4 GB of RAM and 16 GB of commit, and GLiNER then failed
+   to load for lack of commit memory. A fresh load takes 0.8 GB.
 
-Both scripts default `VEIL_LLM_TIMEOUT` to 120 s. The model sometimes dumps a whole table
-(`select * from users`, ~8 KB), which takes qwen3 4b about 45 s; with the old 30 s timeout
-the call failed, detection fell back to regex-only and every name, birth date and address in
-the dump reached the API (first live run, 2026-11-11).
+   ```bash
+   curl -s http://127.0.0.1:11434/api/generate \
+     -d '{"model":"qwen3:4b-instruct-2507-q4_K_M","keep_alive":0}' > /dev/null
+   ```
+
+2. Terminal 1, the gateway with all three layers (regex, qwen3 4b, GLiNER). Both warm-up
+   lines and `veil encoder: loaded gliner:...` must print:
+
+   ```bash
+   export VEIL_LLM_BASE_URL=http://127.0.0.1:11434
+   export VEIL_LLM_MODEL=qwen3:4b-instruct-2507-q4_K_M
+   export VEIL_ENCODER=gliner:urchade/gliner_multi_pii-v1
+   scripts/run-gateway.sh
+   ```
+
+3. Terminal 2, the same two `VEIL_LLM_*` exports, then the prompt below. The hooks only use
+   the LLM when it is exported in the shell that runs `ask.sh`; they inherit that shell's
+   environment, not the gateway's.
+
+Why each piece is there (live runs on 2026-11-11, recording what the gateway sent upstream):
+
+- **GLiNER.** With regex + qwen3 4b only, 5 of 8 runs leaked a soft value: a company in a
+  CRLF error output, a birth date and address next to existing tokens, "depression" in a
+  7.7 KB block. GLiNER caught each of those blocks in under 0.5 s. With all three layers,
+  6 consecutive runs had zero leaks.
+- **`VEIL_LLM_TIMEOUT` 120 s** (the scripts' default). The model sometimes dumps a whole
+  table (`select * from users`, ~8 KB); qwen3 4b needs ~45 s for it. With 30 s the call
+  failed, detection fell back to regex-only and 52 users' names, birth dates and addresses
+  reached the API.
+
+Known cosmetic noise: GLiNER sometimes tokenizes words inside the model's shell commands
+(`Name`, `Get-ChildItem -Force`). PreToolUse resolves them before the command runs, so the
+queries work, but the panel shows them. One turn in six took ~3 min: a qwen call ran long
+and returned no JSON (GLiNER covered that block).
 
 ## Prompts
 
 Main:
 
 ```bash
-scripts/ask.sh --demo-db "Customer lucia.ferrer@riberanorte.es has an invoice problem. Can you check the database and tell me what happened?"
+scripts/ask.sh --demo-db "The user lucia.ferrer@riberanorte.es has an invoice problem. Can you check the database and tell me what happened?"
 ```
+
+Not "Customer lucia.ferrer@...": GLiNER tags the word "Customer" as a PERSON, so the prompt
+pane shows `PII_PERSON_0001 PII_EMAIL_0001 has ...`.
 
 Fallback (same customer, asks for the data directly):
 
@@ -35,8 +63,9 @@ Fallback (same customer, asks for the data directly):
 scripts/ask.sh --demo-db "Can you pull up everything we have on the user lucia.ferrer@riberanorte.es?"
 ```
 
-Neither prompt names files, modules or tables, so the panel's prompt pane should show only
-the email as a token (S5).
+Neither prompt names files, modules or tables, so the panel's prompt pane shows only the
+email as a token (S5): `The user PII_EMAIL_0001 has an invoice problem. ...` in the last
+three runs. The fallback was checked against the detector only, not run end to end.
 
 ## The story in the data
 

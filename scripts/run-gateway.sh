@@ -40,6 +40,16 @@ fi
 # (about 8 KB of query output), which the demo model does produce.
 export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-120}"
 
+# Optional encoder layer, unioned with regex and the LLM in the gateway only
+# (the hooks never load it). The presentation demo runs with
+#   VEIL_ENCODER=gliner:urchade/gliner_multi_pii-v1
+# because qwen3 4b alone missed a company, a birth date, an address or a
+# health fact in about half the live runs on 2026-11-11; GLiNER caught each
+# of those blocks in under 0.5 s on the GPU. See docs/demo-script.md.
+if [ -n "${VEIL_ENCODER:-}" ]; then
+  export VEIL_ENCODER
+fi
+
 # Load the model now and pin it in memory (Ollama unloads it after 5 idle
 # minutes), then check that the detector reaches it. Warns loudly on failure
 # but still starts the gateway, which then runs regex-only.
