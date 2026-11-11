@@ -1,4 +1,4 @@
-"""``PostToolUse`` hook: tokenizes a demo-db Bash command's output.
+"""``PostToolUse`` hook: tokenizes a demo-db shell command's output.
 
 Reads the hook's JSON payload from stdin only. When the tool call is a
 ``Bash`` invocation referencing the demo database (see
@@ -28,7 +28,7 @@ import sys
 
 from veil_pii_middleware.adapters.hooks._panel_report import report
 from veil_pii_middleware.adapters.hooks._paths import AUDIT_LOG_PATH, VAULT_DB_PATH
-from veil_pii_middleware.adapters.hooks._scope import is_demo_db_command
+from veil_pii_middleware.adapters.hooks._scope import SHELL_TOOLS, is_demo_db_command
 from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.tokenizer import JSONValue, tokenize
 from veil_pii_middleware.core.vault import Vault
@@ -50,7 +50,8 @@ def main() -> int:
         return 1
 
     tool_input = payload.get("tool_input")
-    if payload.get("tool_name") != "Bash" or not isinstance(tool_input, dict):
+    tool_name = payload.get("tool_name")
+    if tool_name not in SHELL_TOOLS or not isinstance(tool_input, dict):
         return 0
     command = tool_input.get("command")
     if not isinstance(command, str) or not is_demo_db_command(command):
@@ -68,7 +69,7 @@ def main() -> int:
 
     # Best-effort only -- see adapters/hooks/_panel_report.py's own
     # docstring. Never raises, never affects anything below.
-    report(session_id, "post_tool_use", "start", "Bash")
+    report(session_id, "post_tool_use", "start", str(tool_name))
 
     try:
         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +86,7 @@ def main() -> int:
             " the model (a gateway, if running, still tokenizes it before the API)",
             file=sys.stderr,
         )
-        report(session_id, "post_tool_use", "error", "Bash")
+        report(session_id, "post_tool_use", "error", str(tool_name))
         return 1
 
     output: JSONValue = {
@@ -95,7 +96,7 @@ def main() -> int:
         }
     }
     sys.stdout.write(json.dumps(output))
-    report(session_id, "post_tool_use", "done", "Bash")
+    report(session_id, "post_tool_use", "done", str(tool_name))
     return 0
 
 

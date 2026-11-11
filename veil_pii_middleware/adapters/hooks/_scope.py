@@ -15,7 +15,13 @@ rewritten) command actually runs.
 
 from __future__ import annotations
 
-__all__ = ["is_demo_db_command"]
+__all__ = ["SHELL_TOOLS", "is_demo_db_command"]
+
+#: Claude Code tools whose ``tool_input["command"]`` runs in a shell. On
+#: Windows Claude Code advertises PowerShell as the primary shell and the
+#: model uses it unprompted (seen in the 2026-11-11 smoke test), so a
+#: Bash-only scope would leave tokens unresolved and results untokenized.
+SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 
 #: The demo database's literal filename (see ``demo/veil_demo.db``). A bare
 #: substring check is deliberately the whole strategy here: this project's

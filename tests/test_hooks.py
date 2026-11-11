@@ -270,8 +270,9 @@ class TestSharedScopeCheck:
     def test_both_scripts_import_shared_helper(self) -> None:
         for module in (pre_tool_use, post_tool_use):
             source = inspect.getsource(module)
-            assert "from veil_pii_middleware.adapters.hooks._scope import is_demo_db_command" in (
-                source
+            assert (
+                "from veil_pii_middleware.adapters.hooks._scope import SHELL_TOOLS, "
+                "is_demo_db_command" in source
             )
 
 
@@ -443,3 +444,44 @@ class TestHooksReadUtf8Stdin:
 
         assert result.returncode == 0, result.stderr
         assert "Logroño|PII_EMAIL_" in json.dumps(json.loads(result.stdout), ensure_ascii=False)
+
+
+class TestPowerShellToolIsInScope:
+    """S4: on Windows the model runs shell commands through the PowerShell tool too."""
+
+    def test_pre_hook_resolves_a_token_in_a_powershell_command(self, tmp_path: Path) -> None:
+        token = _seed_token(tmp_path, "session-ps", "alice@example.com", "EMAIL")
+        payload = {
+            "session_id": "session-ps",
+            "tool_name": "PowerShell",
+            "tool_input": {
+                "command": f"python -c \"import sqlite3; sqlite3.connect('demo/veil_demo.db')"
+                f".execute('select 1 where 1=?', ('{token}',))\"",
+            },
+        }
+        result = _run("veil_pii_middleware.adapters.hooks.pre_tool_use", payload, tmp_path)
+        assert result.returncode == 0
+        updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
+        assert "alice@example.com" in updated["command"]
+        assert token not in updated["command"]
+
+    def test_post_hook_tokenizes_powershell_output(self, tmp_path: Path) -> None:
+        payload = {
+            "session_id": "session-ps",
+            "tool_name": "PowerShell",
+            "tool_input": {"command": _DEMO_DB_COMMAND},
+            "tool_response": {"stdout": "alice@example.com", "stderr": ""},
+        }
+        result = _run("veil_pii_middleware.adapters.hooks.post_tool_use", payload, tmp_path)
+        assert result.returncode == 0
+        updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedToolOutput"]
+        assert "alice@example.com" not in json.dumps(updated)
+        assert updated["stdout"].startswith("PII_EMAIL_")
+
+    @pytest.mark.parametrize("name", ["settings.hooks.json", "settings.hooks.isolated.json"])
+    def test_both_demo_settings_match_powershell(self, name: str) -> None:
+        root = Path(__file__).parent.parent
+        data = json.loads((root / "demo" / name).read_text(encoding="utf-8"))
+        for event in ("PreToolUse", "PostToolUse"):
+            matchers = {entry["matcher"] for entry in data["hooks"][event]}
+            assert matchers == {"Bash|PowerShell"}
