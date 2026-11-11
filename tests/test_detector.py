@@ -1073,3 +1073,31 @@ def test_iban_followed_by_a_four_letter_word_is_still_found(text: str) -> None:
     assert len(spans) == 1
     assert valid_iban(spans[0].text)
     assert spans[0].text.replace(" ", "").endswith("1332")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cvv 4111 1111 1111 1111 12/28",
+        "tarjeta 4111 1111 1111 1111 123",
+        "ref 12 4111 1111 1111 1111",
+        "4111111111111111 123",
+    ],
+)
+def test_card_glued_to_expiry_cvv_or_reference_is_detected(text: str) -> None:
+    cards = [span for span in detect_regex(text) if span.entity_type is EntityType.CARD]
+
+    assert [_compact_digits(span.text) for span in cards] == [VALID_CARD]
+    assert all(text[span.start : span.end] == span.text for span in cards)
+
+
+def test_two_cards_in_one_digit_run_are_both_detected() -> None:
+    text = "4111 1111 1111 1111 5500 0000 0000 0004"
+
+    cards = [span.text for span in detect_regex(text) if span.entity_type is EntityType.CARD]
+
+    assert cards == ["4111 1111 1111 1111", "5500 0000 0000 0004"]
+
+
+def _compact_digits(value: str) -> str:
+    return "".join(char for char in value if char.isdigit())

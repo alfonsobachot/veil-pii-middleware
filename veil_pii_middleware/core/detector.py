@@ -426,7 +426,10 @@ _IBAN = re.compile(
 _PHONE_ES = re.compile(r"(?<![0-9+])(?<![A-Za-z0-9]{4})(?P<value>[679](?:[ \-]?[0-9]){8})(?![0-9])")
 # Any country in international form, not a hard-coded +34.
 _PHONE_INTL = re.compile(r"(?<![0-9+])(?P<value>(?:\+|00)(?:[ \-]?[0-9]){8,15})(?![0-9])")
-_CARD = re.compile(r"(?<![0-9])(?P<value>[0-9](?:[ \-]?[0-9]){11,18})(?![0-9])")
+# Matches the maximal digit run (12+ digits) so a card glued to an expiry, a
+# CVV or a leading reference is seen whole; `_card_sub_runs` then finds the
+# Luhn-valid groups inside it.
+_CARD = re.compile(r"(?<![0-9])(?P<value>[0-9](?:[ \-]?[0-9]){11,})(?![0-9])")
 # Octets are matched loosely and range-checked in `valid_ipv4`, so zero-padded
 # forms survive. The trailing guard rejects a longer dotted number but must
 # still allow the full stop that ends a sentence -- `(?![0-9.])` silently
@@ -546,6 +549,35 @@ def _trim_iban(value: str, validator: _Validator) -> str | None:
     return None
 
 
+def _card_sub_runs(value: str, validator: _Validator) -> list[tuple[int, int]]:
+    """Validating runs of whole separator-delimited digit groups inside ``value``.
+
+    Longest run first (leftmost on ties), then the groups on either side are
+    searched the same way, so two cards in one run are both found. Returns
+    ``(start, end)`` offsets into ``value``.
+    """
+    groups = [(m.start(), m.end()) for m in re.finditer(r"[0-9]+", value)]
+
+    def search(lo: int, hi: int) -> list[tuple[int, int]]:
+        best: tuple[int, int, int] | None = None  # (digits, first, last)
+        for first in range(lo, hi):
+            digits = 0
+            for last in range(first, hi):
+                digits += groups[last][1] - groups[last][0]
+                if digits > 19:
+                    break
+                candidate = value[groups[first][0] : groups[last][1]]
+                if digits >= 12 and (best is None or digits > best[0]) and validator(candidate):
+                    best = (digits, first, last)
+        if best is None:
+            return []
+        _, first, last = best
+        found = (groups[first][0], groups[last][1])
+        return [*search(lo, first), found, *search(last + 1, hi)]
+
+    return search(0, len(groups))
+
+
 def detect_regex(text: str) -> list[Span]:
     """Find every structured entity in ``text``, offsets into ``text`` itself.
 
@@ -558,6 +590,20 @@ def detect_regex(text: str) -> list[Span]:
             value = match.group("value")
             start, end = match.span("value")
             if validator is not None and not validator(value):
+                if entity_type is EntityType.CARD:
+                    # A card next to an expiry, a CVV or a reference number
+                    # fails Luhn as one run; retry on whole digit groups.
+                    for sub_start, sub_end in _card_sub_runs(value, validator):
+                        found.append(
+                            Span(
+                                start=start + sub_start,
+                                end=start + sub_end,
+                                entity_type=entity_type,
+                                text=value[sub_start:sub_end],
+                                detector=Detector.REGEX,
+                            )
+                        )
+                    continue
                 if entity_type is not EntityType.IBAN:
                     continue
                 # The IBAN pattern is greedy over 4-char groups, so a following
