@@ -195,7 +195,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R1. `ask.sh --demo-db` queries a stale copy of the demo database
 
-- [ ] Done
+- [x] Done (792bf48)
 - **Where:** `scripts/ask.sh:91-94`.
 - **Evidence (confirmed):** the link/copy only happens if the scratch DB does not exist yet.
   `seed.py:990` unlinks and recreates the DB, so the hard link breaks on every seed.
@@ -328,7 +328,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R11. Hooks and `/veil` read stdin as cp1252 on Windows
 
-- [ ] Done
+- [x] Done (725db80)
 - **Where:** `adapters/hooks/pre_tool_use.py:46`, `adapters/hooks/post_tool_use.py:45`,
   `adapters/command/sanitize.py:53`.
 - **Evidence (confirmed):** without `PYTHONUTF8`, `José Muñoz` comes out as
@@ -353,7 +353,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R13. Script and hook-settings robustness
 
-- [ ] Done
+- [x] Done (77967c1)
 - **Where and fix:**
   - `scripts/ask.sh:109,115`: calls bare `claude`, which is not on Git Bash's `PATH` on this
     machine (`~/.local/bin/claude.exe` exists). Copy the lookup from `demo/run_demo.sh`.
@@ -366,7 +366,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
     should say the untokenized output will reach the model. In hooks-only mode
     (`run_demo.sh`) the hook also runs regex-only unless `VEIL_LLM_*` are exported, and a
     Bash call with exit ≠ 0 probably fires `PostToolUseFailure` instead of PostToolUse
-    (verify live). Have `run_demo.sh` warn when `VEIL_LLM_*` are missing. The gateway covers
+    (verify live). Still to verify in the end-to-end smoke test. Have `run_demo.sh` warn when `VEIL_LLM_*` are missing. The gateway covers
     all of this in `ask.sh`.
 
 ### R14. Ollama model unload and timeouts during the demo
