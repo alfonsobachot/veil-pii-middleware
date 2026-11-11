@@ -293,6 +293,13 @@ scripts/ask.sh "your message"                 # gateway only, no demo-db hooks
 scripts/ask.sh --demo-db "your message"       # gateway + PreToolUse/PostToolUse, full scenario
 ```
 
+With `VEIL_LLM_BASE_URL`/`VEIL_LLM_MODEL` set, `run-gateway.sh` first runs
+`python -m veil_pii_middleware.demo.warmup`: it asks Ollama to load the model and keep it
+loaded (`keep_alive: -1`; Ollama otherwise unloads it after five idle minutes and the reload
+outlasts the timeout), then sends one probe through the detector and prints a loud warning if
+the LLM layer did not answer, since the gateway would then run regex-only. The scripts also
+default `VEIL_LLM_TIMEOUT` to 30 s.
+
 `--demo-db` is the one that exercises the target scenario end to end: it tokenizes the message
 before it reaches the model, lets the model query `demo/veil_demo.db` with only a token
 available to it, de-tokenizes the `Bash` call so the real query runs locally, and re-tokenizes

@@ -738,9 +738,10 @@ LLM_BASE_URL_ENV_VAR: Final = "VEIL_LLM_BASE_URL"
 #: actually has loaded.
 LLM_MODEL_ENV_VAR: Final = "VEIL_LLM_MODEL"
 
-#: Single attempt, no retry: a debugging session must not stall on every
-#: cache-miss block if the endpoint is genuinely down, but a LAN-local host
-#: under light load should comfortably finish well inside this.
+#: Per-call timeout. Connection errors and timeouts are not retried (a
+#: debugging session must not stall on every cache-miss block if the endpoint
+#: is genuinely down); a 5xx gets one retry (see ``LLMClient._chat``).
+#: ``scripts/run-gateway.sh`` raises it to 30 s via ``VEIL_LLM_TIMEOUT``.
 DEFAULT_LLM_TIMEOUT_SECONDS: Final = 10.0
 
 #: Optional overrides for larger/reasoning models. ``VEIL_LLM_REASONING_EFFORT``

@@ -34,6 +34,15 @@ if [ -n "${VEIL_LLM_MODEL:-}" ]; then
   export VEIL_LLM_MODEL
 fi
 
+# The 10 s default per-call timeout is too tight for a local model under
+# load; a timeout falls back to regex-only, so names would go out in clear.
+export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-30}"
+
+# Load the model now and pin it in memory (Ollama unloads it after 5 idle
+# minutes), then check that the detector reaches it. Warns loudly on failure
+# but still starts the gateway, which then runs regex-only.
+.venv/Scripts/python -m veil_pii_middleware.demo.warmup || true
+
 echo "veil: panel at http://127.0.0.1:$PORT/veil-panel"
 echo "veil: point a client at it with ANTHROPIC_BASE_URL=http://127.0.0.1:$PORT (see scripts/ask.sh)"
 exec .venv/Scripts/python -m veil_pii_middleware.adapters.gateway.server "$PORT"

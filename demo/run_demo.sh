@@ -36,6 +36,9 @@ if [ -z "${VEIL_LLM_BASE_URL:-}" ] || [ -z "${VEIL_LLM_MODEL:-}" ]; then
          "tokenized. Export both (see CLAUDE.md) for the full detector." >&2
 fi
 
+# Same per-call LLM timeout as scripts/run-gateway.sh: the hooks call the LLM too.
+export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-30}"
+
 # Windows Python defaults to cp1252; Claude Code reads Bash output as UTF-8.
 export PYTHONUTF8=1
 exec "$bin" --settings demo/settings.hooks.json
