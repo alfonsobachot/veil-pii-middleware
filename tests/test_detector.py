@@ -50,6 +50,10 @@ from veil_pii_middleware.core.detector import (
     valid_spanish_phone,
 )
 
+#: serve_forever() checks for shutdown at this interval; the 0.5 s default made
+#: every server fixture take half a second to tear down.
+_POLL_INTERVAL = 0.02
+
 # Published, widely documented control values. If one of these fails, the
 # implementation is wrong -- not the expectation.
 VALID_DNI = "12345678Z"
@@ -600,13 +604,16 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
 def fake_llm() -> Iterator[tuple[_FakeLLMState, str]]:
     state = _FakeLLMState()
     server = _QuietThreadingHTTPServer(("127.0.0.1", 0), _make_llm_handler(state))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": _POLL_INTERVAL}, daemon=True
+    )
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         yield state, base_url
     finally:
         server.shutdown()
+        server.server_close()
 
 
 @pytest.fixture(autouse=True)

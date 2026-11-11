@@ -31,6 +31,9 @@ from veil_pii_middleware.demo import eval as eval_module
 from veil_pii_middleware.demo.eval import Metrics, Miss, Report
 
 _TEST_KEY_B64 = base64.b64encode(os.urandom(32)).decode()
+#: serve_forever() checks for shutdown at this interval; the 0.5 s default made
+#: every server fixture take half a second to tear down.
+_POLL_INTERVAL = 0.02
 VALID_EMAIL = "alice@example.com"
 
 #: Hook-shaped test session id (deliberately not `gateway-<uuid>`-shaped) --
@@ -188,7 +191,9 @@ def servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server
 
     upstream_state = _RecordingUpstream()
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _make_upstream_handler(upstream_state))
-    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread = threading.Thread(
+        target=upstream.serve_forever, kwargs={"poll_interval": _POLL_INTERVAL}, daemon=True
+    )
     upstream_thread.start()
     upstream_base = f"http://127.0.0.1:{upstream.server_address[1]}"
 
@@ -196,7 +201,9 @@ def servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server
     fallback_session_id = gateway_server._new_session_id()
     handler_cls = gateway_server.make_handler(fallback_session_id, client, upstream_base)
     gateway = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    gateway_thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+    gateway_thread = threading.Thread(
+        target=gateway.serve_forever, kwargs={"poll_interval": _POLL_INTERVAL}, daemon=True
+    )
     gateway_thread.start()
     gateway_url = f"http://127.0.0.1:{gateway.server_address[1]}"
 
@@ -204,7 +211,9 @@ def servers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server
         yield _Servers(upstream_state, gateway_url)
     finally:
         gateway.shutdown()
+        gateway.server_close()
         upstream.shutdown()
+        upstream.server_close()
         client.close()
 
 
@@ -1687,7 +1696,9 @@ class TestMetricsComparisonEndpoint:
             gateway_server._new_session_id(), client2, "http://127.0.0.1:1"
         )
         gateway2 = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls2)
-        gateway2_thread = threading.Thread(target=gateway2.serve_forever, daemon=True)
+        gateway2_thread = threading.Thread(
+            target=gateway2.serve_forever, kwargs={"poll_interval": _POLL_INTERVAL}, daemon=True
+        )
         gateway2_thread.start()
         try:
             resp2 = _get(
@@ -1697,6 +1708,7 @@ class TestMetricsComparisonEndpoint:
             assert resp2.json() == posted
         finally:
             gateway2.shutdown()
+            gateway2.server_close()
             gateway2_thread.join(timeout=5)
             client2.close()
 

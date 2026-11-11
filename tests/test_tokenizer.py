@@ -36,6 +36,9 @@ from veil_pii_middleware.core.tokenizer import (
 )
 from veil_pii_middleware.core.vault import TokenNotFoundError, Vault
 
+#: serve_forever() checks for shutdown at this interval; the 0.5 s default made
+#: every server fixture take half a second to tear down.
+_POLL_INTERVAL = 0.02
 _TEST_KEY = os.urandom(32)
 
 VALID_DNI = "12345678Z"
@@ -469,13 +472,16 @@ def _make_llm_handler(state: _FakeLLMState) -> type[BaseHTTPRequestHandler]:
 def fake_llm_server() -> Iterator[tuple[_FakeLLMState, str]]:
     state = _FakeLLMState()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _make_llm_handler(state))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": _POLL_INTERVAL}, daemon=True
+    )
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         yield state, base_url
     finally:
         server.shutdown()
+        server.server_close()
         clear_llm_cache()
 
 
