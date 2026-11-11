@@ -512,19 +512,6 @@ def _resolve_session_id(handler: BaseHTTPRequestHandler, fallback_session_id: st
     return fallback_session_id
 
 
-# core/vault.py's SQLite-backed counter is read-then-insert with no
-# transaction spanning both statements -- fine for every other adapter,
-# which only ever has one invocation touching a given session at a time,
-# but ThreadingHTTPServer is the first place in this codebase that can run
-# two requests for the *same* session concurrently. Without this lock, two
-# simultaneous requests minting a token for the same entity type can both
-# read the same next_seq and then collide inserting the same token for two
-# different values (caught as a generic exception and failed closed, so no
-# PII leak -- just an availability/flakiness bug under concurrency). Scoped
-# to this process only; deliberately does not touch core/vault.py.
-_vault_lock = threading.Lock()
-
-
 def _write_error(handler: BaseHTTPRequestHandler, status: int, message: str) -> None:
     # Shaped like an Anthropic API error object so an SDK client on the
     # other end has a recognizable error to surface, rather than an opaque
@@ -948,7 +935,10 @@ def _tokenize_body(
     display_client = _default_llm_client_for_display()
     VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with _vault_lock, Vault(VAULT_DB_PATH, session_id) as vault:
+        # No gateway-wide lock: `Vault.get_or_create_token` is transactional
+        # across connections, and the shared encoder locks its own inference,
+        # so concurrent requests no longer queue behind each other's LLM calls.
+        with Vault(VAULT_DB_PATH, session_id) as vault:
             tokenized: JSONValue = _tokenize_request(parsed, vault, display_client, audit_log)
         received_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(parsed))
         outbound_text = _strip_injected_wrapper_tags(_extract_last_user_message_text(tokenized))

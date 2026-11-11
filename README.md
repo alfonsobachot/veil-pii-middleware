@@ -475,9 +475,6 @@ current code.
 - **A fresh LLM client/TCP connection is opened per `tokenize()` call** rather than reused
   across a session — the content-block cache still avoids redundant *LLM calls* (it's keyed by
   content hash, not by client instance), so this is a latency note, not a correctness gap.
-- **The gateway's vault lock serializes concurrent requests behind an in-flight LLM call**
-  once the LLM layer is configured (up to the ~10s timeout) — worth revisiting before running
-  this under real concurrent load.
 - **`ADDRESS` has no manifest ground truth yet** — the entity type exists and is tokenized/
   audited correctly when found, but `demo/seed.py` does not currently seed one, so its recall
   row shows no support.

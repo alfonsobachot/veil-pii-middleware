@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any, Final
@@ -170,6 +171,9 @@ class EncoderBase:
         #: of texts processed -- read by ``demo/eval.py`` for its timing report.
         self.seconds = 0.0
         self.calls = 0
+        #: One model instance is shared by every gateway request thread;
+        #: inference and the counters above run under this lock.
+        self._lock = threading.Lock()
 
     @property
     def identity(self) -> str:
@@ -188,10 +192,11 @@ class EncoderBase:
             for offset, window in _chunks(text):
                 if window.strip():
                     windows.append((index, offset, window))
-        started = time.perf_counter()
-        predictions = self._predict([w for _, _, w in windows]) if windows else []
-        self.seconds += time.perf_counter() - started
-        self.calls += len(texts)
+        with self._lock:
+            started = time.perf_counter()
+            predictions = self._predict([w for _, _, w in windows]) if windows else []
+            self.seconds += time.perf_counter() - started
+            self.calls += len(texts)
 
         results: list[list[Span]] = [[] for _ in texts]
         seen: list[set[tuple[int, int]]] = [set() for _ in texts]

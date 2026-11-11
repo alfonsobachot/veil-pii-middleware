@@ -141,7 +141,11 @@ class Vault:
         # in one primitive can't be leveraged against the other.
         self._aead = AESGCM(self._derive_subkey(b"veil-vault-aesgcm"))
         self._hmac_key = self._derive_subkey(b"veil-vault-hmac")
-        self._conn = sqlite3.connect(db_path)
+        # Autocommit mode: transactions are opened explicitly (`BEGIN
+        # IMMEDIATE` in `get_or_create_token`), so lookup, counter and insert
+        # run under one write lock even across processes (two parallel hooks,
+        # the gateway). `timeout` waits for that lock instead of failing.
+        self._conn = sqlite3.connect(db_path, isolation_level=None, timeout=10)
         self._create_schema()
 
     def _derive_subkey(self, info: bytes) -> bytes:
@@ -226,37 +230,51 @@ class Vault:
         normalized = _normalize(value, entity_type)
         lookup_hmac = self._lookup_hmac(normalized, entity_type)
 
-        cur = self._conn.execute(
+        found = self._find_token(lookup_hmac)
+        if found is not None:
+            return found
+
+        # Lookup, counter and insert form one write transaction: without it
+        # two processes could both miss the lookup and mint the same number
+        # (or two tokens for one value).
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            found = self._find_token(lookup_hmac)
+            if found is not None:
+                self._conn.execute("COMMIT")
+                return found
+            seq = self._next_seq(entity_type)
+            token = f"PII_{entity_type.value}_{seq:04d}"
+            nonce = os.urandom(_NONCE_LENGTH_BYTES)
+            ciphertext = self._aead.encrypt(nonce, value.encode(), self._aad(entity_type, token))
+            self._conn.execute(
+                """
+                INSERT INTO mappings
+                    (token, entity_type, lookup_hmac, ciphertext, nonce, session_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    entity_type.value,
+                    lookup_hmac,
+                    ciphertext,
+                    nonce,
+                    self._session_id,
+                    int(time.time()),
+                ),
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        return token
+
+    def _find_token(self, lookup_hmac: bytes) -> str | None:
+        row = self._conn.execute(
             "SELECT token FROM mappings WHERE session_id = ? AND lookup_hmac = ?",
             (self._session_id, lookup_hmac),
-        )
-        row = cur.fetchone()
-        if row is not None:
-            return str(row[0])
-
-        seq = self._next_seq(entity_type)
-        token = f"PII_{entity_type.value}_{seq:04d}"
-        nonce = os.urandom(_NONCE_LENGTH_BYTES)
-        ciphertext = self._aead.encrypt(nonce, value.encode(), self._aad(entity_type, token))
-
-        self._conn.execute(
-            """
-            INSERT INTO mappings
-                (token, entity_type, lookup_hmac, ciphertext, nonce, session_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                token,
-                entity_type.value,
-                lookup_hmac,
-                ciphertext,
-                nonce,
-                self._session_id,
-                int(time.time()),
-            ),
-        )
-        self._conn.commit()
-        return token
+        ).fetchone()
+        return None if row is None else str(row[0])
 
     def resolve(self, token: str) -> str:
         """Return the original plaintext value behind ``token``.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -242,3 +243,41 @@ class TestSessionIsolation:
         rows = conn.execute("SELECT COUNT(*) FROM mappings WHERE token = ?", (token_a,)).fetchone()
         assert rows[0] == 2
         conn.close()
+
+
+class TestConcurrentTokenCreation:
+    def test_parallel_vaults_on_one_db_never_collide(self, tmp_path: Path) -> None:
+        """Two parallel hooks used to hit `UNIQUE constraint failed` on the same db."""
+        db_path = tmp_path / "vault.db"
+        key = os.urandom(32)
+        shared = [f"shared{i}@example.com" for i in range(15)]
+        barrier = threading.Barrier(4)
+        results: dict[int, dict[str, str]] = {}
+        errors: list[BaseException] = []
+
+        def worker(worker_id: int) -> None:
+            try:
+                with Vault(db_path, "session-1", master_key=key) as vault:
+                    own = [f"w{worker_id}-{i}@example.com" for i in range(15)]
+                    values = [v for pair in zip(shared, own, strict=True) for v in pair]
+                    barrier.wait()
+                    results[worker_id] = {
+                        v: vault.get_or_create_token(v, EntityType.EMAIL) for v in values
+                    }
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert errors == []
+        for value in shared:
+            assert len({results[w][value] for w in range(4)}) == 1
+        by_token: dict[str, str] = {}
+        for mapping in results.values():
+            for value, token in mapping.items():
+                assert by_token.setdefault(token, value) == value
+        assert len(by_token) == len(shared) + 4 * 15
