@@ -531,7 +531,8 @@ regex-detectable PII in evaluated cells.
 - **D7. Strict mode.** CLAUDE.md says "block rather than forward", but any LLM failure falls
   back to regex-only (README §4 documents the floor). Add a strict mode that raises so
   adapters can block, and show fallbacks on the panel.
-- **D9. IP false positive** if decision 2 goes the other way.
+- **D9. IP false positive** if decision 2 goes the other way. Decision 2 kept the behaviour:
+  pinned by `test_four_part_version_after_a_keyword_is_still_an_ip` and documented in README §9.
 - **D10. SECRET false positives in code** (`detector.py:470-473, 363-368`):
   `api_key = os.environ.get('API_KEY')`, `field password: required`,
   `PWD=/home/alfonso/repos`, `password=${DB_PASSWORD}`. In `valid_secret` reject values with

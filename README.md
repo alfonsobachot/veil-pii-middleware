@@ -462,6 +462,11 @@ current code.
   what the regex validators are for. Invisible to the `--mode regex` gate
   (`evaluate_decoys(use_llm=False)`) — it only surfaces when a human explicitly runs
   `--mode llm`/`--mode union` with an LLM configured.
+- **Four-part version numbers are tokenized as IPs.** `version 1.2.3 build 4.5.6.7` yields an
+  `IP` token for `4.5.6.7`: the shape is identical to an IPv4 address. Filtering on words like
+  "version" or "build" would also let `build 10.0.0.5` (a real address) leak, and
+  over-tokenizing a version number leaks nothing, so the false positive is accepted and pinned
+  by a test.
 - **This specific model confuses DNI vs. NIE labeling.** It reliably finds the right span but
   sometimes mislabels a DNI as a NIE despite the prompt's explicit structural rule (§4) — DNI
   recall in `--mode llm`-only stays below 1.0 (currently ~0.70; started at 0.000 before the

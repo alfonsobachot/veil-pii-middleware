@@ -222,6 +222,25 @@ def test_ip_is_found_regardless_of_trailing_punctuation(text: str) -> None:
     assert [s.text for s in spans] == ["192.168.1.15"]
 
 
+@pytest.mark.parametrize(
+    ("text", "ip"),
+    [
+        ("version 1.2.3 build 4.5.6.7", "4.5.6.7"),
+        ("build 10.0.0.5", "10.0.0.5"),
+    ],
+)
+def test_four_part_version_after_a_keyword_is_still_an_ip(text: str, ip: str) -> None:
+    """Known, accepted false positive (decision 2 in docs/review-findings.md).
+
+    A four-part build number is indistinguishable from an IPv4 address. A
+    context filter on "version"/"build" would drop the first case but leak
+    "build 10.0.0.5", which is a real address; over-tokenizing a version
+    leaks nothing, so the filter is deliberately not applied.
+    """
+    spans = [s for s in detect_regex(text) if s.entity_type is EntityType.IP]
+    assert [s.text for s in spans] == [ip]
+
+
 def test_longer_dotted_number_is_not_read_as_an_ip() -> None:
     spans = detect_regex("build 192.168.1.15.7 internal")
     assert [s for s in spans if s.entity_type is EntityType.IP] == []
