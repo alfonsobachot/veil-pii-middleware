@@ -1326,7 +1326,13 @@ def detect(
                 )
     if encoder is not None:
         try:
-            spans.extend(encoder.detect_spans(text))
+            spans.extend(
+                span
+                for span in encoder.detect_spans(text)
+                if not (
+                    span.entity_type in _NAME_LIKE_TYPES and _is_known_non_pii_name(span.text)
+                )
+            )
         except Exception as exc:
             print(
                 f"veil detector: encoder layer failed ({type(exc).__name__}: {exc}), "

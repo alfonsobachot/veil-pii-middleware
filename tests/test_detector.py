@@ -1299,3 +1299,26 @@ def test_common_secret_shapes_are_detected(text: str, secret: str) -> None:
 )
 def test_config_lookalikes_are_not_secrets(text: str) -> None:
     assert detect_regex(text) == []
+
+
+class _FakeEncoder:
+    identity = "fake"
+
+    def __init__(self, spans: list[tuple[str, EntityType]]) -> None:
+        self._spans = spans
+
+    def detect_spans(self, text: str) -> list[Span]:
+        out = []
+        for value, entity_type in self._spans:
+            start = text.index(value)
+            out.append(Span(start, start + len(value), entity_type, value, Detector.ENCODER))
+        return out
+
+
+def test_encoder_spans_skip_known_non_pii_names() -> None:
+    text = "Ask Claude Code to call Ana Garcia"
+    encoder = _FakeEncoder([("Claude Code", EntityType.ORG), ("Ana Garcia", EntityType.PERSON)])
+
+    spans = detect(text, encoder=encoder)
+
+    assert [(s.entity_type, s.text) for s in spans] == [(EntityType.PERSON, "Ana Garcia")]
