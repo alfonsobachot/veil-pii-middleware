@@ -22,7 +22,9 @@ Baseline at review time: ruff, `mypy --strict`, the full pytest suite and the re
   will not survive. The descriptions below are enough to re-create them.
 
 Suggested order: leaks (F) → gateway (R2–R10) → hooks and scripts (R1, R11, R13) → eval (E) →
-panel vendoring (R12) → environment (R14). Then the end-to-end smoke test from the plan.
+panel vendoring (R12) → environment (R14). Then the end-to-end smoke test from the plan. If
+time allows before the UI rewrite, the partial `server.py` split (see "After the
+presentation" → Gateway).
 
 ## Open decisions
 
@@ -453,27 +455,41 @@ regex-detectable PII in evaluated cells.
 
 ### Gateway
 
-- **Module split of `server.py`:**
-  - `server.py`: `main()`, `make_handler`, `do_*` routing, `_handle`, plus a
-    `GatewayContext` dataclass (client, upstream, audit log, bus, encoder, vault path)
-    replacing module globals.
-  - `forwarding.py`: `_HOP_BY_HOP`, request/response header building, `_write_chunk`,
-    `_write_error`, `_resolve_session_id`, `SESSION_ID_HEADER`, upstream constants.
-  - `claude_code_framing.py`: wrapper-tag regex, `_strip_injected_wrapper_tags`, title and
-    safety markers, commit-trailer constant.
-  - `request_sanitizer.py`: `_TOKENIZED_FIELDS`, the block walker (R2), `_excluded_ranges`,
-    the vault locking (R4), `_tokenize_body`.
-  - `response_rewriter.py`: `_TEXT_BEARING_DELTA_FIELDS`, `_split_sse_event`,
-    `_SseResponseRewriter`, `_relay_sse_response`, `_relay_buffered_response`.
-  - `display.py`: `_extract_*_text`, `_find_last_user_message_content`,
-    `_last_user_content_has_text`, `_extract_system_text`, `_classify_cycle_kind`,
-    `_extract_sse_display_text`, `_extract_buffered_display_text`.
-  - `pipeline_bus.py`: `PipelineEventBus`, `_publish_stage`, `PIPELINE_STAGES`, history
-    limits, `_AUXILIARY_CYCLE_KINDS`.
-  - `panel.py`: panel routes as `(handler, ctx)` functions, `_write_json`, `_write_html`,
-    `_write_sse_headers`, `_query_param`, the body helper (R8).
-  - `metrics.py`: `_serialize_*`, `_run_comparison_mode`, `_run_encoder_comparison`, the
-    comparison cache, the single-run guard.
+- **Module split of `server.py`.** Timing:
+  - Do R2–R9 first. They all touch `server.py`, and moving code that is already fixed and
+    pinned by tests is safer than fixing code that was just moved.
+  - Before the UI rewrite starts (Wednesday evening or Thursday morning, only if everything is
+    green and there is time to spare), extract just `panel.py` and `pipeline_bus.py`. Those are
+    what the new UI and option B (H8) will touch; adding endpoints to the current module first
+    would only grow what has to move later.
+  - The rest of the split waits until after the presentation.
+  - Risk is moderate: `tests/test_gateway.py` is mostly black-box over HTTP and only touches
+    `make_handler`, `PipelineEventBus`, a few constants and
+    `_skip_reserved_anthropic_metadata` (deleted by G12). Watch out for
+    `monkeypatch.setattr(gateway_server, "VAULT_DB_PATH" / "AUDIT_LOG_PATH", ...)`
+    (`test_gateway.py:183-184`): once a constant moves to another module that patch silently
+    stops working. The `GatewayContext` below removes the need for it.
+  - Target layout:
+    - `server.py`: `main()`, `make_handler`, `do_*` routing, `_handle`, plus a
+      `GatewayContext` dataclass (client, upstream, audit log, bus, encoder, vault path)
+      replacing module globals.
+    - `forwarding.py`: `_HOP_BY_HOP`, request/response header building, `_write_chunk`,
+      `_write_error`, `_resolve_session_id`, `SESSION_ID_HEADER`, upstream constants.
+    - `claude_code_framing.py`: wrapper-tag regex, `_strip_injected_wrapper_tags`, title and
+      safety markers, commit-trailer constant.
+    - `request_sanitizer.py`: `_TOKENIZED_FIELDS`, the block walker (R2), `_excluded_ranges`,
+      the vault locking (R4), `_tokenize_body`.
+    - `response_rewriter.py`: `_TEXT_BEARING_DELTA_FIELDS`, `_split_sse_event`,
+      `_SseResponseRewriter`, `_relay_sse_response`, `_relay_buffered_response`.
+    - `display.py`: `_extract_*_text`, `_find_last_user_message_content`,
+      `_last_user_content_has_text`, `_extract_system_text`, `_classify_cycle_kind`,
+      `_extract_sse_display_text`, `_extract_buffered_display_text`.
+    - `pipeline_bus.py`: `PipelineEventBus`, `_publish_stage`, `PIPELINE_STAGES`, history
+      limits, `_AUXILIARY_CYCLE_KINDS`.
+    - `panel.py`: panel routes as `(handler, ctx)` functions, `_write_json`, `_write_html`,
+      `_write_sse_headers`, `_query_param`, the body helper (R8).
+    - `metrics.py`: `_serialize_*`, `_run_comparison_mode`, `_run_encoder_comparison`, the
+      comparison cache, the single-run guard.
 - **G7. Known-values pass (leak, soft types).** Assistant text returns to Claude Code with
   names resolved; the next request relies on the LLM re-detecting them in new text. One miss
   sends an already-tokenized name in clear. After detection, also replace exact matches of
