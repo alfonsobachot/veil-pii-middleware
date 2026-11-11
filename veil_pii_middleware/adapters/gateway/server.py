@@ -512,13 +512,16 @@ def _resolve_session_id(handler: BaseHTTPRequestHandler, fallback_session_id: st
     return fallback_session_id
 
 
-def _write_error(handler: BaseHTTPRequestHandler, status: int, message: str) -> None:
+def _write_error(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    message: str,
+    error_type: str = "veil_gateway_error",
+) -> None:
     # Shaped like an Anthropic API error object so an SDK client on the
     # other end has a recognizable error to surface, rather than an opaque
     # connection failure.
-    body = json.dumps(
-        {"type": "error", "error": {"type": "veil_gateway_error", "message": message}}
-    ).encode()
+    body = json.dumps({"type": "error", "error": {"type": error_type, "message": message}}).encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
@@ -1408,8 +1411,9 @@ def make_handler(
                         _write_error(
                             self,
                             400,
-                            "request body is not valid JSON; blocked rather than forwarded"
-                            " unscanned",
+                            "veil blocked: request body is not valid JSON; blocked rather"
+                            " than forwarded unscanned",
+                            "invalid_request_error",
                         )
                         return
                     except Exception:
@@ -1420,10 +1424,15 @@ def make_handler(
                             _decode(raw_body),
                             session_id=session_id,
                         )
+                        # 400, not 500: Claude Code retries 5xx with backoff,
+                        # and each retry would re-run the whole scan only to
+                        # be blocked again.
                         _write_error(
                             self,
-                            500,
-                            "sanitization failed; request blocked rather than forwarded",
+                            400,
+                            "veil blocked: sanitization failed; request blocked rather than"
+                            " forwarded",
+                            "invalid_request_error",
                         )
                         return
                     _publish_stage(

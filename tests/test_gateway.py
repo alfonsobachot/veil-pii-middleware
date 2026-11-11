@@ -727,7 +727,11 @@ class TestFailsClosed:
         monkeypatch.delenv("VEIL_VAULT_KEY", raising=False)
         body = {"messages": [{"role": "user", "content": "carol@example.com"}]}
         resp = _post(f"{servers.gateway_url}/v1/messages", json=body)
-        assert resp.status_code == 500
+        # 400, not 500: Claude Code retries 5xx, re-running the scan each time.
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["message"].startswith("veil blocked")
         assert servers.upstream_state.requests == []
 
     def test_no_secret_or_pii_appears_in_gateway_stderr(
