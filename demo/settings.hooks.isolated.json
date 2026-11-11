@@ -7,7 +7,11 @@
     "allow": [
       "Bash(sqlite3*)",
       "Bash(python -c*)",
-      "Bash(python3 -c*)"
+      "Bash(python3 -c*)",
+      "Bash(python -I -c*)",
+      "PowerShell(sqlite3*)",
+      "PowerShell(python -c*)",
+      "PowerShell(python -I -c*)"
     ]
   },
 

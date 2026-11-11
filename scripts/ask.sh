@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Send one message through the veil gateway to a real `claude -p` process.
 #
-# Runs from a fixed, neutral scratch directory (~/.veil-cli-scratch)
+# Runs from a fixed, neutral scratch directory (see SCRATCH_ROOT below)
 # regardless of where this script itself is invoked from, so no project's
 # CLAUDE.md (this repo's included) ever loads into the request.
 #
@@ -28,6 +28,24 @@
 # Set VEIL_APPEND_SYSTEM_PROMPT to pass --append-system-prompt through to
 # claude (only meaningful with --demo-db) for extra reinforcement if needed.
 set -euo pipefail
+
+# Keep the presenter's own Claude Code configuration out of the demo request:
+# no user CLAUDE.md, auto-memory (its path holds the Windows username), user
+# settings or skill list. Auth is unaffected; --settings files still apply.
+export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+ISOLATION_FLAGS=(--setting-sources project --disable-slash-commands)
+
+# Claude Code puts its working directory and temp scratchpad paths in every
+# request, and under $HOME both carry the Windows username, which the soft
+# detector only sometimes catches. C:\Users\Public has no username in it.
+if [ -d /c/Users/Public ]; then
+  SCRATCH_ROOT=/c/Users/Public/veil-cli-scratch
+else
+  SCRATCH_ROOT="$HOME/.veil-cli-scratch"
+fi
+mkdir -p "$SCRATCH_ROOT/tmp"
+export TEMP="$SCRATCH_ROOT/tmp" TMP="$SCRATCH_ROOT/tmp"
 
 demo_db=0
 if [ "${1:-}" = "--demo-db" ]; then
@@ -95,7 +113,7 @@ if [ "$demo_db" -eq 1 ]; then
   # Claude Code reads Bash output as UTF-8, so accents came back as U+FFFD
   # ("Consultorï¿½a"). Force UTF-8 for every child process.
   export PYTHONUTF8=1
-  SCRATCH="$HOME/.veil-cli-scratch/demo-db"
+  SCRATCH="$SCRATCH_ROOT/demo-db"
   mkdir -p "$SCRATCH/demo"
   cd "$SCRATCH"
   # A relative "demo/veil_demo.db" only resolves here if the file actually
@@ -129,12 +147,13 @@ if [ "$demo_db" -eq 1 ]; then
     SYSTEM_PROMPT="$BASE_SYSTEM_PROMPT"
   fi
   # < /dev/null: claude -p otherwise waits 3 s for piped stdin that never comes.
-  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p --settings "$ROOT/demo/settings.hooks.isolated.json" \
+  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p "${ISOLATION_FLAGS[@]}" \
+    --settings "$ROOT/demo/settings.hooks.isolated.json" \
     --append-system-prompt "$SYSTEM_PROMPT" "$*" < /dev/null
 else
-  SCRATCH="$HOME/.veil-cli-scratch"
+  SCRATCH="$SCRATCH_ROOT"
   mkdir -p "$SCRATCH"
   cd "$SCRATCH"
   # < /dev/null: claude -p otherwise waits 3 s for piped stdin that never comes.
-  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p "$*" < /dev/null
+  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p "${ISOLATION_FLAGS[@]}" "$*" < /dev/null
 fi

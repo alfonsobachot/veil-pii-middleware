@@ -41,4 +41,9 @@ export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-30}"
 
 # Windows Python defaults to cp1252; Claude Code reads Bash output as UTF-8.
 export PYTHONUTF8=1
-exec "$bin" --settings demo/settings.hooks.json
+# Keep the presenter's own Claude Code configuration out of the demo session:
+# no CLAUDE.md, auto-memory (its path holds the Windows username), user
+# settings or skill list. Auth is unaffected; --settings still applies.
+export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+exec "$bin" --setting-sources project --disable-slash-commands --settings demo/settings.hooks.json
