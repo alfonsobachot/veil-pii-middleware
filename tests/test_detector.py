@@ -1266,6 +1266,22 @@ def test_iban_of_any_length_is_detected_whole(text: str, iban: str) -> None:
     assert [(span.entity_type, span.text) for span in spans] == [(EntityType.IBAN, iban)]
 
 
+def test_iban_prefix_passing_mod97_by_chance_is_not_detected() -> None:
+    """Trimming a bad 24-char Spanish IBAN reached a 16-char prefix that passes
+    mod-97; Spanish IBANs are always 24 chars, so the prefix must be rejected."""
+    assert valid_iban("ES43865889470313") is False
+    spans = detect_regex("Transfer to ES4386588947031358349966 bounced, check digits")
+    assert [s for s in spans if s.entity_type is EntityType.IBAN] == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["ES9121000418450200051332", "NO9386011117947", "MT84MALT011000012345MTLCAST001S"],
+)
+def test_iban_at_its_registered_length_still_validates(value: str) -> None:
+    assert valid_iban(value) is True
+
+
 @pytest.mark.parametrize(
     ("text", "secret"),
     [
