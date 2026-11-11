@@ -1092,6 +1092,51 @@ def test_llm_org_span_is_returned_as_org() -> None:
     assert EntityType.ORG not in STRUCTURED_TYPES
 
 
+class _RecordingLLM(_StubLLM):
+    """``_StubLLM`` that also records the text the model was sent."""
+
+    def __init__(self, spans: list[dict[str, Any]]) -> None:
+        super().__init__(spans)
+        self.sent: list[str] = []
+
+    def complete_spans(self, text: str) -> list[dict[str, Any]]:
+        self.sent.append(text)
+        return super().complete_spans(text)
+
+
+def test_vault_tokens_are_masked_before_the_model_sees_the_block() -> None:
+    """Tokens already in a block made qwen3 4b return no spans at all for it."""
+    clear_llm_cache()
+    text = "{'email': 'PII_EMAIL_0001', 'date_of_birth': '1986-03-14', 'phone': 'PII_PHONE_0002'}"
+    client = _RecordingLLM(
+        [
+            {"value": "1986-03-14", "entity_type": "DOB"},
+            {"value": "[redacted]", "entity_type": "EMAIL"},
+        ]
+    )
+
+    spans = detect_llm(text, client)
+
+    assert client.sent == [
+        "{'email': '[redacted]', 'date_of_birth': '1986-03-14', 'phone': '[redacted]'}"
+    ]
+    assert [(s.entity_type, s.text, text[s.start : s.end]) for s in spans] == [
+        (EntityType.DOB, "1986-03-14", "1986-03-14")
+    ]
+
+
+def test_crlf_is_sent_to_the_model_as_lf_and_offsets_stay_in_the_original() -> None:
+    """A CRLF query result made qwen3 4b miss a company it found with LF."""
+    clear_llm_cache()
+    text = "Exit code 1\r\n(21, 'Transportes Ribera Norte S.L.', 'Valladolid')\r\n"
+    client = _RecordingLLM([{"value": "Transportes Ribera Norte S.L.", "entity_type": "ORG"}])
+
+    spans = detect_llm(text, client)
+
+    assert client.sent == [text.replace("\r\n", "\n")]
+    assert [text[s.start : s.end] for s in spans] == ["Transportes Ribera Norte S.L."]
+
+
 @pytest.mark.parametrize("name", ["Claude Code", "claude code", "Anthropic", "Claude"])
 @pytest.mark.parametrize("entity_type", ["PERSON", "ORG"])
 def test_known_non_pii_names_are_dropped_from_llm_spans(name: str, entity_type: str) -> None:

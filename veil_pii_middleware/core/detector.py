@@ -1132,6 +1132,11 @@ _LLM_STRUCTURED_VALIDATORS: Final[dict[EntityType, _Validator]] = {
 }
 
 
+#: A vault token (``PII_<TYPE>_<NNNN>``) and what replaces it in LLM input.
+_VAULT_TOKEN_RE: Final = re.compile(r"PII_[A-Z]+_\d{4}")
+_TOKEN_MASK: Final = "[redacted]"
+
+
 def detect_llm(text: str, client: LLMClient) -> list[Span]:
     """Ask ``client`` for spans over ``text``, validated and offset into it.
 
@@ -1149,7 +1154,18 @@ def detect_llm(text: str, client: LLMClient) -> list[Span]:
     if cached is not None:
         return cached
 
-    raw_spans = client.complete_spans(text)
+    # Vault tokens already in the block are masked before the model sees it.
+    # Measured on the demo turn (qwen3 4b, temperature 0): a query result
+    # where the hook had already tokenized emails and phones came back with
+    # no span at all -- not the birth date, address or names beside them --
+    # while the same block with the tokens masked came back complete. Spans
+    # are still located in the original ``text``, so offsets are unaffected;
+    # a value that spans the mask is not found there and is dropped. CRLF
+    # line endings (Windows tool output) are sent as LF for the same reason:
+    # a query result with CRLF came back empty, the same text with LF found
+    # the company name in it.
+    prompt_text = _VAULT_TOKEN_RE.sub(_TOKEN_MASK, text).replace("\r\n", "\n")
+    raw_spans = client.complete_spans(prompt_text)
     valid_types = {entity_type.value for entity_type in EntityType}
     # Scoped per distinct value, not shared across every value in the
     # response: two different values that happen to start at the same
