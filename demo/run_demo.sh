@@ -11,6 +11,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 if command -v claude >/dev/null 2>&1; then
     bin=claude
+elif [ -x "$HOME/.local/bin/claude.exe" ]; then
+    bin="$HOME/.local/bin/claude.exe"
+elif [ -x "$HOME/.local/bin/claude" ]; then
+    bin="$HOME/.local/bin/claude"
 else
     bin=$(find "$HOME/.vscode/extensions" -maxdepth 1 -iname 'anthropic.claude-code-*' 2>/dev/null \
         | sort -V | tail -n1)/resources/native-binary/claude.exe
@@ -24,6 +28,12 @@ fi
 if [ -z "${VEIL_VAULT_KEY:-}" ]; then
     echo "run_demo.sh: VEIL_VAULT_KEY is not set in this shell -- the hooks" \
          "will fail closed (blocked commands / no tokenization) until it is." >&2
+fi
+
+if [ -z "${VEIL_LLM_BASE_URL:-}" ] || [ -z "${VEIL_LLM_MODEL:-}" ]; then
+    echo "run_demo.sh: VEIL_LLM_BASE_URL/VEIL_LLM_MODEL are not set -- the hooks" \
+         "will run regex-only, so names, organisations and addresses are not" \
+         "tokenized. Export both (see CLAUDE.md) for the full detector." >&2
 fi
 
 # Windows Python defaults to cp1252; Claude Code reads Bash output as UTF-8.

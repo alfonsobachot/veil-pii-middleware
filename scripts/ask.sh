@@ -40,7 +40,26 @@ if [ $# -eq 0 ]; then
   exit 1
 fi
 
-: "${VEIL_GATEWAY_URL:=http://127.0.0.1:8787}"
+# Exported, not just assigned: the hooks report to the panel at this URL.
+export VEIL_GATEWAY_URL="${VEIL_GATEWAY_URL:-http://127.0.0.1:8787}"
+
+# `claude` is not always on Git Bash's PATH: try PATH, the native installer's
+# ~/.local/bin, then the VSCode extension's bundled binary.
+if command -v claude >/dev/null 2>&1; then
+  CLAUDE_BIN=claude
+elif [ -x "$HOME/.local/bin/claude.exe" ]; then
+  CLAUDE_BIN="$HOME/.local/bin/claude.exe"
+elif [ -x "$HOME/.local/bin/claude" ]; then
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+else
+  CLAUDE_BIN="$(find "$HOME/.vscode/extensions" -maxdepth 1 -iname 'anthropic.claude-code-*' \
+    2>/dev/null | sort -V | tail -n1)/resources/native-binary/claude.exe"
+  if [ ! -x "$CLAUDE_BIN" ]; then
+    echo "ask.sh: could not find a claude binary on PATH, in ~/.local/bin or under" \
+         "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/" >&2
+    exit 1
+  fi
+fi
 
 if [ "$demo_db" -eq 1 ]; then
   ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -107,11 +126,11 @@ if [ "$demo_db" -eq 1 ]; then
   else
     SYSTEM_PROMPT="$BASE_SYSTEM_PROMPT"
   fi
-  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" claude -p --settings "$ROOT/demo/settings.hooks.isolated.json" \
+  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p --settings "$ROOT/demo/settings.hooks.isolated.json" \
     --append-system-prompt "$SYSTEM_PROMPT" "$*"
 else
   SCRATCH="$HOME/.veil-cli-scratch"
   mkdir -p "$SCRATCH"
   cd "$SCRATCH"
-  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" claude -p "$*"
+  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p "$*"
 fi

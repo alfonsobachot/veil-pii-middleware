@@ -80,7 +80,11 @@ def main() -> int:
                 adapter=_ADAPTER_NAME,
             )
     except Exception:
-        print("post_tool_use: tokenization failed", file=sys.stderr)
+        print(
+            "post_tool_use: tokenization failed; the untokenized tool output will reach"
+            " the model (a gateway, if running, still tokenizes it before the API)",
+            file=sys.stderr,
+        )
         report(session_id, "post_tool_use", "error", "Bash")
         return 1
 
