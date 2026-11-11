@@ -128,11 +128,13 @@ if [ "$demo_db" -eq 1 ]; then
   else
     SYSTEM_PROMPT="$BASE_SYSTEM_PROMPT"
   fi
+  # < /dev/null: claude -p otherwise waits 3 s for piped stdin that never comes.
   ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p --settings "$ROOT/demo/settings.hooks.isolated.json" \
-    --append-system-prompt "$SYSTEM_PROMPT" "$*"
+    --append-system-prompt "$SYSTEM_PROMPT" "$*" < /dev/null
 else
   SCRATCH="$HOME/.veil-cli-scratch"
   mkdir -p "$SCRATCH"
   cd "$SCRATCH"
-  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p "$*"
+  # < /dev/null: claude -p otherwise waits 3 s for piped stdin that never comes.
+  ANTHROPIC_BASE_URL="$VEIL_GATEWAY_URL" "$CLAUDE_BIN" -p "$*" < /dev/null
 fi
