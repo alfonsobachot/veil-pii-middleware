@@ -413,8 +413,11 @@ _EMAIL = re.compile(
 )
 _DNI = re.compile(r"(?<![0-9A-Za-z])(?P<value>[0-9]{8}[ \-]?[A-Za-z])(?![0-9A-Za-z])")
 _NIE = re.compile(r"(?<![0-9A-Za-z])(?P<value>[XYZxyz][ \-]?[0-9]{7}[ \-]?[A-Za-z])(?![0-9A-Za-z])")
+# Full 4-char groups plus an optional short final group: most countries' IBAN
+# length is not a multiple of 4 (DE 22, GB 22, FR 27, NL 18).
 _IBAN = re.compile(
-    r"(?<![0-9A-Za-z])(?P<value>[A-Za-z]{2}[0-9]{2}(?:[ \-]?[0-9A-Za-z]{4}){3,7})(?![0-9A-Za-z])"
+    r"(?<![0-9A-Za-z])(?P<value>[A-Za-z]{2}[0-9]{2}(?:[ \-]?[0-9A-Za-z]{4}){2,7}"
+    r"(?:[ \-]?[0-9A-Za-z]{1,3})?)(?![0-9A-Za-z])"
 )
 # Nine digits opening 6, 7 or 9, in ANY grouping. Fixing the grouping at 3-3-3
 # missed `91 234 56 78`, which is simply how a Madrid landline is written.
@@ -540,10 +543,15 @@ def merge_spans(spans: Iterable[Span]) -> list[Span]:
 
 
 def _trim_iban(value: str, validator: _Validator) -> str | None:
-    """Drop trailing 4-char groups (and their separator) until the IBAN validates."""
+    """Drop trailing groups (and their separator) until the IBAN validates.
+
+    Whole groups, not fixed 4-char cuts: the final group may be shorter, and
+    cutting through a swallowed word ("... 1332 de Juan") would misalign
+    every later cut.
+    """
     candidate = value
     while len(_compact(candidate)) > 15:
-        candidate = candidate[:-4].rstrip(" -")
+        candidate = re.sub(r"[ \-]?[0-9A-Za-z]{1,4}$", "", candidate)
         if validator(candidate):
             return candidate
     return None

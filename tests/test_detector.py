@@ -1101,3 +1101,23 @@ def test_two_cards_in_one_digit_run_are_both_detected() -> None:
 
 def _compact_digits(value: str) -> str:
     return "".join(char for char in value if char.isdigit())
+
+
+@pytest.mark.parametrize(
+    ("text", "iban"),
+    [
+        ("pay DE89 3704 0044 0532 0130 00 now", "DE89 3704 0044 0532 0130 00"),
+        ("pay DE89370400440532013000 now", "DE89370400440532013000"),
+        ("pay GB29 NWBK 6016 1331 9268 19 now", "GB29 NWBK 6016 1331 9268 19"),
+        ("pay GB29NWBK60161331926819 now", "GB29NWBK60161331926819"),
+        ("pay FR14 2004 1010 0505 0001 3M02 606 now", "FR14 2004 1010 0505 0001 3M02 606"),
+        ("pay FR1420041010050500013M02606 now", "FR1420041010050500013M02606"),
+        ("pay NL91 ABNA 0417 1643 00 now", "NL91 ABNA 0417 1643 00"),
+        ("pay NL91ABNA0417164300 now", "NL91ABNA0417164300"),
+        ("ES91 2100 0418 4502 0005 1332 de Juan", "ES91 2100 0418 4502 0005 1332"),
+    ],
+)
+def test_iban_of_any_length_is_detected_whole(text: str, iban: str) -> None:
+    spans = detect_regex(text)
+
+    assert [(span.entity_type, span.text) for span in spans] == [(EntityType.IBAN, iban)]
