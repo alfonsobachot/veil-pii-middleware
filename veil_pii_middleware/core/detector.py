@@ -823,20 +823,38 @@ def _is_known_non_pii_name(text: str) -> bool:
     return " ".join(text.split()).casefold() in _NON_PII_NAMES
 
 
-def _parse_json_object(content: str) -> Any:
+_THINK_BLOCK_RE: Final = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _parse_json_object(content: str, key: str) -> Any:
     """Parse a model reply as JSON, tolerating a markdown fence or stray prose.
 
-    Larger models sometimes wrap the object in ```json fences or prefix a
-    sentence despite the prompt; the object itself is still the outermost
-    ``{...}``. Raises ``json.JSONDecodeError`` when no object can be parsed.
+    Models sometimes wrap the object in fences, think out loud first
+    (``<think>return {"spans": []} if none</think>{...}``) or add a note
+    after it. Drops ``<think>`` blocks, then tries a ``JSONDecoder.raw_decode``
+    from every ``{`` and returns the first object that has ``key``. Raises
+    ``json.JSONDecodeError`` when none does.
     """
+    content = _THINK_BLOCK_RE.sub("", content)
     try:
-        return json.loads(content)
+        whole = json.loads(content)
     except json.JSONDecodeError:
-        start, end = content.find("{"), content.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        return json.loads(content[start : end + 1])
+        pass
+    else:
+        if isinstance(whole, dict) and key in whole:
+            return whole
+    decoder = json.JSONDecoder()
+    start = content.find("{")
+    while start != -1:
+        try:
+            candidate, _ = decoder.raw_decode(content, start)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(candidate, dict) and key in candidate:
+                return candidate
+        start = content.find("{", start + 1)
+    raise json.JSONDecodeError(f"no JSON object with {key!r}", content, 0)
 
 
 def llm_client_from_env() -> LLMClient | None:
@@ -925,7 +943,7 @@ class LLMClient:
             raise LLMDetectionError(f"message content is not a string ({type(content).__name__})")
         return content
 
-    def complete_spans(self, text: str) -> list[dict[str, Any]]:
+    def complete_spans(self, text: str) -> list[Any]:
         """POST one chat-completion request; return the raw parsed ``spans`` list.
 
         Deliberately does not set ``response_format`` -- live-tested
@@ -946,7 +964,7 @@ class LLMClient:
         """
         content = self._chat(_SYSTEM_PROMPT, f"Text:\n{text}")
         try:
-            parsed = _parse_json_object(content)
+            parsed = _parse_json_object(content, "spans")
             spans = parsed["spans"]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
@@ -973,7 +991,7 @@ class LLMClient:
         numbered = "\n".join(f"{i}. {candidate}" for i, candidate in enumerate(candidates, 1))
         content = self._chat(_PERSON_CONFIRMATION_SYSTEM_PROMPT, numbered)
         try:
-            parsed = _parse_json_object(content)
+            parsed = _parse_json_object(content, "persons")
             persons = parsed["persons"]
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise LLMDetectionError(f"unexpected response shape: {exc}") from exc
@@ -1048,12 +1066,12 @@ _LLM_STRUCTURED_VALIDATORS: Final[dict[EntityType, _Validator]] = {
 def detect_llm(text: str, client: LLMClient) -> list[Span]:
     """Ask ``client`` for spans over ``text``, validated and offset into it.
 
-    Raises ``LLMDetectionError`` or an ``httpx`` exception on any malformed
-    or failed response -- callers must catch and fail closed (``detect``
-    does this). Every raised message describes only the *shape* of the bad
-    entry (its type, or which field was wrong) -- never its content, since a
-    malformed entry's content can itself be the raw PII this whole module
-    exists to keep out of any log. Results are cached by content hash (see
+    Raises ``LLMDetectionError`` or an ``httpx`` exception when the response
+    as a whole is malformed or the call fails -- callers must catch and fail
+    closed (``detect`` does this). A single malformed entry (not an object,
+    non-string or empty ``value``/``entity_type``) is skipped, so one bad
+    entry does not cost the block every correct span; nothing about it is
+    logged, since its content can itself be raw PII. Results are cached by content hash (see
     ``_llm_span_cache``), so a repeated block within this process is not
     re-sent to the model.
     """
@@ -1074,18 +1092,13 @@ def detect_llm(text: str, client: LLMClient) -> list[Span]:
     found: list[Span] = []
     for item in raw_spans:
         if not isinstance(item, dict):
-            raise LLMDetectionError(f"span entry is not an object (got {type(item).__name__})")
+            continue
         value = item.get("value")
         entity_type_raw = item.get("entity_type")
         if not isinstance(value, str) or not value:
-            raise LLMDetectionError(
-                f"span entry's 'value' must be a non-empty string (got {type(value).__name__})"
-            )
+            continue
         if not isinstance(entity_type_raw, str) or not entity_type_raw:
-            raise LLMDetectionError(
-                f"span entry's 'entity_type' must be a non-empty string "
-                f"(got {type(entity_type_raw).__name__})"
-            )
+            continue
         # An invented label still marks something the model judged
         # identifying; keep it as OTHER instead of failing the whole block.
         entity_type = (

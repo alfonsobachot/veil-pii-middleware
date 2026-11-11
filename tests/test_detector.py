@@ -628,14 +628,22 @@ class TestDetectLLM:
 
         assert [(s.entity_type, s.text) for s in spans] == [(EntityType.OTHER, "x")]
 
-    def test_non_string_entity_type_raises(self, fake_llm: tuple[_FakeLLMState, str]) -> None:
+    def test_non_string_entity_type_entry_is_skipped(
+        self, fake_llm: tuple[_FakeLLMState, str]
+    ) -> None:
         state, base_url = fake_llm
-        state.completion_content = json.dumps({"spans": [{"value": "x", "entity_type": 7}]})
-        with (
-            LLMClient(base_url, "test-model", timeout_seconds=2.0) as client,
-            pytest.raises(LLMDetectionError),
-        ):
-            detect_llm("x appears here", client)
+        state.completion_content = json.dumps(
+            {
+                "spans": [
+                    {"value": "x", "entity_type": 7},
+                    {"value": "Ana Garcia", "entity_type": "PERSON"},
+                ]
+            }
+        )
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            spans = detect_llm("x and Ana Garcia", client)
+
+        assert [(s.entity_type, s.text) for s in spans] == [(EntityType.PERSON, "Ana Garcia")]
 
     def test_structured_span_failing_its_check_digit_is_dropped(
         self, fake_llm: tuple[_FakeLLMState, str]
@@ -648,41 +656,70 @@ class TestDetectLLM:
         with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
             assert detect_llm("DNI 12345678A on file", client) == []
 
-    def test_flat_string_span_entry_raises_without_leaking_its_content(
-        self, fake_llm: tuple[_FakeLLMState, str]
+    def test_flat_string_span_entry_is_skipped_without_leaking_its_content(
+        self, fake_llm: tuple[_FakeLLMState, str], capsys: pytest.CaptureFixture[str]
     ) -> None:
         """A model returning `{"spans": ["value", ...]}` instead of objects is a
-        realistic instruction-following failure. The raw string -- which could be
-        the exact PII value the model was asked to redact -- must never appear in
-        the raised exception's message, since that message is later logged.
+        realistic instruction-following failure. The bad entry is skipped, the
+        good ones are kept, and its raw string -- possibly the exact PII value
+        -- never reaches stderr.
         """
         state, base_url = fake_llm
         secret = "customer-secret@example.com"
-        state.completion_content = json.dumps({"spans": [secret]})
-        with (
-            LLMClient(base_url, "test-model", timeout_seconds=2.0) as client,
-            pytest.raises(LLMDetectionError) as exc_info,
-        ):
-            detect_llm(f"email {secret}", client)
+        state.completion_content = json.dumps(
+            {"spans": [secret, {"value": "Ana Garcia", "entity_type": "PERSON"}]}
+        )
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            spans = detect_llm(f"email {secret} for Ana Garcia", client)
 
-        assert secret not in str(exc_info.value)
+        assert [s.text for s in spans] == ["Ana Garcia"]
+        captured = capsys.readouterr()
+        assert secret not in captured.err + captured.out
 
-    def test_bad_value_field_raises_without_leaking_other_fields(
-        self, fake_llm: tuple[_FakeLLMState, str]
+    @pytest.mark.parametrize("bad_value", [12345, "", None])
+    def test_bad_value_entry_is_skipped_without_leaking_other_fields(
+        self,
+        fake_llm: tuple[_FakeLLMState, str],
+        capsys: pytest.CaptureFixture[str],
+        bad_value: object,
     ) -> None:
-        """An entry with a non-string 'value' must not echo whatever else it carries."""
+        """An entry with a bad 'value' is skipped and must not echo what else it carries."""
         state, base_url = fake_llm
         secret = "other-secret@example.com"
         state.completion_content = json.dumps(
-            {"spans": [{"value": 12345, "entity_type": "PERSON", "note": secret}]}
+            {
+                "spans": [
+                    {"value": bad_value, "entity_type": "PERSON", "note": secret},
+                    {"value": "Ana Garcia", "entity_type": None},
+                    {"value": "Calle Mayor 5", "entity_type": "ADDRESS"},
+                ]
+            }
         )
-        with (
-            LLMClient(base_url, "test-model", timeout_seconds=2.0) as client,
-            pytest.raises(LLMDetectionError) as exc_info,
-        ):
-            detect_llm(f"email {secret}", client)
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            spans = detect_llm(f"email {secret}, Ana Garcia, Calle Mayor 5", client)
 
-        assert secret not in str(exc_info.value)
+        assert [(s.entity_type, s.text) for s in spans] == [(EntityType.ADDRESS, "Calle Mayor 5")]
+        captured = capsys.readouterr()
+        assert secret not in captured.err + captured.out
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            '<think>return {"spans": []} if none</think>'
+            '{"spans": [{"value": "Ana Garcia", "entity_type": "PERSON"}]}',
+            'Here: {"spans": [{"value": "Ana Garcia", "entity_type": "PERSON"}]} Note: {x}',
+            '```json\n{"spans": [{"value": "Ana Garcia", "entity_type": "PERSON"}]}\n```',
+        ],
+    )
+    def test_chatty_reply_still_yields_its_spans(
+        self, fake_llm: tuple[_FakeLLMState, str], reply: str
+    ) -> None:
+        state, base_url = fake_llm
+        state.completion_content = reply
+        with LLMClient(base_url, "test-model", timeout_seconds=2.0) as client:
+            spans = detect_llm("call Ana Garcia", client)
+
+        assert [(s.entity_type, s.text) for s in spans] == [(EntityType.PERSON, "Ana Garcia")]
 
     def test_different_values_sharing_a_start_offset_are_both_kept(
         self, fake_llm: tuple[_FakeLLMState, str]
