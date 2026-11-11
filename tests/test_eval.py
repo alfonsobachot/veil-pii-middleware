@@ -179,3 +179,56 @@ class TestOneValuePerSpan:
         )
         assert report.by_type["EMAIL"].true_positives == 0
         assert report.by_type["PERSON"].false_positives == 1
+
+
+class TestDecoyOverlap:
+    """E3: a span touching any part of a decoy is a hit."""
+
+    _DECOY_TEXT = "Escalated to the billing department yesterday."
+
+    def _decoys(self, tmp_path: Path) -> tuple[Path, Path]:
+        db_path = tmp_path / "decoys.db"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+            connection.execute("INSERT INTO notes VALUES (1, ?)", (self._DECOY_TEXT,))
+        connection.close()
+        value = "the billing department"
+        decoys_path = tmp_path / "decoys.json"
+        decoys_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "table": "notes",
+                        "column": "body",
+                        "row_id": 1,
+                        "offset": self._DECOY_TEXT.index(value),
+                        "entity_type": "ORG",
+                        "value": value,
+                        "reason": "generic department, not an organisation",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return db_path, decoys_path
+
+    def _span(self, value: str) -> Span:
+        start = self._DECOY_TEXT.index(value)
+        return Span(start, start + len(value), EntityType.ORG, value, Detector.LLM)
+
+    def test_partial_overlap_counts_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spans = [self._span("billing"), self._span("department")]
+        monkeypatch.setattr(eval_module, "detect", lambda *a, **k: spans)
+        report = eval_module.evaluate_decoys(*self._decoys(tmp_path))
+        assert len(report.hits) == 1
+        assert report.hits[0].entity_type == "ORG"
+
+    def test_an_adjacent_span_is_not_a_hit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spans = [self._span("yesterday")]
+        monkeypatch.setattr(eval_module, "detect", lambda *a, **k: spans)
+        report = eval_module.evaluate_decoys(*self._decoys(tmp_path))
+        assert report.hits == []

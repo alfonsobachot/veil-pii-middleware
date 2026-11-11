@@ -402,8 +402,10 @@ def evaluate_decoys(
         spans = detect(
             text, use_regex=use_regex, use_llm=use_llm, llm_client=llm_client, encoder=encoder
         )
+        # Any overlap is a hit: a span on part of a decoy ("billing department"
+        # inside "the billing department") still tokenizes non-PII.
         for span in spans:
-            if span.start == offset and span.text == value:
+            if span.start < offset + len(value) and offset < span.end:
                 hits.append(
                     DecoyHit(
                         table=cell[0],
@@ -414,6 +416,7 @@ def evaluate_decoys(
                         reason=str(decoy["reason"]),
                     )
                 )
+                break  # one hit per decoy, however many spans touch it
     return DecoyReport(hits=hits)
 
 
