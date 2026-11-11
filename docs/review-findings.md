@@ -205,7 +205,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R2. Gateway tokenizes ids, signatures and base64 payloads
 
-- [ ] Done
+- [x] Done (aeada75)
 - **Where:** `adapters/gateway/server.py:795-817` (`_tokenize_request`).
 - **Evidence (confirmed):** every string under `messages` is scanned, including `type`, `id`,
   `tool_use_id`, thinking `signature`, `redacted_thinking.data` and image/document
@@ -226,7 +226,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R3. Detokenized thinking can break its signature on the next turn
 
-- [ ] Done (do with R2)
+- [x] Done (aeada75)
 - **Where:** `adapters/gateway/server.py:971-974` (`_TEXT_BEARING_DELTA_FIELDS`).
 - **Evidence (read-only, needs one live check):** `thinking_delta` is detokenized, so Claude
   Code stores thinking with real values. Next turn the gateway re-tokenizes it; if the result
@@ -238,7 +238,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R4. Vault race between processes; gateway lock held across LLM calls
 
-- [ ] Done
+- [x] Done (b563b51)
 - **Where:** `core/vault.py:195-210, 229-258`; `adapters/gateway/server.py:916`
   (`_vault_lock`), comment at `server.py:513`.
 - **Evidence:**
@@ -263,7 +263,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R5. Tool-result continuations with a system-reminder create fake turns in the panel
 
-- [ ] Done
+- [x] Done (5d786f0)
 - **Where:** `adapters/gateway/server.py:625-648, 880` (`_last_user_content_has_text`).
 - **Evidence (confirmed):** a continuation carrying a `<system-reminder>` text block (todo
   reminders, hook context) counts as real text, is classified `"conversation"` with display
@@ -274,7 +274,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R6. Empty bodies produce a premature end-of-chunks marker
 
-- [ ] Done
+- [x] Done (b79d752)
 - **Where:** `adapters/gateway/server.py:1103-1106, 1183-1186` (`_write_chunk`).
 - **Evidence (confirmed):** an empty upstream body writes `0\r\n\r\n0\r\n\r\n`, corrupting a
   keep-alive connection. 204/304 responses also get a chunked body they must not have.
@@ -283,7 +283,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R7. Fail-closed block returns 500, which Claude Code retries
 
-- [ ] Done (needs decision 4)
+- [x] Done (acbb0c1)
 - **Where:** `adapters/gateway/server.py:1367-1371`.
 - **Evidence:** blocking is correct (tokenization error → 500, nothing forwarded; invalid
   JSON → 400), but Claude Code retries 5xx with backoff and each retry re-runs the full scan.
@@ -291,7 +291,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R8. Panel endpoints: body validation and concurrent metrics runs
 
-- [ ] Done
+- [x] Done (dd09890)
 - **Where:** `adapters/gateway/server.py:1599-1614` (`/vault/reveal`), `1692`
   (`/hook-event`), `1660-1673` (POST `/metrics/comparison`).
 - **Evidence (confirmed for the first two bullets):**
@@ -309,7 +309,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R9. Bodyless requests create panel turns
 
-- [ ] Done
+- [x] Done (5d786f0)
 - **Where:** `adapters/gateway/server.py:1334, 1444-1467`.
 - **Evidence (read-only):** a GET (e.g. `/v1/models`) publishes only response stages with
   the default `kind="conversation"`, creating a turn keyed by the response text and taking
@@ -319,7 +319,7 @@ Settled 2026-11-11: all four recommendations (in bold) accepted.
 
 ### R10. Encoder spans bypass the non-PII name filter
 
-- [ ] Done
+- [x] Done (8213cc0)
 - **Where:** `core/detector.py:1206-1214` (encoder leg in `detect`).
 - **Evidence (confirmed with a fake encoder):** an encoder ORG span `Claude Code` in "Ask
   Claude Code to …" is kept, so the prompt shows `PII_ORG_xxxx` on stage.
@@ -494,7 +494,7 @@ regex-detectable PII in evaluated cells.
   names resolved; the next request relies on the LLM re-detecting them in new text. One miss
   sends an already-tokenized name in clear. After detection, also replace exact matches of
   this session's existing vault values.
-- **G12. Dead billing-header skip.** `_skip_reserved_anthropic_metadata`
+- **G12. Dead billing-header skip.** Done in `aeada75`. `_skip_reserved_anthropic_metadata`
   (`server.py:551-555, 810`): the header lives in `system`, no longer tokenized since
   `d3a0690`. Inside `messages` it only lets through a tool result that starts with
   `x-anthropic-billing-header:`. Delete the predicate and the `skip=` argument. (Cheap; can
@@ -502,7 +502,7 @@ regex-detectable PII in evaluated cells.
 - **G13. Request body edge cases** (`server.py:1326`): malformed `Content-Length` on the
   proxy path returns a misleading 502; a chunked request body is sent upstream empty and
   poisons keep-alive. Parse up front, return 400 / 411.
-- **G14. Buffered path detokenizes `tool_use.input`** (`server.py:1194-1195`), while SSE
+- **G14. Buffered path detokenizes `tool_use.input`** Done in `aeada75` (text blocks only). (`server.py:1194-1195`), while SSE
   leaves `input_json_delta` tokenized for PreToolUse. Resolve only `content[*].text`.
 - **G15. Duplicate `server`/`date` headers** (`server.py:1429-1432`). Add them to the
   response skip set.
@@ -536,7 +536,7 @@ regex-detectable PII in evaluated cells.
   `_person_confirmation_cache` keep plaintext for the process lifetime, and `detect_llm`
   returns the cached list itself. Capped LRU (`OrderedDict`, about 4096) and return
   `list(cached)`.
-- **D13. Encoder thread safety** (`encoder.py:181-222`): no init race (`_ENCODER` is set
+- **D13. Encoder thread safety** Done in `b563b51` (lock around `_predict` and counters). (`encoder.py:181-222`): no init race (`_ENCODER` is set
   before `serve_forever`), but `_predict` can run in parallel (display `detect()` outside the
   lock, metrics thread); `seconds`/`calls` counters race. Put a lock around `_predict`.
 - **D14. Encoder details** (`encoder.py:322, 120, 102`): `device=0 if cuda else -1` sends
