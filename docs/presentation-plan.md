@@ -12,6 +12,12 @@ when it is done.
 - **Step 3** running on the current detector (`5806341` and later: no detector change since).
 - **Step 5 done** without the `server.py` split: option B in the hooks (b4ee3cb) and the
   flow view at `/veil-panel/flow` (405c363). The classic panel stays at `/veil-panel`.
+- **Steps 3 and 4 done:** 9 configurations re-run at `5806341` (qwen3.8 had 1 of 1,063 cells
+  fall back to regex-only; noted, not repeated); `docs/benchmarks.md` and README §8 rewritten.
+- **Step 6:** rehearsal at 17:20 with the exact Friday setup (model reloaded, regex + qwen3 4b
+  + GLiNER, flow view): main prompt twice and the fallback once, all three with zero PII in
+  the recorded upstream requests. Q&A answers in `docs/qa-notes.md`. Pushed. Still to do on
+  Friday: reload the Ollama model before starting (`docs/demo-script.md`, Setup step 1).
 
 ## Where things stood on Wednesday
 
