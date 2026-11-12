@@ -609,6 +609,14 @@ class TestPowerShellToolIsInScope:
         ("/c/Python311/python -c x", "/c/Python311/python -c x"),
         ("python -X utf8 -c x", "python -X utf8 -c x"),
         ("echo mypython -c", "echo mypython -c"),
+        (
+            "which sqlite3 python python3 2>/dev/null; python -c x",
+            "which sqlite3 python python3 2>/dev/null; python -X utf8 -c x",
+        ),
+        ("cd demo || python3 -c x", "cd demo || python3 -X utf8 -c x"),
+        ("echo $(python -c x)", "echo $(python -X utf8 -c x)"),
+        ("a | python -", "a | python -X utf8 -"),
+        ("x\npython -c y", "x\npython -X utf8 -c y"),
     ],
 )
 def test_force_python_utf8(command: str, expected: str) -> None:

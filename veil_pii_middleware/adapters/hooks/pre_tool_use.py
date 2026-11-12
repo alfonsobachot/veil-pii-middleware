@@ -41,8 +41,10 @@ from veil_pii_middleware.core.vault import Vault
 
 __all__ = ["force_python_utf8", "main"]
 
-#: A Python interpreter invoked as a command word, not part of a path or name.
-_PYTHON_CALL = re.compile(r"(?<![\w./\\-])(?:python3?|py)(?:\.exe)?(?=\s)")
+#: A Python interpreter in command position: at the start, or right after a
+#: shell separator (``;``, ``&&``, ``||``, ``|``, ``(``, ``$(``, newline) -- not
+#: an argument, as in ``which python``.
+_PYTHON_CALL = re.compile(r"(?:^|(?<=[;&|(\n]))\s*(?:python3?|py)(?:\.exe)?(?=\s)")
 
 
 def force_python_utf8(command: str) -> str:
