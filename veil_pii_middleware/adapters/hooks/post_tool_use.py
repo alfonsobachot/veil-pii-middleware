@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import sys
 
-from veil_pii_middleware.adapters.hooks._panel_report import report
+from veil_pii_middleware.adapters.hooks._panel_report import display_text, report
 from veil_pii_middleware.adapters.hooks._paths import AUDIT_LOG_PATH, VAULT_DB_PATH
 from veil_pii_middleware.adapters.hooks._scope import SHELL_TOOLS, is_demo_db_command
 from veil_pii_middleware.core.audit import AuditLog
@@ -67,10 +67,8 @@ def main() -> int:
         print("post_tool_use: missing session_id", file=sys.stderr)
         return 1
 
-    # Best-effort only -- see adapters/hooks/_panel_report.py's own
-    # docstring. Never raises, never affects anything below.
-    report(session_id, "post_tool_use", "start", str(tool_name))
-
+    # report() below is best-effort only -- see adapters/hooks/_panel_report.py.
+    # It never raises and never affects the hook's result.
     try:
         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with Vault(VAULT_DB_PATH, session_id) as vault:
@@ -86,7 +84,13 @@ def main() -> int:
             " the model (a gateway, if running, still tokenizes it before the API)",
             file=sys.stderr,
         )
-        report(session_id, "post_tool_use", "error", str(tool_name))
+        report(
+            session_id,
+            "post_tool_use",
+            "error",
+            str(tool_name),
+            before=display_text(tool_response),
+        )
         return 1
 
     output: JSONValue = {
@@ -96,7 +100,14 @@ def main() -> int:
         }
     }
     sys.stdout.write(json.dumps(output))
-    report(session_id, "post_tool_use", "done", str(tool_name))
+    report(
+        session_id,
+        "post_tool_use",
+        "done",
+        str(tool_name),
+        before=display_text(tool_response),
+        after=display_text(tokenized),
+    )
     return 0
 
 

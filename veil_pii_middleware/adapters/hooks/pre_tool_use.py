@@ -30,6 +30,7 @@ goes through that same normal ask-permission flow before it runs.
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 from veil_pii_middleware.adapters.hooks._panel_report import report
@@ -38,7 +39,25 @@ from veil_pii_middleware.adapters.hooks._scope import SHELL_TOOLS, is_demo_db_co
 from veil_pii_middleware.core.tokenizer import JSONValue, detokenize
 from veil_pii_middleware.core.vault import Vault
 
-__all__ = ["main"]
+__all__ = ["force_python_utf8", "main"]
+
+#: A Python interpreter invoked as a command word, not part of a path or name.
+_PYTHON_CALL = re.compile(r"(?<![\w./\\-])(?:python3?|py)(?:\.exe)?(?=\s)")
+
+
+def force_python_utf8(command: str) -> str:
+    """Add ``-X utf8`` to every Python interpreter call in ``command``.
+
+    On Windows a piped Python prints in the ANSI code page, so ``Lucía``
+    reached Claude Code as ``Luc\\ufffda``: unreadable, and the detector then
+    tokenized only ``Ferrer Montoya`` and let the broken first name through
+    (live runs, 2026-11-11). ``ask.sh`` sets ``PYTHONUTF8=1``, but the model
+    often calls ``python -I``, which ignores every ``PYTHON*`` variable; the
+    ``-X utf8`` flag still applies under ``-I``.
+    """
+    if "-X utf8" in command:
+        return command
+    return _PYTHON_CALL.sub(lambda m: f"{m.group(0)} -X utf8", command)
 
 
 def main() -> int:
@@ -63,26 +82,25 @@ def main() -> int:
         print("pre_tool_use: missing session_id, blocking", file=sys.stderr)
         return 2
 
-    # Best-effort only -- see adapters/hooks/_panel_report.py's own
-    # docstring. Never raises, never affects anything below.
-    report(session_id, "pre_tool_use", "start", str(tool_name))
-
+    # report() below is best-effort only -- see adapters/hooks/_panel_report.py.
+    # It never raises and never affects the hook's result.
     try:
         VAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with Vault(VAULT_DB_PATH, session_id) as vault:
             detokenized = detokenize(command, vault)
     except Exception:
         print("pre_tool_use: detokenization failed, blocking", file=sys.stderr)
-        report(session_id, "pre_tool_use", "error", str(tool_name))
+        report(session_id, "pre_tool_use", "error", str(tool_name), before=command)
         return 2
 
     if not isinstance(detokenized, str):
         # detokenize() always returns a str for a str input; this only
         # guards mypy's narrowing and would indicate a core/ contract break.
         print("pre_tool_use: detokenization failed, blocking", file=sys.stderr)
-        report(session_id, "pre_tool_use", "error", str(tool_name))
+        report(session_id, "pre_tool_use", "error", str(tool_name), before=command)
         return 2
 
+    detokenized = force_python_utf8(detokenized)
     updated_input: JSONValue = {**tool_input, "command": detokenized}
     output: JSONValue = {
         "hookSpecificOutput": {
@@ -91,7 +109,11 @@ def main() -> int:
         }
     }
     sys.stdout.write(json.dumps(output))
-    report(session_id, "pre_tool_use", "done", str(tool_name))
+    # The panel aligns before and after; both carry the same -X utf8 so only tokens differ.
+    shown_before = force_python_utf8(command)
+    report(
+        session_id, "pre_tool_use", "done", str(tool_name), before=shown_before, after=detokenized
+    )
     return 0
 
 

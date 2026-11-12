@@ -804,9 +804,13 @@ class TestPanelDoesNotShadowTheProxy:
         assert servers.upstream_state.requests == []
 
 
+_PANEL_PAGES = pytest.mark.parametrize("page", ["/veil-panel", "/veil-panel/flow"])
+
+
 class TestPanelStaticPage:
-    def test_serves_html_with_no_build_step(self, servers: _Servers) -> None:
-        resp = _get(f"{servers.gateway_url}/veil-panel")
+    @_PANEL_PAGES
+    def test_serves_html_with_no_build_step(self, servers: _Servers, page: str) -> None:
+        resp = _get(f"{servers.gateway_url}{page}")
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
         body = resp.text
@@ -815,15 +819,17 @@ class TestPanelStaticPage:
         assert "node_modules" not in body
         assert "package.json" not in body
 
-    def test_loads_no_script_from_the_network(self, servers: _Servers) -> None:
+    @_PANEL_PAGES
+    def test_loads_no_script_from_the_network(self, servers: _Servers, page: str) -> None:
         """The panel must work offline: every script comes from the gateway."""
-        body = _get(f"{servers.gateway_url}/veil-panel").text
+        body = _get(f"{servers.gateway_url}{page}").text
         sources = re.findall(r"<script[^>]*\bsrc=\"([^\"]+)\"", body)
         assert sources
         assert all(src.startswith("/veil-panel/vendor/") for src in sources)
 
-    def test_every_referenced_script_is_served(self, servers: _Servers) -> None:
-        body = _get(f"{servers.gateway_url}/veil-panel").text
+    @_PANEL_PAGES
+    def test_every_referenced_script_is_served(self, servers: _Servers, page: str) -> None:
+        body = _get(f"{servers.gateway_url}{page}").text
         for src in re.findall(r"<script[^>]*\bsrc=\"([^\"]+)\"", body):
             resp = _get(f"{servers.gateway_url}{src}")
             assert resp.status_code == 200, src
@@ -2072,6 +2078,48 @@ class TestHookEventEndpoint:
         assert len(hook_events) == 1
         assert "command" not in hook_events[0]
         assert "12345678A" not in json.dumps(hook_events[0])
+
+    def test_before_and_after_reach_the_panel_bus_truncated_and_never_the_audit_log(
+        self, servers: _Servers
+    ) -> None:
+        conversation_events = _run_request_and_collect_pipeline_events(
+            servers, {"messages": [{"role": "user", "content": "run the query"}]}
+        )
+        turn_request_id = conversation_events[-1]["request_id"]
+        audit_before = (
+            gateway_server.AUDIT_LOG_PATH.read_text(encoding="utf-8")
+            if gateway_server.AUDIT_LOG_PATH.exists()
+            else ""
+        )
+
+        _post(
+            f"{servers.gateway_url}/veil-panel/hook-event",
+            json={
+                "session_id": HOOK_SESSION_ID,
+                "hook": "pre_tool_use",
+                "phase": "done",
+                "tool_name": "Bash",
+                "before": "select * from users where dni='PII_DNI_0001'",
+                "after": "select * from users where dni='12345678Z'" + "x" * 9000,
+            },
+        )
+
+        chunks = _read_sse_chunks_until_idle(f"{servers.gateway_url}/veil-panel/pipeline-stream")
+        events = _parse_sse_events("".join(chunks))
+        hook_events = [
+            e for e in events if e["request_id"] == turn_request_id and e.get("kind") == "hook"
+        ]
+        assert len(hook_events) == 1
+        assert hook_events[0]["before"] == "select * from users where dni='PII_DNI_0001'"
+        assert hook_events[0]["after"].startswith("select * from users where dni='12345678Z'")
+        assert len(hook_events[0]["after"]) == gateway_server._HOOK_TEXT_LIMIT
+        audit_after = (
+            gateway_server.AUDIT_LOG_PATH.read_text(encoding="utf-8")
+            if gateway_server.AUDIT_LOG_PATH.exists()
+            else ""
+        )
+        assert "12345678Z" not in audit_after
+        assert audit_after == audit_before
 
 
 class _StubLLMClient:

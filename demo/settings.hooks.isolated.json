@@ -11,9 +11,14 @@
       "Bash(python -I -c*)",
       "Bash(python - *)",
       "Bash(python3 - *)",
+      "Bash(python -X utf8*)",
+      "Bash(python3 -X utf8*)",
+      "Bash(python.exe -X utf8*)",
       "PowerShell(sqlite3*)",
       "PowerShell(python -c*)",
-      "PowerShell(python -I -c*)"
+      "PowerShell(python -I -c*)",
+      "PowerShell(python -X utf8*)",
+      "PowerShell(python.exe -X utf8*)"
     ]
   },
 

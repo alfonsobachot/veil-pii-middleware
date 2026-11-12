@@ -91,11 +91,12 @@ tool_result-only continuation cycle (``_classify_cycle_kind``'s
 the frontend can render one logical user request -- however many tool
 round-trips it takes -- as a single screen instead of one chip per raw HTTP
 call. ``POST /veil-panel/hook-event`` lets the ``PreToolUse``/``PostToolUse``
-hooks (separate, short-lived processes) report best-effort live progress
-markers (a fixed ``hook``/``phase``/``tool_name`` shape, never a command
-string or tool output) into that same open turn, which is what makes the
-actual local DB round-trip's duration visible in the panel for the first
-time.
+hooks (separate, short-lived processes) report best-effort events into
+that same open turn: a fixed ``hook``/``phase``/``tool_name`` shape plus the
+hook's ``before``/``after`` text (option B: the command before and after
+detokenization, the tool output before and after tokenization). Those texts
+hold real values, so they go on the in-memory panel bus only -- never into
+the audit log and never upstream -- and the panel is ``127.0.0.1``-only.
 """
 
 from __future__ import annotations
@@ -203,9 +204,8 @@ _AUXILIARY_CYCLE_KINDS: Final = frozenset(
 )
 
 #: Allowed values for ``POST /veil-panel/hook-event``'s ``hook``/``phase``
-#: fields -- a fixed, small enum, not freeform text, so the
-#: schema stays structurally incapable of carrying a command string or tool
-#: output (this must be true by construction, not by convention).
+#: fields -- a fixed, small enum. The free text a hook sends travels only in
+#: the optional ``before``/``after`` fields (see ``_HOOK_TEXT_LIMIT``).
 _ALLOWED_HOOK_NAMES: Final = frozenset({"pre_tool_use", "post_tool_use"})
 _ALLOWED_HOOK_PHASES: Final = frozenset({"start", "done", "error"})
 
@@ -420,6 +420,9 @@ def _publish_stage(
 #: by this process so there is no CORS to fight (see module docstring).
 _FRONTEND_DIR: Final = Path(__file__).resolve().parent.parent.parent / "frontend"
 _PANEL_HTML_PATH: Final = _FRONTEND_DIR / "panel.html"
+#: The flow view (prompt → tokenize → API → hooks → DB → answer), served at
+#: ``/veil-panel/flow``; ``panel.html`` stays as the classic view.
+_FLOW_HTML_PATH: Final = _FRONTEND_DIR / "flow.html"
 #: Third-party scripts the panel loads, shipped in the package so the panel
 #: works without network access (React 18.3.1, Babel standalone 7.24.7).
 #: Served by exact name only: nothing outside this set is ever read from disk.
@@ -499,6 +502,11 @@ _HOP_BY_HOP = {
 
 #: Largest body a panel endpoint accepts. Real ones are a few hundred bytes.
 _PANEL_MAX_BODY_BYTES: Final = 64_000
+
+#: Characters kept of a hook event's ``before``/``after`` text. The hooks
+#: already truncate to ``_panel_report.TEXT_LIMIT``; this caps whatever else
+#: posts to the endpoint.
+_HOOK_TEXT_LIMIT: Final = 8000
 
 #: Tool names a hook may report (Claude Code built-ins and `mcp__...`).
 _HOOK_TOOL_NAME_RE: Final = re.compile(r"^[A-Za-z0-9_.:\-]{1,128}$")
@@ -1619,6 +1627,12 @@ def make_handler(
             if path in (_PANEL_PREFIX, f"{_PANEL_PREFIX}/"):
                 _write_html(self, 200, _PANEL_HTML_PATH.read_bytes())
                 return True
+            if (
+                path in (f"{_PANEL_PREFIX}/flow", f"{_PANEL_PREFIX}/flow/")
+                and self.command == "GET"
+            ):
+                _write_html(self, 200, _FLOW_HTML_PATH.read_bytes())
+                return True
             vendor_prefix = f"{_PANEL_PREFIX}/vendor/"
             if path.startswith(vendor_prefix) and self.command == "GET":
                 name = path.removeprefix(vendor_prefix)
@@ -1819,14 +1833,12 @@ def make_handler(
         def _serve_hook_event(self) -> None:
             """Best-effort ingress for a hook's own live progress report.
 
-            Request schema is deliberately minimal --
-            ``session_id``/``hook``/``phase``/``tool_name``, all short
-            fixed-shape strings -- and structurally incapable of carrying a
-            command string, a tool response, or any tokenized/detokenized
-            value: there is no field for one, and any extra field in the
-            request body is ignored outright, never stored or forwarded, so
-            a caller cannot smuggle sensitive text through by adding a field
-            this schema does not expect.
+            Schema: ``session_id``/``hook``/``phase``/``tool_name`` (short,
+            validated) plus optional ``before``/``after`` strings, each cut
+            to ``_HOOK_TEXT_LIMIT`` characters. Those two carry the hook's
+            command or tool output, real values included (option B), so they
+            are published on the in-memory panel bus only -- never written to
+            the audit log, never forwarded. Any other field is ignored.
 
             Always responds ``204`` regardless of outcome (unrecognized
             session, no open turn for it, malformed body) -- the reporting
@@ -1862,16 +1874,19 @@ def make_handler(
             turn_request_id = pipeline_bus.open_turn_for_session(session_id)
             if turn_request_id is None:
                 return
-            pipeline_bus.publish(
-                {
-                    "request_id": turn_request_id,
-                    "kind": "hook",
-                    "hook": hook,
-                    "phase": phase,
-                    "tool_name": tool_name,
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-            )
+            event: dict[str, Any] = {
+                "request_id": turn_request_id,
+                "kind": "hook",
+                "hook": hook,
+                "phase": phase,
+                "tool_name": tool_name,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            for field in ("before", "after"):
+                text = payload.get(field)
+                if isinstance(text, str):
+                    event[field] = text[:_HOOK_TEXT_LIMIT]
+            pipeline_bus.publish(event)
 
         def do_GET(self) -> None:
             if self._handle_panel():

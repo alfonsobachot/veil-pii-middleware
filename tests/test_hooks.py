@@ -390,6 +390,118 @@ class TestPanelReportBestEffort:
         assert result_a.stdout == result_b.stdout
 
 
+class _RecordingGateway:
+    """A local HTTP server that records every hook-event body posted to it."""
+
+    def __init__(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+
+        bodies: list[dict[str, Any]] = []
+        self.bodies = bodies
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                bodies.append(json.loads(self.rfile.read(length).decode("utf-8")))
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+class TestPanelReportCarriesBeforeAndAfter:
+    """Option B: one report per hook run, with the hook's before/after text."""
+
+    def test_pre_tool_use_reports_the_command_before_and_after_detokenizing(
+        self, tmp_path: Path
+    ) -> None:
+        token = _seed_token(tmp_path, "session-a", "alice@example.com", "EMAIL")
+        command = f"sqlite3 demo/veil_demo.db \"select * from users where email='{token}'\""
+        gateway = _RecordingGateway()
+        try:
+            result = _run(
+                "veil_pii_middleware.adapters.hooks.pre_tool_use",
+                {
+                    "session_id": "session-a",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                tmp_path,
+                env_overrides={"VEIL_GATEWAY_URL": gateway.url},
+            )
+        finally:
+            gateway.close()
+        assert result.returncode == 0
+        assert len(gateway.bodies) == 1
+        body = gateway.bodies[0]
+        assert (body["hook"], body["phase"], body["tool_name"]) == ("pre_tool_use", "done", "Bash")
+        assert body["before"] == command
+        assert body["after"] == command.replace(token, "alice@example.com")
+
+    def test_post_tool_use_reports_the_output_before_and_after_tokenizing(
+        self, tmp_path: Path
+    ) -> None:
+        gateway = _RecordingGateway()
+        try:
+            result = _run(
+                "veil_pii_middleware.adapters.hooks.post_tool_use",
+                {
+                    "session_id": "session-a",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": _DEMO_DB_COMMAND},
+                    "tool_response": {"stdout": "row: alice@example.com", "stderr": ""},
+                },
+                tmp_path,
+                env_overrides={"VEIL_GATEWAY_URL": gateway.url},
+            )
+        finally:
+            gateway.close()
+        assert result.returncode == 0
+        assert len(gateway.bodies) == 1
+        body = gateway.bodies[0]
+        assert (body["hook"], body["phase"]) == ("post_tool_use", "done")
+        assert body["before"] == "row: alice@example.com"
+        assert body["after"].startswith("row: PII_EMAIL_")
+        assert "alice@example.com" not in body["after"]
+
+    def test_long_text_is_truncated(self) -> None:
+        from veil_pii_middleware.adapters.hooks._panel_report import TEXT_LIMIT, report
+
+        gateway = _RecordingGateway()
+        os.environ["VEIL_GATEWAY_URL"] = gateway.url
+        try:
+            report("s", "post_tool_use", "done", "Bash", before="x" * (TEXT_LIMIT + 50))
+        finally:
+            os.environ.pop("VEIL_GATEWAY_URL", None)
+            gateway.close()
+        assert len(gateway.bodies[0]["before"]) == TEXT_LIMIT
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("plain", "plain"),
+            ({"stdout": "out", "stderr": "err", "interrupted": False}, "out\nerr"),
+            ({"stdout": "", "stderr": "only err"}, "only err"),
+            ({"other": 1}, '{"other": 1}'),
+        ],
+    )
+    def test_display_text(self, value: object, expected: str) -> None:
+        from veil_pii_middleware.adapters.hooks._panel_report import display_text
+
+        assert display_text(value) == expected
+
+
 def _run_utf8_bytes(
     module: str, payload: Any, tmp_path: Path
 ) -> subprocess.CompletedProcess[bytes]:
@@ -485,3 +597,20 @@ class TestPowerShellToolIsInScope:
         for event in ("PreToolUse", "PostToolUse"):
             matchers = {entry["matcher"] for entry in data["hooks"][event]}
             assert matchers == {"Bash|PowerShell"}
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ('python -I -c "print(1)"', 'python -X utf8 -I -c "print(1)"'),
+        ('python3 -c "x"', 'python3 -X utf8 -c "x"'),
+        ("cd demo && python.exe - <<EOF", "cd demo && python.exe -X utf8 - <<EOF"),
+        ('sqlite3 demo/veil_demo.db "select 1"', 'sqlite3 demo/veil_demo.db "select 1"'),
+        ("/c/Python311/python -c x", "/c/Python311/python -c x"),
+        ("python -X utf8 -c x", "python -X utf8 -c x"),
+        ("echo mypython -c", "echo mypython -c"),
+    ],
+)
+def test_force_python_utf8(command: str, expected: str) -> None:
+    """``python -I`` ignores PYTHONUTF8, so accents came back as U+FFFD."""
+    assert pre_tool_use.force_python_utf8(command) == expected
