@@ -333,8 +333,18 @@ detail rather than something a user of this project needs to reason about direct
 
 ## 7. Observability panel
 
-Served by the gateway process itself at `http://127.0.0.1:<port>/veil-panel` — no separate
-process, no CORS to fight. Shows the **live** session, not a recording.
+Served by the gateway process itself — no separate process, no CORS to fight, no network
+needed (React and Babel are vendored). Shows the **live** session, not a recording. Two views:
+
+- **Flow view** at `/veil-panel/flow` (the one used in the demo): an animated diagram of the
+  whole path — your prompt → gateway tokenize → Claude API → `PreToolUse` → local database →
+  `PostToolUse` → back to the API → gateway detokenize → your screen — with one card per step
+  showing its text before and after: the prompt as typed and as Claude receives it, each
+  command Claude wrote (tokens) and the one that runs locally (real values), each query result
+  (real values) and what goes back to Claude (tokens), and the final answer. **Replay this
+  turn** walks through a finished turn step by step. Turn list, audit log and vault in a
+  sidebar.
+- **Classic view** at `/veil-panel`, described below.
 
 **One screen per logical request, not per HTTP call.** A single question can take several
 gateway round-trips under the hood (the model asks for a tool, gets a result, asks again) —
@@ -351,13 +361,13 @@ behind a "Show hidden" toggle.
   intermediate tool round-trips happened, and regardless of what's expanded in the sidebar.
 - **Left sidebar timeline**: every stage of the turn (received → tokenized → forwarded → API
   response → detokenized → displayed), for every round it took, in chronological order — each
-  row expands inline to show that exact step's text. Interleaved with these are live
-  `PreToolUse`/`PostToolUse` progress markers the hooks report to the panel on a best-effort
-  basis (`POST /veil-panel/hook-event`, a fixed, minimal schema — never a command string or tool
-  output, since `PreToolUse` in particular exists specifically to hand the local tool a real,
-  detokenized value): a hook `start` with no matching `done`/`error` yet renders live as
-  in-progress. This is what makes a slow local DB round-trip's actual duration visible for the
-  first time, instead of being an invisible gap between two gateway calls.
+  row expands inline to show that exact step's text. Interleaved with these are the
+  `PreToolUse`/`PostToolUse` events the hooks report on a best-effort basis
+  (`POST /veil-panel/hook-event`, one call per hook run). Each carries the hook's text before
+  and after (option B): the command with tokens and with real values, the tool output with real
+  values and with tokens, each cut to 6,000 characters. Those texts hold real values, so the
+  gateway puts them on the in-memory panel stream only — never in `audit.jsonl`, never
+  upstream.
 - **Audit-log pane**: a live table fed by `/veil-panel/audit-stream` (SSE tail of
   `.veil/audit.jsonl`) — timestamp, adapter, entity type, detector, token. Never a value.
 - **Vault inspector**: lists every token minted (type, ciphertext, timestamp) across every
@@ -373,8 +383,9 @@ Start it with `scripts/run-gateway.sh` (§6) and open the panel URL it prints.
 **Known, accepted trade-off:** the pipeline-stream endpoint carries raw, pre-tokenization
 request/response text to any local process that opens it while a request is in flight — with
 no authentication beyond the gateway's `127.0.0.1`-only bind. The same bind is the only guard
-on `/veil-panel/hook-event`, the hooks' own reporting endpoint. This is required by the panes'
-own job (showing spans highlighted in the actual text) and the sidebar's live progress, not an
+on `/veil-panel/hook-event`, the hooks' own reporting endpoint, whose events now carry the
+detokenized command and the raw tool output too. This is required by the panes' own job
+(showing spans highlighted in the actual text, and each hook's before and after), not an
 oversight; it is bound to the same "single local developer" threat model as the rest of this
 project and was flagged for explicit human sign-off during development.
 

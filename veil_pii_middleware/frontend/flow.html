@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>veil — live flow</title>
+<style>
+  :root {
+    --bg: #0d1016;
+    --panel: #151a23;
+    --panel-2: #1b212c;
+    --border: #283040;
+    --text: #e7eaf0;
+    --muted: #8b93a5;
+    --regex: #4fb0ff;
+    --llm: #ffa64f;
+    --encoder: #f06fd0;
+    --token: #46d68c;
+    --detoken: #c08cff;
+    --api: #e8b04a;
+    --local: #46c1d6;
+    --danger: #ff6464;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 "Segoe UI", -apple-system, system-ui, sans-serif;
+  }
+  #root { height: 100%; }
+  .app { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: 100%; }
+  .main { overflow-y: auto; padding: 16px 20px 40px; }
+  .side { border-left: 1px solid var(--border); background: var(--panel); overflow-y: auto; }
+
+  header.top { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  header.top h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
+  header.top h1 b { color: var(--token); }
+  header.top .sub { color: var(--muted); }
+  header.top .spacer { flex: 1; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #3d4a62; }
+  button.primary { background: #23436e; border-color: #2f5d97; }
+  button:disabled { opacity: 0.45; cursor: default; }
+
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 6px 0 12px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 14px; min-width: 130px;
+  }
+  .stat .v { font-size: 22px; font-weight: 600; }
+  .stat .l { color: var(--muted); font-size: 12px; }
+  .stat.good .v { color: var(--token); }
+
+  /* ---- flow diagram ---- */
+  .diagram-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+  .diagram { position: relative; width: 1000px; height: 280px; margin: 0 auto; }
+  .diagram svg { position: absolute; inset: 0; }
+  .edge { fill: none; stroke: #2c3546; stroke-width: 2.5; transition: stroke 0.4s; }
+  .edge.hot { stroke: #6aa8ff; }
+  .edge.local { stroke-dasharray: 5 5; }
+  .zone { fill: none; stroke: #23303f; stroke-dasharray: 4 6; }
+  .zone-label { fill: var(--muted); font-size: 11px; letter-spacing: 1px; }
+  .node {
+    position: absolute; width: 132px; margin-left: -66px; margin-top: -26px; height: 52px;
+    border-radius: 10px; border: 1.5px solid var(--border); background: var(--panel-2);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; transition: border-color 0.3s, box-shadow 0.3s, transform 0.3s;
+  }
+  .node .n { font-weight: 600; font-size: 13px; }
+  .node .s { font-size: 11px; color: var(--muted); }
+  .node.api { border-color: #6b5626; }
+  .node.lit { border-color: var(--c, #6aa8ff); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, #6aa8ff) 30%, transparent), 0 0 22px color-mix(in srgb, var(--c, #6aa8ff) 45%, transparent); transform: scale(1.05); }
+  .packet {
+    position: absolute; left: 0; top: 0; width: 14px; height: 14px; margin: -7px 0 0 -7px;
+    border-radius: 50%; background: var(--c, #6aa8ff); box-shadow: 0 0 12px var(--c, #6aa8ff);
+    offset-rotate: 0deg; animation: travel var(--d, 0.7s) ease-in-out var(--delay, 0s) both;
+  }
+  .packet .lbl {
+    position: absolute; left: 16px; top: -6px; white-space: nowrap; font: 600 11px/1 ui-monospace, Consolas, monospace;
+    color: var(--c); background: #0d1016cc; padding: 3px 5px; border-radius: 4px;
+  }
+  @keyframes travel { from { offset-distance: 0%; opacity: 1; } 92% { opacity: 1; } to { offset-distance: 100%; opacity: 0; } }
+
+  /* ---- steps ---- */
+  .steps { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+  .step {
+    background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--c, var(--border));
+    border-radius: 10px; padding: 10px 14px 12px; animation: rise 0.45s ease-out both;
+  }
+  .step.current { box-shadow: 0 0 0 1px var(--c), 0 6px 26px #0008; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  .step-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .step-head .idx { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .step-head .t { font-weight: 600; font-size: 15px; }
+  .step-head .where { font-size: 12px; color: var(--c); border: 1px solid var(--c); border-radius: 999px; padding: 0 8px; }
+  .step-head .meta { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .step .why { color: var(--muted); font-size: 12.5px; margin: 2px 0 8px; }
+  .ba { display: grid; grid-template-columns: minmax(0, 1fr) 26px minmax(0, 1fr); gap: 6px; align-items: stretch; }
+  .ba .arrow { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 18px; }
+  .box { background: #0f131b; border: 1px solid var(--border); border-radius: 8px; min-width: 0; display: flex; flex-direction: column; }
+  .box .bl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); padding: 5px 9px 0; display: flex; gap: 8px; }
+  .box .bl .tag { color: var(--c2, var(--muted)); }
+  .box pre {
+    margin: 0; padding: 6px 9px 9px; white-space: pre-wrap; word-break: break-word;
+    font: 12.5px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; max-height: 260px; overflow: auto;
+  }
+  .single pre { max-height: 200px; }
+  .hl { border-radius: 3px; padding: 0 2px; }
+  .hl.REGEX { background: #4fb0ff33; box-shadow: inset 0 -2px var(--regex); }
+  .hl.LLM { background: #ffa64f33; box-shadow: inset 0 -2px var(--llm); }
+  .hl.ENCODER { background: #f06fd033; box-shadow: inset 0 -2px var(--encoder); }
+  .hl.tok { background: #46d68c26; color: #8ff0bb; box-shadow: inset 0 -2px var(--token); }
+  .hl.real { background: #c08cff2b; color: #e2c9ff; box-shadow: inset 0 -2px var(--detoken); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 10px 2px 0; }
+  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  .waiting { color: var(--muted); padding: 10px 4px; display: flex; gap: 8px; align-items: center; }
+  .dot-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--api); animation: pulse 1s infinite alternate; }
+  @keyframes pulse { from { opacity: 0.25; } to { opacity: 1; } }
+  .empty { color: var(--muted); padding: 40px 10px; text-align: center; }
+
+  /* ---- sidebar ---- */
+  .side section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .side h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  .side h2 .spacer { flex: 1; }
+  .turn { display: block; width: 100%; text-align: left; margin-bottom: 6px; padding: 7px 9px; }
+  .turn.sel { border-color: #2f5d97; background: #1d2c44; }
+  .turn .p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .turn .m { color: var(--muted); font-size: 11.5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 3px 4px; text-align: left; border-bottom: 1px solid #1f2633; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  td.mono, code { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+  .audit-new { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { background: #46d68c33; } to { background: transparent; } }
+  .scroll { max-height: 300px; overflow-y: auto; }
+  .small { font-size: 11.5px; padding: 2px 8px; }
+  .muted { color: var(--muted); }
+  a { color: #7fb4ff; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="/veil-panel/vendor/react.production.min.js"></script>
+<script src="/veil-panel/vendor/react-dom.production.min.js"></script>
+<script src="/veil-panel/vendor/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// Same constants as panel.html / the gateway's PipelineEventBus.
+const HISTORY_LIMIT = 20;
+const HIDDEN_KINDS = new Set(["title_generation", "safety_check", "internal_continuation"]);
+const TOKEN_RE = /PII_([A-Z]+)_\d{4}/g;
+const REPLAY_STEP_MS = 2600;
+// Steps older than this page load are history: listed, never animated.
+const PAGE_LOADED_AT = new Date(Date.now() - 1500).toISOString();
+
+// ------------------------------------------------------------------ diagram
+// Fixed 1000x280 coordinate space; packets travel along the same SVG paths
+// through CSS offset-path, so the diagram is a fixed-size scrollable block.
+const NODES = {
+  you:   { x: 70,  y: 70,  n: "You", s: "Claude Code", c: "#9fb3d1" },
+  tok:   { x: 270, y: 70,  n: "veil gateway", s: "tokenize", c: "var(--token)" },
+  api:   { x: 500, y: 70,  n: "Claude API", s: "only sees tokens", c: "var(--api)" },
+  detok: { x: 730, y: 70,  n: "veil gateway", s: "detokenize", c: "var(--detoken)" },
+  screen:{ x: 930, y: 70,  n: "Your screen", s: "real values", c: "#9fb3d1" },
+  pre:   { x: 690, y: 215, n: "PreToolUse", s: "token → value", c: "var(--detoken)" },
+  db:    { x: 500, y: 215, n: "Local database", s: "real data", c: "var(--local)" },
+  post:  { x: 310, y: 215, n: "PostToolUse", s: "value → token", c: "var(--token)" },
+};
+const EDGES = {
+  "you-tok": "M 136 70 L 204 70",
+  "tok-api": "M 336 70 L 434 70",
+  "api-detok": "M 566 70 L 664 70",
+  "detok-screen": "M 796 70 L 864 70",
+  "api-pre": "M 540 96 C 580 150, 640 170, 690 189",
+  "pre-db": "M 624 215 L 566 215",
+  "db-post": "M 434 215 L 376 215",
+  "post-tok": "M 310 189 C 300 150, 285 120, 276 96",
+};
+const LOCAL_EDGES = new Set(["api-pre", "pre-db", "db-post", "post-tok"]);
+
+// What each step kind animates: [edge, packet label, colour].
+const STEP_PATHS = {
+  prompt: [["you-tok", "raw", "#9fb3d1"], ["tok-api", "tokens", "var(--token)"]],
+  claude: [["api-detok", "tokens", "var(--api)"], ["detok-screen", "text", "var(--detoken)"]],
+  pre:    [["api-pre", "PII_…", "var(--api)"], ["pre-db", "real value", "var(--detoken)"]],
+  post:   [["db-post", "rows", "var(--local)"], ["post-tok", "tokens", "var(--token)"], ["tok-api", "tokens", "var(--token)"]],
+  answer: [["api-detok", "tokens", "var(--api)"], ["detok-screen", "real values", "var(--detoken)"]],
+};
+const STEP_NODES = {
+  prompt: ["you", "tok", "api"],
+  claude: ["api", "detok", "screen"],
+  pre: ["api", "pre", "db"],
+  post: ["db", "post", "tok", "api"],
+  answer: ["api", "detok", "screen"],
+};
+const PACKET_MS = 700;
+
+function Diagram({ flow }) {
+  const kind = flow && flow.kind;
+  const path = kind ? STEP_PATHS[kind] : [];
+  const litNodes = kind ? STEP_NODES[kind] : [];
+  const hotEdges = new Set(path.map((p) => p[0]));
+  return (
+    <div className="diagram-wrap">
+      <div className="diagram">
+        <svg width="1000" height="280" viewBox="0 0 1000 280">
+          <rect className="zone" x="200" y="150" width="590" height="115" rx="14" />
+          <text className="zone-label" x="212" y="272">YOUR MACHINE · REAL VALUES ONLY HERE</text>
+          <text className="zone-label" x="455" y="22">INTERNET</text>
+          {Object.entries(EDGES).map(([id, d]) => (
+            <path key={id} d={d}
+              className={"edge" + (LOCAL_EDGES.has(id) ? " local" : "") + (hotEdges.has(id) ? " hot" : "")}
+              markerEnd="url(#arrow)" />
+          ))}
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a5873" />
+            </marker>
+          </defs>
+        </svg>
+        {Object.entries(NODES).map(([id, node]) => {
+          const order = litNodes.indexOf(id);
+          return (
+            <div key={id + (order >= 0 ? flow.key : "")}
+              className={"node" + (id === "api" ? " api" : "") + (order >= 0 ? " lit" : "")}
+              style={{ left: node.x, top: node.y, "--c": node.c, transitionDelay: order >= 0 ? `${order * PACKET_MS}ms` : "0ms" }}>
+              <div className="n">{node.n}</div>
+              <div className="s">{node.s}</div>
+            </div>
+          );
+        })}
+        {path.map(([edge, label, colour], i) => (
+          <div key={`${flow.key}-${i}`} className="packet"
+            style={{ offsetPath: `path('${EDGES[edge]}')`, "--c": colour, "--delay": `${i * PACKET_MS}ms`, "--d": `${PACKET_MS}ms` }}>
+            <span className="lbl">{label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ text rendering
+function renderTokens(text) {
+  const parts = [];
+  let last = 0;
+  let m;
+  TOKEN_RE.lastIndex = 0;
+  while ((m = TOKEN_RE.exec(text)) !== null) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    parts.push(<span className="hl tok" title={`token for a ${m[1]}`} key={m.index}>{m[0]}</span>);
+    last = m.index + m[0].length;
+  }
+  parts.push(text.slice(last));
+  return parts;
+}
+
+function renderSpans(text, spans) {
+  if (!spans || !spans.length) return text;
+  const sorted = [...spans].sort((a, b) => a.start - b.start);
+  const parts = [];
+  let last = 0;
+  sorted.forEach((s, i) => {
+    if (s.start < last) return;
+    if (s.start > last) parts.push(text.slice(last, s.start));
+    parts.push(
+      <span className={`hl ${s.detector}`} title={`${s.entity_type} · ${s.detector}`} key={i}>{text.slice(s.start, s.end)}</span>
+    );
+    last = s.end;
+  });
+  parts.push(text.slice(last));
+  return parts;
+}
+
+// Marks the real values in `resolved` by aligning it against `tokenized`:
+// everything around a token is identical in both texts, so the literal runs
+// anchor where each substituted value starts and ends. Where the two stop
+// lining up (the hooks truncate both texts), the rest is shown plain.
+function renderResolved(resolved, tokenized) {
+  if (!tokenized) return resolved;
+  const segs = [];
+  let last = 0;
+  let m;
+  TOKEN_RE.lastIndex = 0;
+  while ((m = TOKEN_RE.exec(tokenized)) !== null) {
+    segs.push({ lit: tokenized.slice(last, m.index) });
+    segs.push({ tok: m[0], type: m[1] });
+    last = m.index + m[0].length;
+  }
+  segs.push({ lit: tokenized.slice(last) });
+  if (!segs.some((s) => s.tok)) return resolved;
+  const parts = [];
+  let pos = 0;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    if (seg.lit !== undefined) {
+      if (!seg.lit) continue;
+      if (!resolved.startsWith(seg.lit, pos)) break; // e.g. both texts truncated at different points
+      parts.push(seg.lit);
+      pos += seg.lit.length;
+      continue;
+    }
+    let anchor = "";
+    for (let j = i + 1; j < segs.length; j++) {
+      if (segs[j].lit) { anchor = segs[j].lit; break; }
+    }
+    const end = anchor ? resolved.indexOf(anchor, pos) : resolved.length;
+    if (end === -1) break;
+    parts.push(<span className="hl real" title={`real ${seg.type} (was ${seg.tok})`} key={i}>{resolved.slice(pos, end)}</span>);
+    pos = end;
+  }
+  if (pos < resolved.length) parts.push(resolved.slice(pos));
+  return parts;
+}
+
+function countTokens(text) {
+  return new Set((text || "").match(TOKEN_RE) || []).size;
+}
+
+// ------------------------------------------------------------------ data
+function useEventSource(path, onEvent) {
+  const ref = useRef(onEvent);
+  ref.current = onEvent;
+  useEffect(() => {
+    const source = new EventSource(path);
+    source.onmessage = (ev) => {
+      try { ref.current(JSON.parse(ev.data)); } catch (err) { /* skip a malformed line */ }
+    };
+    return () => source.close();
+  }, [path]);
+}
+
+function roundIdsOf(cycles, turnId) {
+  const children = Object.values(cycles)
+    .filter((c) => c.requestId !== turnId && c.parentRequestId === turnId)
+    .sort((a, b) => (a.firstSeenAt < b.firstSeenAt ? -1 : 1))
+    .map((c) => c.requestId);
+  return [turnId, ...children];
+}
+
+// One logical turn → the ordered list of step cards the page shows.
+function buildSteps(cycles, turnId) {
+  const turn = cycles[turnId];
+  if (!turn) return { steps: [], inFlight: false };
+  const ids = roundIdsOf(cycles, turnId);
+  const steps = [];
+  const received = turn.stages.received;
+  const tokenized = turn.stages.tokenized;
+  if (received) {
+    steps.push({
+      kind: "prompt", key: `${turnId}:prompt`, at: received.timestamp,
+      before: received.text, beforeSpans: received.spans, after: tokenized ? tokenized.text : null,
+    });
+  }
+  ids.forEach((id, round) => {
+    const c = cycles[id];
+    (c.hookEvents || []).forEach((h, i) => {
+      steps.push({ kind: h.hook === "pre_tool_use" ? "pre" : "post", key: `${id}:h${i}`, at: h.timestamp, hook: h });
+    });
+    // `id`s own hook events are attached to the turn id by the gateway, so
+    // only the turn cycle carries them; rounds contribute their responses.
+    const resp = c.stages.response_received;
+    const shown = c.stages.detokenized;
+    const last = round === ids.length - 1;
+    if (resp && (resp.text || "").trim()) {
+      steps.push({
+        kind: last ? "answer" : "claude", key: `${id}:resp`, at: resp.timestamp,
+        before: resp.text, after: shown ? shown.text : null, round,
+      });
+    }
+  });
+  steps.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  // Only the final round's reply is "the answer"; anything Claude said before
+  // a later tool call is an intermediate message.
+  const lastAnswer = [...steps].reverse().find((s) => s.kind === "answer" || s.kind === "claude");
+  steps.forEach((s) => { if (s.kind === "answer" && s !== lastAnswer) s.kind = "claude"; });
+  const lastCycle = cycles[ids[ids.length - 1]];
+  const inFlight = !(lastCycle && lastCycle.stages.displayed);
+  if (!inFlight && lastAnswer && lastAnswer.kind === "claude" && lastAnswer.round === ids.length - 1) {
+    lastAnswer.kind = "answer";
+  }
+  return { steps, inFlight, rounds: ids.length };
+}
+
+function turnStats(cycles, turnId, steps) {
+  const ids = roundIdsOf(cycles, turnId);
+  const tokens = new Set();
+  ids.forEach((id) => {
+    const c = cycles[id];
+    ["tokenized", "response_received"].forEach((st) => {
+      ((c.stages[st] && c.stages[st].text) || "").replace(TOKEN_RE, (t) => tokens.add(t));
+    });
+    (c.hookEvents || []).forEach((h) => (h.after || "").replace(TOKEN_RE, (t) => tokens.add(t)));
+  });
+  return {
+    tokens: tokens.size,
+    rounds: ids.length,
+    tools: steps.filter((s) => s.kind === "pre").length,
+  };
+}
+
+// ------------------------------------------------------------------ step cards
+const STEP_META = {
+  prompt: { title: "Your prompt", where: "veil gateway", c: "var(--token)",
+    why: "Detected values are replaced with stable tokens before the request leaves the machine.",
+    bl: ["What you typed", "What Claude receives"] },
+  claude: { title: "Claude decides what to do", where: "Claude API", c: "var(--api)",
+    why: "Claude works with tokens only, and asks for a local tool when it needs data.",
+    bl: ["Claude's reply (tokens)", "On your screen"] },
+  pre: { title: "Tool call: tokens back to real values", where: "PreToolUse hook · local", c: "var(--detoken)",
+    why: "The command Claude wrote uses tokens; the hook resolves them so the local database sees the real values.",
+    bl: ["Command from Claude", "Command that runs locally"] },
+  post: { title: "Tool result: real values back to tokens", where: "PostToolUse hook · local", c: "var(--token)",
+    why: "The query result holds customer data; it is tokenized before it goes back to Claude.",
+    bl: ["Database output (local)", "What goes back to Claude"] },
+  answer: { title: "The answer", where: "veil gateway", c: "var(--detoken)",
+    why: "Claude answers with tokens; the gateway resolves them for you on the way back.",
+    bl: ["Claude's answer (tokens)", "On your screen"] },
+};
+
+function Box({ label, tag, c2, children, single }) {
+  return (
+    <div className={"box" + (single ? " single" : "")} style={{ "--c2": c2 }}>
+      <div className="bl"><span>{label}</span>{tag && <span className="tag">{tag}</span>}</div>
+      <pre>{children}</pre>
+    </div>
+  );
+}
+
+function StepCard({ step, index, current }) {
+  const meta = STEP_META[step.kind];
+  let before = null, after = null, metaText = "", error = false;
+  if (step.kind === "prompt") {
+    before = renderSpans(step.before, step.beforeSpans);
+    after = step.after == null ? <span className="muted">…</span> : renderTokens(step.after);
+    metaText = `${(step.beforeSpans || []).length} value(s) detected`;
+  } else if (step.kind === "pre" || step.kind === "post") {
+    const h = step.hook;
+    error = h.phase === "error";
+    const b = h.before || "", a = h.after;
+    if (step.kind === "pre") {
+      before = renderTokens(b);
+      after = a == null ? <span className="muted">(blocked)</span> : renderResolved(a, b);
+      metaText = `${countTokens(b)} token(s) resolved`;
+    } else {
+      before = a == null ? b : renderResolved(b, a);
+      after = a == null ? <span className="muted">(tokenization failed — the gateway still scans it)</span> : renderTokens(a);
+      metaText = a == null ? "" : `${countTokens(a)} distinct token(s)`;
+    }
+  } else {
+    before = renderTokens(step.before);
+    after = step.after == null ? <span className="muted">…</span> : renderResolved(step.after, step.before);
+    metaText = `${countTokens(step.before)} token(s) resolved`;
+  }
+  return (
+    <div className={"step" + (current ? " current" : "")} style={{ "--c": error ? "var(--danger)" : meta.c }} id={`step-${index}`}>
+      <div className="step-head">
+        <span className="idx">{index + 1}</span>
+        <span className="t">{meta.title}{error ? " — failed" : ""}</span>
+        <span className="where">{meta.where}</span>
+        <span className="meta">{metaText} · {new Date(step.at || step.hook?.timestamp).toLocaleTimeString()}</span>
+      </div>
+      <div className="why">{meta.why}</div>
+      <div className="ba">
+        <Box label={meta.bl[0]}>{before}</Box>
+        <div className="arrow">→</div>
+        <Box label={meta.bl[1]}>{after}</Box>
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ sidebar
+function AuditPane() {
+  const [rows, setRows] = useState([]);
+  useEventSource("/veil-panel/audit-stream", (e) => setRows((prev) => [{ ...e, _k: Math.random() }, ...prev].slice(0, 60)));
+  return (
+    <section>
+      <h2>Audit log <span className="spacer" /> <span className="muted">no values, ever</span></h2>
+      <div className="scroll">
+        <table>
+          <thead><tr><th>Time</th><th>Where</th><th>Detector</th><th>Token</th></tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r._k} className="audit-new">
+                <td>{new Date(r.timestamp).toLocaleTimeString()}</td>
+                <td>{(r.adapter || "").replace("hooks:", "")}</td>
+                <td>{r.detector}</td>
+                <td className="mono">{r.token}</td>
+              </tr>
+            ))}
+            {!rows.length && <tr><td colSpan="4" className="muted">Waiting for tokens…</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function VaultPane() {
+  const [mappings, setMappings] = useState([]);
+  const [revealed, setRevealed] = useState({});
+  const [filter, setFilter] = useState("");
+  const refresh = useCallback(() => {
+    fetch("/veil-panel/vault").then((r) => r.json()).then((d) => setMappings(d.mappings || [])).catch(() => {});
+  }, []);
+  useEffect(() => { refresh(); const id = setInterval(refresh, 4000); return () => clearInterval(id); }, [refresh]);
+  const key = (m) => `${m.session_id} ${m.token}`;
+  const reveal = (m) => {
+    fetch("/veil-panel/vault/reveal", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: m.token, session_id: m.session_id }),
+    })
+      .then((r) => r.json())
+      .then((d) => setRevealed((p) => ({ ...p, [key(m)]: d.value ?? d.error ?? "(error)" })))
+      .catch(() => setRevealed((p) => ({ ...p, [key(m)]: "(gateway unreachable)" })));
+  };
+  const shown = mappings.filter((m) => !filter || m.token.includes(filter.toUpperCase()));
+  return (
+    <section>
+      <h2>Vault <span className="spacer" /> <span className="muted">AES-GCM · {mappings.length} tokens</span></h2>
+      <input placeholder="filter, e.g. IBAN" value={filter} onChange={(e) => setFilter(e.target.value)}
+        style={{ width: "100%", marginBottom: 6, background: "#0f131b", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 6, padding: "4px 8px" }} />
+      <div className="scroll">
+        <table>
+          <thead><tr><th>Token</th><th>Stored as</th><th></th></tr></thead>
+          <tbody>
+            {shown.slice(0, 200).map((m) => {
+              const k = key(m);
+              return (
+                <tr key={k}>
+                  <td className="mono">{m.token}</td>
+                  <td className="mono muted" title={m.ciphertext_b64}>
+                    {revealed[k] !== undefined ? <span style={{ color: "var(--detoken)" }}>{revealed[k]}</span> : m.ciphertext_b64.slice(0, 14) + "…"}
+                  </td>
+                  <td>
+                    {revealed[k] !== undefined
+                      ? <button className="small" onClick={() => setRevealed((p) => { const n = { ...p }; delete n[k]; return n; })}>Hide</button>
+                      : <button className="small" onClick={() => reveal(m)}>Reveal</button>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+// ------------------------------------------------------------------ app
+function App() {
+  const [cycles, setCycles] = useState({});
+  const [order, setOrder] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [follow, setFollow] = useState(true);
+  const [flow, setFlow] = useState(null);
+  const [replay, setReplay] = useState(null); // number of steps shown while replaying
+  const followRef = useRef(true);
+  followRef.current = follow;
+  const known = useRef(new Set());
+  const lastAnimated = useRef({});
+
+  useEventSource("/veil-panel/pipeline-stream", (ev) => {
+    const { request_id, stage, text, spans, timestamp, kind, parent_request_id } = ev;
+    const isNew = !known.current.has(request_id);
+    known.current.add(request_id);
+    setCycles((prev) => {
+      const ex = prev[request_id];
+      const stages = stage ? { ...(ex ? ex.stages : {}), [stage]: { text, spans, timestamp } } : ex ? ex.stages : {};
+      const hookEvents = kind === "hook" ? [...(ex ? ex.hookEvents : []), ev] : ex ? ex.hookEvents : [];
+      return {
+        ...prev,
+        [request_id]: {
+          requestId: request_id, stages, hookEvents,
+          kind: kind && kind !== "hook" ? kind : ex ? ex.kind : "conversation",
+          parentRequestId: parent_request_id || (ex ? ex.parentRequestId : null) || null,
+          firstSeenAt: ex ? ex.firstSeenAt : timestamp,
+        },
+      };
+    });
+    if (kind === "hook" || HIDDEN_KINDS.has(kind || "conversation")) return;
+    if (isNew && !parent_request_id) {
+      setOrder((prev) => (prev.includes(request_id) ? prev : [...prev, request_id].slice(-HISTORY_LIMIT)));
+      if (followRef.current) setSelected(request_id);
+    }
+  });
+
+  const turns = order.filter((id) => cycles[id] && !(cycles[id].parentRequestId && cycles[cycles[id].parentRequestId]));
+  const { steps, inFlight } = useMemo(() => (selected ? buildSteps(cycles, selected) : { steps: [], inFlight: false }), [cycles, selected]);
+  const stats = selected ? turnStats(cycles, selected, steps) : null;
+  const visible = replay == null ? steps : steps.slice(0, replay);
+
+  // Live: animate each step the first time it appears on the selected turn.
+  useEffect(() => {
+    if (replay != null || !selected) return;
+    const seen = lastAnimated.current[selected] || 0;
+    if (steps.length > seen) {
+      const s = steps[steps.length - 1];
+      lastAnimated.current[selected] = steps.length;
+      if (!s.at || s.at < PAGE_LOADED_AT) return;
+      setFlow({ kind: s.kind, key: `${s.key}-${Date.now()}` });
+      lastAnimated.current[selected] = steps.length;
+      setTimeout(() => {
+        const el = document.getElementById(`step-${steps.length - 1}`);
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }, 60);
+    }
+  }, [steps, selected, replay]);
+
+  // Replay: reveal the selected turn's steps one at a time.
+  useEffect(() => {
+    if (replay == null) return;
+    if (replay > 0 && replay <= steps.length) {
+      const s = steps[replay - 1];
+      setFlow({ kind: s.kind, key: `${s.key}-replay-${Date.now()}` });
+      setTimeout(() => {
+        const el = document.getElementById(`step-${replay - 1}`);
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 60);
+    }
+    if (replay >= steps.length) {
+      const t = setTimeout(() => setReplay(null), REPLAY_STEP_MS);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(() => setReplay((n) => (n == null ? null : n + 1)), replay === 0 ? 400 : REPLAY_STEP_MS);
+    return () => clearTimeout(t);
+  }, [replay, steps]);
+
+  const select = (id) => {
+    setReplay(null);
+    setSelected(id);
+    setFollow(id === turns[turns.length - 1]);
+    lastAnimated.current[id] = buildSteps(cycles, id).steps.length;
+    setFlow(null);
+  };
+
+  return (
+    <div className="app">
+      <div className="main">
+        <header className="top">
+          <h1><b>veil</b> — what leaves your machine</h1>
+          <span className="sub">live from the gateway and the hooks</span>
+          <span className="spacer" />
+          <button className="primary" disabled={!steps.length || replay != null} onClick={() => setReplay(0)}>▶ Replay this turn</button>
+          {replay != null && <button onClick={() => setReplay(null)}>Stop</button>}
+          <a href="/veil-panel" title="the previous panel">classic panel</a>
+        </header>
+        {stats && (
+          <div className="stats">
+            <div className="stat good"><div className="v">{stats.tokens}</div><div className="l">distinct values kept local</div></div>
+            <div className="stat"><div className="v">{stats.tools}</div><div className="l">local tool calls</div></div>
+            <div className="stat"><div className="v">{stats.rounds}</div><div className="l">requests to the Claude API</div></div>
+            <div className="stat"><div className="v">{inFlight ? "running" : "done"}</div><div className="l">turn status</div></div>
+          </div>
+        )}
+        <Diagram flow={flow} />
+        <div className="legend">
+          <span><i style={{ background: "var(--regex)" }} />regex (check digits)</span>
+          <span><i style={{ background: "var(--llm)" }} />local LLM</span>
+          <span><i style={{ background: "var(--encoder)" }} />GLiNER encoder</span>
+          <span><i style={{ background: "var(--token)" }} />token</span>
+          <span><i style={{ background: "var(--detoken)" }} />real value, resolved locally</span>
+        </div>
+        <div className="steps">
+          {!selected && <div className="empty">Run <code>scripts/ask.sh --demo-db "…"</code> — the turn appears here as it happens.</div>}
+          {visible.map((s, i) => (
+            <StepCard key={s.key} step={s} index={i} current={replay != null ? i === replay - 1 : i === visible.length - 1 && inFlight} />
+          ))}
+          {selected && inFlight && replay == null && (
+            <div className="waiting"><span className="dot-pulse" /> waiting for the next step…</div>
+          )}
+        </div>
+      </div>
+      <aside className="side">
+        <section>
+          <h2>Turns <span className="spacer" />
+            <label className="muted" style={{ textTransform: "none", letterSpacing: 0 }}>
+              <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> follow latest
+            </label>
+          </h2>
+          {[...turns].reverse().map((id) => {
+            const c = cycles[id];
+            const t = (c.stages.tokenized && c.stages.tokenized.text) || (c.stages.received && c.stages.received.text) || "…";
+            return (
+              <button key={id} className={"turn" + (id === selected ? " sel" : "")} onClick={() => select(id)}>
+                <div className="p">{renderTokens(t.slice(0, 90))}</div>
+                <div className="m">{new Date(c.firstSeenAt).toLocaleTimeString()}</div>
+              </button>
+            );
+          })}
+          {!turns.length && <div className="muted">No turns yet.</div>}
+        </section>
+        <AuditPane />
+        <VaultPane />
+      </aside>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
