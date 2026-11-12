@@ -4,7 +4,16 @@ Remaining work before the live presentation on **Friday 2026-11-13** (in English
 2026-11-11 in the evening, to be executed in fresh sessions. Steps are in order; each one says
 when it is done.
 
-## Where things stand
+## Status on Thursday 2026-11-12, afternoon
+
+- **Step 1 done.** Demo customer, prompt and setup in `docs/demo-script.md`; 6 consecutive
+  recorded runs with zero leaks (regex + qwen3 4b + GLiNER in the gateway).
+- **Step 2 deferred** until after the presentation (no time; the corpus stays as it is).
+- **Step 3** running on the current detector (`5806341` and later: no detector change since).
+- **Step 5 done** without the `server.py` split: option B in the hooks (b4ee3cb) and the
+  flow view at `/veil-panel/flow` (405c363). The classic panel stays at `/veil-panel`.
+
+## Where things stood on Wednesday
 
 - The code review (`docs/code-review-plan.md`) is finished. Every "Fix now" item in
   `docs/review-findings.md` is fixed and ticked, plus smoke-test fixes S4, S6, S7 and S9.

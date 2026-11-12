@@ -194,8 +194,9 @@ take precedence (among themselves the longest wins); an overlapping LLM or encod
 trimmed to its uncovered parts instead of dropped, so no character either layer flagged goes
 out in clear (`core/detector.py::merge_spans`).
 
-**Deterministic layer (regex).** Covers `EMAIL`, `DNI`, `NIE`, `IBAN`, Spanish and
-international `PHONE`, `CARD`, `IP`. Check-digit validation is mandatory, not cosmetic — a
+**Deterministic layer (regex).** Covers 13 types: `EMAIL`, `DNI`, `NIE`, `IBAN`, Spanish and
+international `PHONE`, `CARD`, `IP` (v4 and v6), `CIF`, `NSS`, `SECRET` (API keys, tokens,
+passwords in URLs), `PLATE`, `MAC`, `GPS`. Check-digit validation is mandatory, not cosmetic — a
 bare nine-digit run is an order number as often as a phone, and a sixteen-digit run is a
 reference code as often as a card:
 
@@ -204,9 +205,12 @@ reference code as often as a card:
 - Card: Luhn checksum, 12–19 digits (Maestro PANs can be as short as 12).
 - IP: four dot-separated octets, each range-checked 0–255 (zero-padded forms accepted, since
   log exporters emit `192.168.001.001`).
+- CIF: the company tax ID control digit or letter; NSS: mod 97.
+- The rest are shape rules: known secret prefixes (`AKIA`, `ghp_`, `sk_live_`, JWTs...),
+  Spanish plates without vowels, MAC and coordinate pairs in range.
 
 This is the guaranteed floor: if the local LLM is down, times out, or returns malformed JSON,
-these seven types are still tokenized — `detect()` fails closed to regex-only on any LLM-side
+these 13 types are still tokenized — `detect()` fails closed to regex-only on any LLM-side
 failure.
 
 **Probabilistic layer (local LLM).** Reached over an OpenAI-compatible

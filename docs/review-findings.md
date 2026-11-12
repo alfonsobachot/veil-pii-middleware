@@ -477,7 +477,7 @@ both lines at start-up; the full turn took 51 s.
   query there, the token would not have been resolved (and in hooks-only mode the result
   would not have been tokenized). Fix: match `Bash|PowerShell` in both hooks and the scope
   check, or tell the model to use Bash in the demo system prompt.
-- **S5. Over-tokenization of the prompt by the LLM layer.** "Python's sqlite3 module",
+- **S5. Over-tokenization of the prompt by the LLM layer.** Handled for the demo (2026-11-12): the demo prompt names no files or tables and starts "The user ..." (GLiNER tags "Customer" as PERSON); the prompt reaches the API as `The user PII_EMAIL_0001 has ...`. Words inside shell commands are still sometimes tokenized (cosmetic; PreToolUse resolves them). "Python's sqlite3 module",
   `demo/veil_demo.db` and the table names became `PII_OTHER_*` / `PII_ORG_*`, and the
   `email` column name in the schema output became `PII_USERNAME_0001`. The model coped, but
   the panel shows a mangled prompt. Skill names in Claude Code's context became `PII_ORG_*`
@@ -489,7 +489,7 @@ both lines at start-up; the full turn took 51 s.
   skill list load into the demo request (not tokenized in `system` by design).
 - **S7. `ask.sh` waits 3 s for stdin.** Fixed in 7196c1e. `claude -p` prints "no stdin data received in 3s".
   Fix: `< /dev/null` on both invocations.
-- **S8. A synthetic company name reached the API.** In the S6 re-runs the row
+- **S8. A synthetic company name reached the API.** Fixed for the demo (2026-11-11/12): vault tokens are masked and CRLF sent as LF before the LLM call (0aa173f), and the demo gateway adds GLiNER; 6 consecutive recorded runs had no leak. Root cause stays: qwen3 4b alone misses soft values in dense blocks. In the S6 re-runs the row
   `customer (2, 'Consultoría Guillen & Asociados S.Com.', ...)` was forwarded in clear twice
   in a row: neither the post-hook nor the gateway (same qwen3 4b) tagged it as ORG, while the
   first run, with a different output shape, did. Soft-layer recall gap on tuple-shaped
@@ -638,11 +638,11 @@ both lines at start-up; the full turn took 51 s.
   injection could exfiltrate a resolved value. Case-sensitive (misses `VEIL_DEMO.DB`); the
   `PowerShell` tool is not covered by the `Bash` matcher. Require a leading `sqlite3 ` and no
   `;|&$\``; remove `Bash(python -c*)` from the allow list.
-- **H7. Panel reporting latency** (`adapters/hooks/_panel_report.py:44`): best-effort and
+- **H7. Panel reporting latency** Done in b4ee3cb (one call per hook, `trust_env=False`). (`adapters/hooks/_panel_report.py:44`): best-effort and
   correct, but about 0.25 s per call with the gateway down (0.42 s with `localhost`), two
   calls per hook, and httpx honours `HTTP(S)_PROXY`. One call per hook, `trust_env=False`,
   0.05 s timeout.
-- **H8. Option B design (hooks report before/after text).** Add optional `before`/`after`
+- **H8. Option B design (hooks report before/after text).** Done in b4ee3cb; the flow view (`/veil-panel/flow`, 405c363) renders it. Add optional `before`/`after`
   kwargs to `report()`, truncated to about 8 KB; accept them server-side with a length cap
   and put them on the bus event only (never in `audit.jsonl`). Data: Pre has `command` →
   `detokenized`; Post has `tool_response` → `tokenized`. Rewrite what pins the opposite:
