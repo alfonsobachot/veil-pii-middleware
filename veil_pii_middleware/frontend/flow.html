@@ -20,45 +20,82 @@
     --api: #e8b04a;
     --local: #46c1d6;
     --danger: #ff6464;
+    --accent: #f7074d;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
-  html, body { margin: 0; height: 100%; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
   body {
     background: var(--bg);
     color: var(--text);
-    font: 14px/1.45 "Segoe UI", -apple-system, system-ui, sans-serif;
+    font: 15px/1.45 "Segoe UI", -apple-system, system-ui, sans-serif;
   }
   #root { height: 100%; }
-  .app { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: 100%; }
-  .main { overflow-y: auto; padding: 16px 20px 40px; }
-  .side { border-left: 1px solid var(--border); background: var(--panel); overflow-y: auto; }
-
-  header.top { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
-  header.top h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
-  header.top h1 b { color: var(--token); }
-  header.top .sub { color: var(--muted); }
-  header.top .spacer { flex: 1; }
+  .app { display: grid; grid-template-columns: 440px minmax(0, 1fr); height: 100%; }
   button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
-    border-radius: 6px; padding: 5px 12px; font: inherit; cursor: pointer;
+    border-radius: 6px; padding: 6px 13px; font: inherit; cursor: pointer;
   }
   button:hover { border-color: #3d4a62; }
   button.primary { background: #23436e; border-color: #2f5d97; }
+  button.accent { background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
   button:disabled { opacity: 0.45; cursor: default; }
+  .muted { color: var(--muted); }
+  code, .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
 
-  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 6px 0 12px; }
-  .stat {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 8px 14px; min-width: 130px;
+  /* ---- left sidebar ---- */
+  .side { border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  .brand { padding: 14px 18px 10px; display: flex; align-items: baseline; gap: 10px; }
+  .brand b { color: var(--token); font-size: 22px; }
+  .brand span { color: var(--muted); font-size: 13px; }
+  .ask { padding: 4px 18px 14px; border-bottom: 1px solid var(--border); }
+  .ask textarea {
+    width: 100%; min-height: 112px; resize: vertical; background: #0f131b; color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: 15px/1.45 inherit;
+    font-family: inherit;
   }
-  .stat .v { font-size: 22px; font-weight: 600; }
-  .stat .l { color: var(--muted); font-size: 12px; }
-  .stat.good .v { color: var(--token); }
+  .ask textarea:focus { outline: none; border-color: #2f5d97; }
+  .ask-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .ask-row .spacer { flex: 1; }
+  .ask-status { margin-top: 8px; font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+  .ask-status.err { color: var(--danger); }
+  .ask-status.ok { color: var(--token); }
+  .ask details { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .ask details pre { white-space: pre-wrap; max-height: 160px; overflow: auto; margin: 4px 0 0; }
+  .link { background: none; border: none; color: #7fb4ff; padding: 0; font-size: 13px; }
+  .tabs { display: flex; border-bottom: 1px solid var(--border); padding: 0 10px; }
+  .tabs button { background: none; border: none; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted); padding: 10px 10px 8px; }
+  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  .tab-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px; }
+  .turn { display: block; width: 100%; text-align: left; margin-bottom: 6px; padding: 8px 10px; }
+  .turn.sel { border-color: #2f5d97; background: #1d2c44; }
+  .turn .p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .turn .m { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { padding: 4px 4px; text-align: left; border-bottom: 1px solid #1f2633; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .audit-new { animation: flash 1.2s ease-out; }
+  @keyframes flash { from { background: #46d68c33; } to { background: transparent; } }
+  .small { font-size: 12px; padding: 2px 8px; }
+  .filter { width: 100%; margin-bottom: 8px; background: #0f131b; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; font: inherit; }
 
-  /* ---- flow diagram ---- */
-  .diagram-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
-  .diagram { position: relative; width: 1000px; height: 280px; margin: 0 auto; }
+  /* ---- main ---- */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .top { padding: 12px 22px 10px; border-bottom: 1px solid var(--border); }
+  .bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px; display: flex; gap: 8px; align-items: baseline; }
+  .stat .v { font-size: 20px; font-weight: 600; }
+  .stat .l { color: var(--muted); font-size: 12.5px; }
+  .stat.good .v { color: var(--token); }
+  .bar .spacer { flex: 1; }
+  .follow { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13.5px; cursor: pointer; user-select: none; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; margin-top: 8px; justify-content: center; }
+  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+  /* diagram: fixed 1000x280 drawing, scaled to the space available */
+  .diagram-fit { display: flex; justify-content: center; }
+  .diagram-frame { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .diagram { position: relative; width: 1000px; height: 280px; transform-origin: top left; }
   .diagram svg { position: absolute; inset: 0; }
   .edge { fill: none; stroke: #2c3546; stroke-width: 2.5; transition: stroke 0.4s; }
   .edge.hot { stroke: #6aa8ff; }
@@ -87,7 +124,7 @@
   @keyframes travel { from { offset-distance: 0%; opacity: 1; } 92% { opacity: 1; } to { offset-distance: 100%; opacity: 0; } }
 
   /* ---- steps ---- */
-  .steps { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+  .steps { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 22px 40px; display: flex; flex-direction: column; gap: 12px; }
   .step {
     background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--c, var(--border));
     border-radius: 10px; padding: 10px 14px 12px; animation: rise 0.45s ease-out both;
@@ -96,51 +133,28 @@
   @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
   .step-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
   .step-head .idx { color: var(--muted); font-variant-numeric: tabular-nums; }
-  .step-head .t { font-weight: 600; font-size: 15px; }
+  .step-head .t { font-weight: 600; font-size: 16px; }
   .step-head .where { font-size: 12px; color: var(--c); border: 1px solid var(--c); border-radius: 999px; padding: 0 8px; }
-  .step-head .meta { color: var(--muted); font-size: 12px; margin-left: auto; }
-  .step .why { color: var(--muted); font-size: 12.5px; margin: 2px 0 8px; }
+  .step-head .meta { color: var(--muted); font-size: 12.5px; margin-left: auto; }
+  .step .why { color: var(--muted); font-size: 13px; margin: 2px 0 8px; }
   .ba { display: grid; grid-template-columns: minmax(0, 1fr) 26px minmax(0, 1fr); gap: 6px; align-items: stretch; }
   .ba .arrow { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 18px; }
   .box { background: #0f131b; border: 1px solid var(--border); border-radius: 8px; min-width: 0; display: flex; flex-direction: column; }
-  .box .bl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); padding: 5px 9px 0; display: flex; gap: 8px; }
-  .box .bl .tag { color: var(--c2, var(--muted)); }
+  .box .bl { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); padding: 5px 9px 0; }
   .box pre {
     margin: 0; padding: 6px 9px 9px; white-space: pre-wrap; word-break: break-word;
-    font: 12.5px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; max-height: 260px; overflow: auto;
+    font: 13.5px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; max-height: 34vh; overflow: auto;
   }
-  .single pre { max-height: 200px; }
   .hl { border-radius: 3px; padding: 0 2px; }
   .hl.REGEX { background: #4fb0ff33; box-shadow: inset 0 -2px var(--regex); }
   .hl.LLM { background: #ffa64f33; box-shadow: inset 0 -2px var(--llm); }
   .hl.ENCODER { background: #f06fd033; box-shadow: inset 0 -2px var(--encoder); }
   .hl.tok { background: #46d68c26; color: #8ff0bb; box-shadow: inset 0 -2px var(--token); }
   .hl.real { background: #c08cff2b; color: #e2c9ff; box-shadow: inset 0 -2px var(--detoken); }
-  .legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 10px 2px 0; }
-  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
-  .waiting { color: var(--muted); padding: 10px 4px; display: flex; gap: 8px; align-items: center; }
+  .waiting { color: var(--muted); padding: 6px 4px; display: flex; gap: 8px; align-items: center; }
   .dot-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--api); animation: pulse 1s infinite alternate; }
   @keyframes pulse { from { opacity: 0.25; } to { opacity: 1; } }
   .empty { color: var(--muted); padding: 40px 10px; text-align: center; }
-
-  /* ---- sidebar ---- */
-  .side section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
-  .side h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600; display: flex; gap: 8px; align-items: center; }
-  .side h2 .spacer { flex: 1; }
-  .turn { display: block; width: 100%; text-align: left; margin-bottom: 6px; padding: 7px 9px; }
-  .turn.sel { border-color: #2f5d97; background: #1d2c44; }
-  .turn .p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .turn .m { color: var(--muted); font-size: 11.5px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  td, th { padding: 3px 4px; text-align: left; border-bottom: 1px solid #1f2633; vertical-align: top; }
-  th { color: var(--muted); font-weight: 500; }
-  td.mono, code { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
-  .audit-new { animation: flash 1.2s ease-out; }
-  @keyframes flash { from { background: #46d68c33; } to { background: transparent; } }
-  .scroll { max-height: 300px; overflow-y: auto; }
-  .small { font-size: 11.5px; padding: 2px 8px; }
-  .muted { color: var(--muted); }
-  a { color: #7fb4ff; }
 </style>
 </head>
 <body>
@@ -149,19 +163,20 @@
 <script src="/veil-panel/vendor/react-dom.production.min.js"></script>
 <script src="/veil-panel/vendor/babel.min.js"></script>
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } = React;
 
 // Same constants as panel.html / the gateway's PipelineEventBus.
 const HISTORY_LIMIT = 20;
 const HIDDEN_KINDS = new Set(["title_generation", "safety_check", "internal_continuation"]);
 const TOKEN_RE = /PII_([A-Z]+)_\d{4}/g;
 const REPLAY_STEP_MS = 2600;
+const DEMO_PROMPT = "The user lucia.ferrer@riberanorte.es has an invoice problem. Can you check the database and tell me what happened?";
 // Steps older than this page load are history: listed, never animated.
 const PAGE_LOADED_AT = new Date(Date.now() - 1500).toISOString();
 
 // ------------------------------------------------------------------ diagram
-// Fixed 1000x280 coordinate space; packets travel along the same SVG paths
-// through CSS offset-path, so the diagram is a fixed-size scrollable block.
+// Drawn in a fixed 1000x280 space (packets travel the same SVG paths through
+// CSS offset-path) and scaled as a whole to the space available.
 const NODES = {
   you:   { x: 70,  y: 70,  n: "You", s: "Claude Code", c: "#9fb3d1" },
   tok:   { x: 270, y: 70,  n: "veil gateway", s: "tokenize", c: "var(--token)" },
@@ -183,8 +198,6 @@ const EDGES = {
   "post-tok": "M 310 189 C 300 150, 285 120, 276 96",
 };
 const LOCAL_EDGES = new Set(["api-pre", "pre-db", "db-post", "post-tok"]);
-
-// What each step kind animates: [edge, packet label, colour].
 const STEP_PATHS = {
   prompt: [["you-tok", "raw", "#9fb3d1"], ["tok-api", "tokens", "var(--token)"]],
   claude: [["api-detok", "tokens", "var(--api)"], ["detok-screen", "text", "var(--detoken)"]],
@@ -202,45 +215,62 @@ const STEP_NODES = {
 const PACKET_MS = 700;
 
 function Diagram({ flow }) {
+  const fitRef = useRef(null);
+  const [scale, setScale] = useState(1);
+  useLayoutEffect(() => {
+    const el = fitRef.current;
+    if (!el) return;
+    const measure = () => {
+      const maxH = Math.min(Math.max(window.innerHeight * 0.34, 220), 520);
+      setScale(Math.max(0.5, Math.min((el.clientWidth - 2) / 1000, maxH / 280)));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener("resize", measure);
+    return () => { ro.disconnect(); window.removeEventListener("resize", measure); };
+  }, []);
   const kind = flow && flow.kind;
   const path = kind ? STEP_PATHS[kind] : [];
   const litNodes = kind ? STEP_NODES[kind] : [];
   const hotEdges = new Set(path.map((p) => p[0]));
   return (
-    <div className="diagram-wrap">
-      <div className="diagram">
-        <svg width="1000" height="280" viewBox="0 0 1000 280">
-          <rect className="zone" x="200" y="150" width="590" height="115" rx="14" />
-          <text className="zone-label" x="212" y="272">YOUR MACHINE · REAL VALUES ONLY HERE</text>
-          <text className="zone-label" x="455" y="22">INTERNET</text>
-          {Object.entries(EDGES).map(([id, d]) => (
-            <path key={id} d={d}
-              className={"edge" + (LOCAL_EDGES.has(id) ? " local" : "") + (hotEdges.has(id) ? " hot" : "")}
-              markerEnd="url(#arrow)" />
-          ))}
-          <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a5873" />
-            </marker>
-          </defs>
-        </svg>
-        {Object.entries(NODES).map(([id, node]) => {
-          const order = litNodes.indexOf(id);
-          return (
-            <div key={id + (order >= 0 ? flow.key : "")}
-              className={"node" + (id === "api" ? " api" : "") + (order >= 0 ? " lit" : "")}
-              style={{ left: node.x, top: node.y, "--c": node.c, transitionDelay: order >= 0 ? `${order * PACKET_MS}ms` : "0ms" }}>
-              <div className="n">{node.n}</div>
-              <div className="s">{node.s}</div>
+    <div className="diagram-fit" ref={fitRef}>
+      <div className="diagram-frame" style={{ width: 1000 * scale + 2, height: 280 * scale + 2 }}>
+        <div className="diagram" style={{ transform: `scale(${scale})` }}>
+          <svg width="1000" height="280" viewBox="0 0 1000 280">
+            <rect className="zone" x="200" y="150" width="590" height="115" rx="14" />
+            <text className="zone-label" x="212" y="272">YOUR MACHINE · REAL VALUES ONLY HERE</text>
+            <text className="zone-label" x="455" y="22">INTERNET</text>
+            {Object.entries(EDGES).map(([id, d]) => (
+              <path key={id} d={d}
+                className={"edge" + (LOCAL_EDGES.has(id) ? " local" : "") + (hotEdges.has(id) ? " hot" : "")}
+                markerEnd="url(#arrow)" />
+            ))}
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a5873" />
+              </marker>
+            </defs>
+          </svg>
+          {Object.entries(NODES).map(([id, node]) => {
+            const order = litNodes.indexOf(id);
+            return (
+              <div key={id + (order >= 0 ? flow.key : "")}
+                className={"node" + (id === "api" ? " api" : "") + (order >= 0 ? " lit" : "")}
+                style={{ left: node.x, top: node.y, "--c": node.c, transitionDelay: order >= 0 ? `${order * PACKET_MS}ms` : "0ms" }}>
+                <div className="n">{node.n}</div>
+                <div className="s">{node.s}</div>
+              </div>
+            );
+          })}
+          {path.map(([edge, label, colour], i) => (
+            <div key={`${flow.key}-${i}`} className="packet"
+              style={{ offsetPath: `path('${EDGES[edge]}')`, "--c": colour, "--delay": `${i * PACKET_MS}ms`, "--d": `${PACKET_MS}ms` }}>
+              <span className="lbl">{label}</span>
             </div>
-          );
-        })}
-        {path.map(([edge, label, colour], i) => (
-          <div key={`${flow.key}-${i}`} className="packet"
-            style={{ offsetPath: `path('${EDGES[edge]}')`, "--c": colour, "--delay": `${i * PACKET_MS}ms`, "--d": `${PACKET_MS}ms` }}>
-            <span className="lbl">{label}</span>
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -301,7 +331,7 @@ function renderResolved(resolved, tokenized) {
     const seg = segs[i];
     if (seg.lit !== undefined) {
       if (!seg.lit) continue;
-      if (!resolved.startsWith(seg.lit, pos)) break; // e.g. both texts truncated at different points
+      if (!resolved.startsWith(seg.lit, pos)) break;
       parts.push(seg.lit);
       pos += seg.lit.length;
       continue;
@@ -344,7 +374,7 @@ function roundIdsOf(cycles, turnId) {
   return [turnId, ...children];
 }
 
-// One logical turn → the ordered list of step cards the page shows.
+// One logical turn → the ordered list of step cards.
 function buildSteps(cycles, turnId) {
   const turn = cycles[turnId];
   if (!turn) return { steps: [], inFlight: false };
@@ -363,29 +393,22 @@ function buildSteps(cycles, turnId) {
     (c.hookEvents || []).forEach((h, i) => {
       steps.push({ kind: h.hook === "pre_tool_use" ? "pre" : "post", key: `${id}:h${i}`, at: h.timestamp, hook: h });
     });
-    // `id`s own hook events are attached to the turn id by the gateway, so
-    // only the turn cycle carries them; rounds contribute their responses.
     const resp = c.stages.response_received;
     const shown = c.stages.detokenized;
-    const last = round === ids.length - 1;
     if (resp && (resp.text || "").trim()) {
       steps.push({
-        kind: last ? "answer" : "claude", key: `${id}:resp`, at: resp.timestamp,
+        kind: "claude", key: `${id}:resp`, at: resp.timestamp,
         before: resp.text, after: shown ? shown.text : null, round,
       });
     }
   });
   steps.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
-  // Only the final round's reply is "the answer"; anything Claude said before
-  // a later tool call is an intermediate message.
-  const lastAnswer = [...steps].reverse().find((s) => s.kind === "answer" || s.kind === "claude");
-  steps.forEach((s) => { if (s.kind === "answer" && s !== lastAnswer) s.kind = "claude"; });
   const lastCycle = cycles[ids[ids.length - 1]];
   const inFlight = !(lastCycle && lastCycle.stages.displayed);
-  if (!inFlight && lastAnswer && lastAnswer.kind === "claude" && lastAnswer.round === ids.length - 1) {
-    lastAnswer.kind = "answer";
-  }
-  return { steps, inFlight, rounds: ids.length };
+  // The final round's reply, once the turn is done, is "the answer".
+  const lastReply = [...steps].reverse().find((s) => s.kind === "claude");
+  if (!inFlight && lastReply && lastReply.round === ids.length - 1) lastReply.kind = "answer";
+  return { steps, inFlight };
 }
 
 function turnStats(cycles, turnId, steps) {
@@ -398,36 +421,32 @@ function turnStats(cycles, turnId, steps) {
     });
     (c.hookEvents || []).forEach((h) => (h.after || "").replace(TOKEN_RE, (t) => tokens.add(t)));
   });
-  return {
-    tokens: tokens.size,
-    rounds: ids.length,
-    tools: steps.filter((s) => s.kind === "pre").length,
-  };
+  return { tokens: tokens.size, rounds: ids.length, tools: steps.filter((s) => s.kind === "pre").length };
 }
 
 // ------------------------------------------------------------------ step cards
 const STEP_META = {
   prompt: { title: "Your prompt", where: "veil gateway", c: "var(--token)",
-    why: "Detected values are replaced with stable tokens before the request leaves the machine.",
+    why: "Personal values are replaced with tokens before the request leaves the machine.",
     bl: ["What you typed", "What Claude receives"] },
   claude: { title: "Claude decides what to do", where: "Claude API", c: "var(--api)",
-    why: "Claude works with tokens only, and asks for a local tool when it needs data.",
+    why: "Claude only works with tokens. When it needs data, it asks to run a local command.",
     bl: ["Claude's reply (tokens)", "On your screen"] },
   pre: { title: "Tool call: tokens back to real values", where: "PreToolUse hook · local", c: "var(--detoken)",
-    why: "The command Claude wrote uses tokens; the hook resolves them so the local database sees the real values.",
+    why: "Claude's command uses tokens. The hook puts the real values back, so the local database finds the rows.",
     bl: ["Command from Claude", "Command that runs locally"] },
   post: { title: "Tool result: real values back to tokens", where: "PostToolUse hook · local", c: "var(--token)",
-    why: "The query result holds customer data; it is tokenized before it goes back to Claude.",
+    why: "The result has customer data. It is tokenized before it goes back to Claude.",
     bl: ["Database output (local)", "What goes back to Claude"] },
   answer: { title: "The answer", where: "veil gateway", c: "var(--detoken)",
-    why: "Claude answers with tokens; the gateway resolves them for you on the way back.",
+    why: "Claude answers with tokens. The gateway puts the real values back for your screen.",
     bl: ["Claude's answer (tokens)", "On your screen"] },
 };
 
-function Box({ label, tag, c2, children, single }) {
+function Box({ label, children }) {
   return (
-    <div className={"box" + (single ? " single" : "")} style={{ "--c2": c2 }}>
-      <div className="bl"><span>{label}</span>{tag && <span className="tag">{tag}</span>}</div>
+    <div className="box">
+      <div className="bl">{label}</div>
       <pre>{children}</pre>
     </div>
   );
@@ -459,12 +478,12 @@ function StepCard({ step, index, current }) {
     metaText = `${countTokens(step.before)} token(s) resolved`;
   }
   return (
-    <div className={"step" + (current ? " current" : "")} style={{ "--c": error ? "var(--danger)" : meta.c }} id={`step-${index}`}>
+    <div className={"step" + (current ? " current" : "")} style={{ "--c": error ? "var(--danger)" : meta.c }} data-step={index}>
       <div className="step-head">
         <span className="idx">{index + 1}</span>
         <span className="t">{meta.title}{error ? " — failed" : ""}</span>
         <span className="where">{meta.where}</span>
-        <span className="meta">{metaText} · {new Date(step.at || step.hook?.timestamp).toLocaleTimeString()}</span>
+        <span className="meta">{metaText} · {new Date(step.at).toLocaleTimeString()}</span>
       </div>
       <div className="why">{meta.why}</div>
       <div className="ba">
@@ -477,33 +496,87 @@ function StepCard({ step, index, current }) {
 }
 
 // ------------------------------------------------------------------ sidebar
-function AuditPane() {
-  const [rows, setRows] = useState([]);
-  useEventSource("/veil-panel/audit-stream", (e) => setRows((prev) => [{ ...e, _k: Math.random() }, ...prev].slice(0, 60)));
+function AskBox({ onStarted, onRunning }) {
+  const [text, setText] = useState("");
+  const [state, setState] = useState({ running: false, enabled: true });
+  const [error, setError] = useState("");
+  const poll = useCallback(() => {
+    fetch("/veil-panel/ask").then((r) => r.json()).then(setState).catch(() => {});
+  }, []);
+  useEffect(() => { poll(); }, [poll]);
+  useEffect(() => { onRunning(!!state.running); }, [state.running]);
+  useEffect(() => {
+    if (!state.running) return;
+    const id = setInterval(poll, 1000);
+    return () => clearInterval(id);
+  }, [state.running, poll]);
+
+  const run = () => {
+    const prompt = text.trim();
+    if (!prompt || state.running) return;
+    setError("");
+    fetch("/veil-panel/ask", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }),
+    })
+      .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+      .then(({ ok, d }) => {
+        if (!ok) { setError(d.error || "could not start"); return; }
+        setState(d);
+        onStarted();
+      })
+      .catch(() => setError("gateway unreachable"));
+  };
+
+  let status = null;
+  if (!state.enabled) status = <div className="ask-status err">Disabled: start the gateway with scripts/run-gateway.sh</div>;
+  else if (error) status = <div className="ask-status err">{error}</div>;
+  else if (state.running) status = <div className="ask-status"><span className="dot-pulse" /> Running… {Math.round(state.elapsed || 0)} s</div>;
+  else if (state.exit_code === 0) status = <div className="ask-status ok">Done in {Math.round(state.seconds)} s</div>;
+  else if (state.exit_code !== undefined) status = <div className="ask-status err">Failed ({state.exit_code === null ? "no exit code" : `exit ${state.exit_code}`})</div>;
+
   return (
-    <section>
-      <h2>Audit log <span className="spacer" /> <span className="muted">no values, ever</span></h2>
-      <div className="scroll">
-        <table>
-          <thead><tr><th>Time</th><th>Where</th><th>Detector</th><th>Token</th></tr></thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r._k} className="audit-new">
-                <td>{new Date(r.timestamp).toLocaleTimeString()}</td>
-                <td>{(r.adapter || "").replace("hooks:", "")}</td>
-                <td>{r.detector}</td>
-                <td className="mono">{r.token}</td>
-              </tr>
-            ))}
-            {!rows.length && <tr><td colSpan="4" className="muted">Waiting for tokens…</td></tr>}
-          </tbody>
-        </table>
+    <div className="ask">
+      <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Ask about the demo database…"
+        onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); run(); } }}
+        disabled={state.running} />
+      <div className="ask-row">
+        <button className="link" onClick={() => setText(DEMO_PROMPT)} disabled={state.running}>use the demo prompt</button>
+        <span className="spacer" />
+        <button className="accent" onClick={run} disabled={state.running || !text.trim() || !state.enabled}>Run ▶</button>
       </div>
-    </section>
+      {status}
+      {!state.running && state.output && state.exit_code !== 0 && (
+        <details><summary>output</summary><pre>{state.output}</pre></details>
+      )}
+    </div>
   );
 }
 
-function VaultPane() {
+function AuditPane({ hidden }) {
+  const [rows, setRows] = useState([]);
+  useEventSource("/veil-panel/audit-stream", (e) => setRows((prev) => [{ ...e, _k: Math.random() }, ...prev].slice(0, 80)));
+  return (
+    <div hidden={hidden}>
+      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>Every token created. Never a value.</div>
+      <table>
+        <thead><tr><th>Time</th><th>Where</th><th>Detector</th><th>Token</th></tr></thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r._k} className="audit-new">
+              <td>{new Date(r.timestamp).toLocaleTimeString()}</td>
+              <td>{(r.adapter || "").replace("hooks:", "")}</td>
+              <td>{r.detector}</td>
+              <td className="mono">{r.token}</td>
+            </tr>
+          ))}
+          {!rows.length && <tr><td colSpan="4" className="muted">Waiting for tokens…</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function VaultPane({ hidden }) {
   const [mappings, setMappings] = useState([]);
   const [revealed, setRevealed] = useState({});
   const [filter, setFilter] = useState("");
@@ -523,34 +596,31 @@ function VaultPane() {
   };
   const shown = mappings.filter((m) => !filter || m.token.includes(filter.toUpperCase()));
   return (
-    <section>
-      <h2>Vault <span className="spacer" /> <span className="muted">AES-GCM · {mappings.length} tokens</span></h2>
-      <input placeholder="filter, e.g. IBAN" value={filter} onChange={(e) => setFilter(e.target.value)}
-        style={{ width: "100%", marginBottom: 6, background: "#0f131b", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 6, padding: "4px 8px" }} />
-      <div className="scroll">
-        <table>
-          <thead><tr><th>Token</th><th>Stored as</th><th></th></tr></thead>
-          <tbody>
-            {shown.slice(0, 200).map((m) => {
-              const k = key(m);
-              return (
-                <tr key={k}>
-                  <td className="mono">{m.token}</td>
-                  <td className="mono muted" title={m.ciphertext_b64}>
-                    {revealed[k] !== undefined ? <span style={{ color: "var(--detoken)" }}>{revealed[k]}</span> : m.ciphertext_b64.slice(0, 14) + "…"}
-                  </td>
-                  <td>
-                    {revealed[k] !== undefined
-                      ? <button className="small" onClick={() => setRevealed((p) => { const n = { ...p }; delete n[k]; return n; })}>Hide</button>
-                      : <button className="small" onClick={() => reveal(m)}>Reveal</button>}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </section>
+    <div hidden={hidden}>
+      <input className="filter" placeholder="filter, e.g. IBAN" value={filter} onChange={(e) => setFilter(e.target.value)} />
+      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>AES-GCM · {mappings.length} tokens</div>
+      <table>
+        <thead><tr><th>Token</th><th>Stored as</th><th></th></tr></thead>
+        <tbody>
+          {shown.slice(0, 200).map((m) => {
+            const k = key(m);
+            return (
+              <tr key={k}>
+                <td className="mono">{m.token}</td>
+                <td className="mono muted" title={m.ciphertext_b64}>
+                  {revealed[k] !== undefined ? <span style={{ color: "var(--detoken)" }}>{revealed[k]}</span> : m.ciphertext_b64.slice(0, 14) + "…"}
+                </td>
+                <td>
+                  {revealed[k] !== undefined
+                    ? <button className="small" onClick={() => setRevealed((p) => { const n = { ...p }; delete n[k]; return n; })}>Hide</button>
+                    : <button className="small" onClick={() => reveal(m)}>Reveal</button>}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -561,11 +631,14 @@ function App() {
   const [selected, setSelected] = useState(null);
   const [follow, setFollow] = useState(true);
   const [flow, setFlow] = useState(null);
-  const [replay, setReplay] = useState(null); // number of steps shown while replaying
-  const followRef = useRef(true);
+  const [replay, setReplay] = useState(null); // steps shown while replaying
+  const [tab, setTab] = useState("turns");
+  const [askRunning, setAskRunning] = useState(false);
+  const followRef = useRef(follow);
   followRef.current = follow;
   const known = useRef(new Set());
-  const lastAnimated = useRef({});
+  const animated = useRef({});
+  const stepsRef = useRef(null);
 
   useEventSource("/veil-panel/pipeline-stream", (ev) => {
     const { request_id, stage, text, spans, timestamp, kind, parent_request_id } = ev;
@@ -593,25 +666,27 @@ function App() {
   });
 
   const turns = order.filter((id) => cycles[id] && !(cycles[id].parentRequestId && cycles[cycles[id].parentRequestId]));
+  const latest = turns[turns.length - 1];
   const { steps, inFlight } = useMemo(() => (selected ? buildSteps(cycles, selected) : { steps: [], inFlight: false }), [cycles, selected]);
   const stats = selected ? turnStats(cycles, selected, steps) : null;
   const visible = replay == null ? steps : steps.slice(0, replay);
 
-  // Live: animate each step the first time it appears on the selected turn.
+  const scrollTo = (index, block) => {
+    const box = stepsRef.current;
+    const el = box && box.querySelector(`[data-step="${index}"]`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block });
+  };
+
+  // Live: animate each new step of the selected turn; scroll only when following.
   useEffect(() => {
     if (replay != null || !selected) return;
-    const seen = lastAnimated.current[selected] || 0;
-    if (steps.length > seen) {
-      const s = steps[steps.length - 1];
-      lastAnimated.current[selected] = steps.length;
-      if (!s.at || s.at < PAGE_LOADED_AT) return;
-      setFlow({ kind: s.kind, key: `${s.key}-${Date.now()}` });
-      lastAnimated.current[selected] = steps.length;
-      setTimeout(() => {
-        const el = document.getElementById(`step-${steps.length - 1}`);
-        if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }, 60);
-    }
+    const seen = animated.current[selected] || 0;
+    if (steps.length <= seen) return;
+    animated.current[selected] = steps.length;
+    const s = steps[steps.length - 1];
+    if (!s.at || s.at < PAGE_LOADED_AT) return;
+    setFlow({ kind: s.kind, key: `${s.key}-${Date.now()}` });
+    if (followRef.current) setTimeout(() => scrollTo(steps.length - 1, "end"), 60);
   }, [steps, selected, replay]);
 
   // Replay: reveal the selected turn's steps one at a time.
@@ -619,57 +694,82 @@ function App() {
     if (replay == null) return;
     if (replay > 0 && replay <= steps.length) {
       const s = steps[replay - 1];
-      setFlow({ kind: s.kind, key: `${s.key}-replay-${Date.now()}` });
-      setTimeout(() => {
-        const el = document.getElementById(`step-${replay - 1}`);
-        if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
-      }, 60);
+      setFlow({ kind: s.kind, key: `${s.key}-replay-${replay}` });
+      setTimeout(() => scrollTo(replay - 1, "center"), 60);
     }
-    if (replay >= steps.length) {
-      const t = setTimeout(() => setReplay(null), REPLAY_STEP_MS);
-      return () => clearTimeout(t);
-    }
-    const t = setTimeout(() => setReplay((n) => (n == null ? null : n + 1)), replay === 0 ? 400 : REPLAY_STEP_MS);
+    const done = replay >= steps.length;
+    const t = setTimeout(() => setReplay(done ? null : replay + 1), done ? REPLAY_STEP_MS : replay === 0 ? 300 : REPLAY_STEP_MS);
     return () => clearTimeout(t);
-  }, [replay, steps]);
+    // `steps` only grows; re-running on its identity would restart the timer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [replay]);
 
   const select = (id) => {
     setReplay(null);
     setSelected(id);
-    setFollow(id === turns[turns.length - 1]);
-    lastAnimated.current[id] = buildSteps(cycles, id).steps.length;
+    setFollow(id === latest);
+    animated.current[id] = buildSteps(cycles, id).steps.length;
     setFlow(null);
+  };
+  const toggleFollow = (on) => {
+    setFollow(on);
+    if (on && latest && latest !== selected) select(latest);
   };
 
   return (
     <div className="app">
-      <div className="main">
-        <header className="top">
-          <h1><b>veil</b> — what leaves your machine</h1>
-          <span className="sub">live from the gateway and the hooks</span>
-          <span className="spacer" />
-          <button className="primary" disabled={!steps.length || replay != null} onClick={() => setReplay(0)}>▶ Replay this turn</button>
-          {replay != null && <button onClick={() => setReplay(null)}>Stop</button>}
-          <a href="/veil-panel" title="the previous panel">classic panel</a>
-        </header>
-        {stats && (
-          <div className="stats">
-            <div className="stat good"><div className="v">{stats.tokens}</div><div className="l">distinct values kept local</div></div>
-            <div className="stat"><div className="v">{stats.tools}</div><div className="l">local tool calls</div></div>
-            <div className="stat"><div className="v">{stats.rounds}</div><div className="l">requests to the Claude API</div></div>
-            <div className="stat"><div className="v">{inFlight ? "running" : "done"}</div><div className="l">turn status</div></div>
-          </div>
-        )}
-        <Diagram flow={flow} />
-        <div className="legend">
-          <span><i style={{ background: "var(--regex)" }} />regex (check digits)</span>
-          <span><i style={{ background: "var(--llm)" }} />local LLM</span>
-          <span><i style={{ background: "var(--encoder)" }} />GLiNER encoder</span>
-          <span><i style={{ background: "var(--token)" }} />token</span>
-          <span><i style={{ background: "var(--detoken)" }} />real value, resolved locally</span>
+      <aside className="side">
+        <div className="brand"><b>veil</b><span>what leaves your machine</span></div>
+        <AskBox onStarted={() => { setReplay(null); setFollow(true); }} onRunning={setAskRunning} />
+        <div className="tabs">
+          {[["turns", `Turns (${turns.length})`], ["vault", "Vault"], ["audit", "Audit log"]].map(([id, label]) => (
+            <button key={id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
+          ))}
         </div>
-        <div className="steps">
-          {!selected && <div className="empty">Run <code>scripts/ask.sh --demo-db "…"</code> — the turn appears here as it happens.</div>}
+        <div className="tab-body">
+          <div hidden={tab !== "turns"}>
+            {[...turns].reverse().map((id) => {
+              const c = cycles[id];
+              const t = (c.stages.tokenized && c.stages.tokenized.text) || (c.stages.received && c.stages.received.text) || "…";
+              return (
+                <button key={id} className={"turn" + (id === selected ? " sel" : "")} onClick={() => select(id)}>
+                  <div className="p">{renderTokens(t.slice(0, 120))}</div>
+                  <div className="m">{new Date(c.firstSeenAt).toLocaleTimeString()}</div>
+                </button>
+              );
+            })}
+            {!turns.length && <div className="muted">No turns yet. Run a prompt above.</div>}
+          </div>
+          <VaultPane hidden={tab !== "vault"} />
+          <AuditPane hidden={tab !== "audit"} />
+        </div>
+      </aside>
+      <main className="main">
+        <div className="top">
+          <div className="bar">
+            {stats && <>
+              <div className="stat good"><span className="v">{stats.tokens}</span><span className="l">values kept local</span></div>
+              <div className="stat"><span className="v">{stats.tools}</span><span className="l">local tool calls</span></div>
+              <div className="stat"><span className="v">{stats.rounds}</span><span className="l">API requests</span></div>
+              <div className="stat"><span className="v">{inFlight || (askRunning && selected === latest) ? "running" : "done"}</span></div>
+            </>}
+            <span className="spacer" />
+            <label className="follow"><input type="checkbox" checked={follow} onChange={(e) => toggleFollow(e.target.checked)} /> follow latest</label>
+            <button className="primary" disabled={!steps.length || replay != null} onClick={() => setReplay(0)}>▶ Replay this turn</button>
+            {replay != null && <button onClick={() => setReplay(null)}>Stop</button>}
+            <a href="/veil-panel" style={{ color: "#7fb4ff", fontSize: 13 }}>classic panel</a>
+          </div>
+          <Diagram flow={flow} />
+          <div className="legend">
+            <span><i style={{ background: "var(--regex)" }} />regex</span>
+            <span><i style={{ background: "var(--llm)" }} />local LLM</span>
+            <span><i style={{ background: "var(--encoder)" }} />GLiNER</span>
+            <span><i style={{ background: "var(--token)" }} />token</span>
+            <span><i style={{ background: "var(--detoken)" }} />real value, resolved locally</span>
+          </div>
+        </div>
+        <div className="steps" ref={stepsRef}>
+          {!selected && <div className="empty">Type a prompt on the left. The turn appears here as it happens.</div>}
           {visible.map((s, i) => (
             <StepCard key={s.key} step={s} index={i} current={replay != null ? i === replay - 1 : i === visible.length - 1 && inFlight} />
           ))}
@@ -677,29 +777,7 @@ function App() {
             <div className="waiting"><span className="dot-pulse" /> waiting for the next step…</div>
           )}
         </div>
-      </div>
-      <aside className="side">
-        <section>
-          <h2>Turns <span className="spacer" />
-            <label className="muted" style={{ textTransform: "none", letterSpacing: 0 }}>
-              <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> follow latest
-            </label>
-          </h2>
-          {[...turns].reverse().map((id) => {
-            const c = cycles[id];
-            const t = (c.stages.tokenized && c.stages.tokenized.text) || (c.stages.received && c.stages.received.text) || "…";
-            return (
-              <button key={id} className={"turn" + (id === selected ? " sel" : "")} onClick={() => select(id)}>
-                <div className="p">{renderTokens(t.slice(0, 90))}</div>
-                <div className="m">{new Date(c.firstSeenAt).toLocaleTimeString()}</div>
-              </button>
-            );
-          })}
-          {!turns.length && <div className="muted">No turns yet.</div>}
-        </section>
-        <AuditPane />
-        <VaultPane />
-      </aside>
+      </main>
     </div>
   );
 }

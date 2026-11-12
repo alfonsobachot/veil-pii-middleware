@@ -40,6 +40,10 @@ fi
 # (about 8 KB of query output), which the demo model does produce.
 export VEIL_LLM_TIMEOUT="${VEIL_LLM_TIMEOUT:-120}"
 
+# Lets the flow panel's prompt box run `scripts/ask.sh --demo-db` (see
+# adapters/gateway/panel_ask.py). Set VEIL_PANEL_ASK=0 to turn it off.
+export VEIL_PANEL_ASK="${VEIL_PANEL_ASK:-1}"
+
 # Optional encoder layer, unioned with regex and the LLM in the gateway only
 # (the hooks never load it). The presentation demo runs with
 #   VEIL_ENCODER=gliner:urchade/gliner_multi_pii-v1

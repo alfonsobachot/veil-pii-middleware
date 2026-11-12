@@ -26,12 +26,14 @@ Run everything from Git Bash.
    scripts/run-gateway.sh
    ```
 
-3. Terminal 2, the same two `VEIL_LLM_*` exports, then the prompt below. The hooks only use
-   the LLM when it is exported in the shell that runs `ask.sh`; they inherit that shell's
-   environment, not the gateway's.
+3. Browser: open `http://127.0.0.1:8787/veil-panel/flow`. It works offline (vendored
+   scripts). Type the prompt in the box at the top left (or click "use the demo prompt") and
+   press Enter: the gateway runs `scripts/ask.sh --demo-db` itself, with its own `VEIL_LLM_*`
+   settings, so no second terminal is needed. The classic panel stays at `/veil-panel`.
 
-4. Browser: open `http://127.0.0.1:8787/veil-panel/flow` before running the prompt. It works
-   offline (vendored scripts). The classic panel stays at `/veil-panel` as a fallback.
+4. Fallback without the box: a second terminal with the same two `VEIL_LLM_*` exports, then
+   the command below. The hooks only use the LLM when it is exported in the shell that runs
+   `ask.sh`.
 
 ## Showing it
 

@@ -116,11 +116,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 from urllib.parse import unquote, urlsplit
 
 import httpx
 
+from veil_pii_middleware.adapters.gateway.panel_ask import MAX_PROMPT_CHARS, AskRunner
 from veil_pii_middleware.core.audit import AuditLog
 from veil_pii_middleware.core.detector import (
     LLMClient,
@@ -1427,6 +1428,9 @@ def make_handler(
     #: having to paste one in -- this is a single-active-debugging-session
     #: demo tool, not a multi-tenant dashboard.
     last_session_id: dict[str, str] = {}
+    #: The flow panel's prompt box runner, built on first use (it needs the
+    #: port this server is listening on).
+    ask_runner: dict[str, AskRunner] = {}
 
     class GatewayHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1665,10 +1669,71 @@ def make_handler(
             if path == f"{_PANEL_PREFIX}/hook-event" and self.command == "POST":
                 self._serve_hook_event()
                 return True
+            if path == f"{_PANEL_PREFIX}/ask" and self.command == "GET":
+                _write_json(self, 200, self._ask_runner().status())
+                return True
+            if path == f"{_PANEL_PREFIX}/ask" and self.command == "POST":
+                self._serve_ask()
+                return True
             if path.startswith(f"{_PANEL_PREFIX}/"):
                 _write_json(self, 404, {"error": f"no panel route for {self.command} {path}"})
                 return True
             return False
+
+        def _ask_runner(self) -> AskRunner:
+            if "runner" not in ask_runner:
+                port = cast(ThreadingHTTPServer, self.server).server_port
+                ask_runner["runner"] = AskRunner(f"http://127.0.0.1:{port}")
+            return ask_runner["runner"]
+
+        def _serve_ask(self) -> None:
+            """Run a prompt typed in the flow panel (see ``panel_ask``).
+
+            Answers 403 when disabled or posted from another origin, 415 for a
+            non-JSON body (a cross-origin JSON post needs a CORS preflight this
+            server never grants), 400 for a bad body, 409 while a run is going
+            and 202 once the run has started.
+            """
+            try:
+                raw = _read_panel_body(self)
+            except _PanelBodyError as exc:
+                _write_json(self, exc.status, {"error": exc.message})
+                return
+            runner = self._ask_runner()
+            if not runner.enabled():
+                _write_json(
+                    self, 403, {"error": "disabled: start the gateway with VEIL_PANEL_ASK=1"}
+                )
+                return
+            port = cast(ThreadingHTTPServer, self.server).server_port
+            origin = self.headers.get("Origin")
+            if origin is not None and origin not in (
+                f"http://127.0.0.1:{port}",
+                f"http://localhost:{port}",
+            ):
+                _write_json(self, 403, {"error": "only the panel itself may post a prompt"})
+                return
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+            if content_type != "application/json":
+                _write_json(self, 415, {"error": "the body must be application/json"})
+                return
+            try:
+                payload = json.loads(raw)
+                prompt = payload["prompt"].strip()
+                if not prompt or len(prompt) > MAX_PROMPT_CHARS:
+                    raise ValueError("prompt length")
+            except Exception:
+                _write_json(
+                    self,
+                    400,
+                    {"error": f'body must be {{"prompt": "..."}}, 1-{MAX_PROMPT_CHARS} characters'},
+                )
+                return
+            error = runner.start(prompt)
+            if error is not None:
+                _write_json(self, 409, {"error": error})
+                return
+            _write_json(self, 202, runner.status())
 
         def _default_session_id(self) -> str:
             return last_session_id.get("value", fallback_session_id)

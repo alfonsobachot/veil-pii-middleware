@@ -346,8 +346,10 @@ needed (React and Babel are vendored). Shows the **live** session, not a recordi
   showing its text before and after: the prompt as typed and as Claude receives it, each
   command Claude wrote (tokens) and the one that runs locally (real values), each query result
   (real values) and what goes back to Claude (tokens), and the final answer. **Replay this
-  turn** walks through a finished turn step by step. Turn list, audit log and vault in a
-  sidebar.
+  turn** walks through a finished turn step by step. The left sidebar has a prompt box that
+  runs `scripts/ask.sh --demo-db` for you (`POST /veil-panel/ask`; on only with
+  `VEIL_PANEL_ASK=1`, which `scripts/run-gateway.sh` sets; same-origin JSON only, one run at
+  a time), then the turn list, the vault and the audit log.
 - **Classic view** at `/veil-panel`, described below.
 
 **One screen per logical request, not per HTTP call.** A single question can take several
