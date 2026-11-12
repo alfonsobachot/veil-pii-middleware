@@ -398,64 +398,58 @@ project and was flagged for explicit human sign-off during development.
 ## 8. Metrics
 
 `demo/eval.py` sweeps every cell the seeded ground-truth manifest points at, runs it through
-the detector, and reports recall/precision per entity type and per detector. Numbers below are
-from a live run against this repo's current code and a real LM Studio instance
-(`qwen_qwen3-4b-instruct-2507`, LAN-local), demo corpus: 20 customers, 50 users, 100 invoices,
-30 support tickets, 200 log lines, 30 webhooks.
+the detector, and reports recall/precision per entity type and per detector. Corpus: 1,063
+cells, 2,590 ground-truth PII instances (at least 100 per type), 194 decoys.
 
-**`--mode regex`** (the gated mode — `--min-recall 1.0`, `--max-false-positives 0`):
+**`--mode regex`** (the gated mode — `--min-recall 1.0`, `--max-false-positives 0`), from the
+2026-11-12 run:
 
 ```
 entity      support   found  missed    fp   recall    prec
 ----------------------------------------------------------
-CARD             30      30       0     0    1.000   1.000
-DNI              46      46       0     0    1.000   1.000
-EMAIL            80      80       0     0    1.000   1.000
-IBAN            100     100       0     0    1.000   1.000
-IP              200     200       0     0    1.000   1.000
-NIE               4       4       0     0    1.000   1.000
-PERSON          250       0     250     0    0.000   1.000  (not gated — no regex can prove a name)
-PHONE            33      33       0     0    1.000   1.000
+ADDRESS         152       0     152     0    0.000   1.000  (not gated)
+CARD            101     101       0     0    1.000   1.000
+CIF             101     101       0     0    1.000   1.000
+DNI             154     154       0     0    1.000   1.000
+DOB             153       0     153     0    0.000   1.000  (not gated)
+EMAIL           106     106       0     0    1.000   1.000
+GPS             100     100       0     0    1.000   1.000
+IBAN            108     108       0     0    1.000   1.000
+IP              202     202       0     0    1.000   1.000
+MAC             100     100       0     0    1.000   1.000
+NIE             100     100       0     0    1.000   1.000
+NSS             100     100       0     0    1.000   1.000
+ORG             101       0     101     0    0.000   1.000  (not gated)
+PERSON          456       0     456     0    0.000   1.000  (not gated)
+PHONE           155     155       0     0    1.000   1.000
+PLATE           100     100       0     0    1.000   1.000
+SECRET          100     100       0     0    1.000   1.000
+SENSITIVE       101       0     101     0    0.000   1.000  (not gated)
+USERNAME        100       0     100     0    0.000   1.000  (not gated)
 
 PASS — every structured entity type is at or above 1.00 recall
+timing: 0.1s over 1063 cells (0.1 ms/cell)
 decoys: 0 false positive(s) (max allowed 0) — PASS
 ```
 
-**`--mode union`** (regex + LLM, the project's actual target configuration):
-
-```
-entity      support   found  missed    fp   recall    prec
-----------------------------------------------------------
-CARD             30      30       0     0    1.000   1.000
-DNI              46      46       0     0    1.000   1.000
-EMAIL            80      80       0     0    1.000   1.000
-IBAN            100     100       0     0    1.000   1.000
-IP              200     200       0     0    1.000   1.000
-NIE               4       4       0     0    1.000   1.000
-PERSON          250     244       6    14    0.976   0.946  (not gated)
-PHONE            33      33       0     0    1.000   1.000
-
-PASS — every structured entity type is at or above 1.00 recall
-decoys: 6 false positive(s) (max allowed 0) — see §9
-```
-
-Union recovers 100% recall on every structured (check-digit-provable) type — regex fills every
-LLM miss or mislabel via the regex-first merge rule — plus 97.6% recall on
-`PERSON`, which no regex could ever provide. `--mode llm` alone (not reproduced in full here;
-see `--mode llm` in the table logic above) scores measurably worse per type on its own — e.g.
-DNI recall drops without regex backing it up — which is exactly the comparison this evaluation
-exists to make visible.
+**`--mode union`** with qwen3 4b, the demo's LLM: the 13 structured types stay at 100%, and the
+soft types reach recall 0.907 at precision 0.986 (PERSON 435/456, ORG 91/101, ADDRESS
+149/152, DOB 151/153, USERNAME 98/100, SENSITIVE 40/101), at 321 ms per cell. Health data is
+the weak spot. [`docs/benchmarks.md`](docs/benchmarks.md) compares it with two larger LLMs and
+five encoder models: qwen3.8 27b reaches 0.987 recall at 2.1 s per cell; GLiNER-PII 0.913 at
+18 ms per cell, noisier. The demo gateway runs qwen3 4b and GLiNER together because they miss
+different things.
 
 **What this measures, and what it doesn't.** Recall/precision are computed against a fully
 synthetic, seeded corpus with known ground truth — a controlled measurement, not a claim about
-arbitrary real-world text. The gate (`--mode regex`, exit code) only binds the seven
-check-digit-provable types; `PERSON`/`ADDRESS` are reported (`not gated`) because no regex
+arbitrary real-world text. The gate (`--mode regex`, exit code) only binds the 13
+structured types; the soft types (`PERSON`, `ADDRESS`, ...) are reported (`not gated`) because no regex
 could ever satisfy a 100%-recall gate for them, and hiding that number would misrepresent the
 system's actual guarantee. The decoy check (a set of deliberately invalid or PII-shaped
 non-PII values that must never be detected) is scored against whichever layer(s) the chosen
 `--mode` enables; outside `--mode regex` it is report-only, and any mode exits 2 when a
-detection layer call fails — see §9 for what the `--mode union`/`--mode llm` decoy failures above
-actually mean.
+detection layer call fails. Soft-layer decoy hits (qwen3 4b: 4 of 194) are over-tokenization,
+not leaks.
 
 ---
 
