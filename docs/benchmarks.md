@@ -50,7 +50,8 @@ categories); 1,063 instances.
 |---|---|---|---|---|---|---|---|---|
 | qwen3.8:27b-q4_K_M ¹ | LLM, 27.8B dense | 0.987 | 0.997 | 0.992 | 0.989 | 3 | 7 | 2060.1 |
 | gpt-oss:20b | LLM, 21B MoE | 0.950 | 0.995 | 0.972 | 0.959 | 5 | 3 | 821.9 |
-| qwen3:4b-instruct-2507-q4_K_M | LLM, 4B (demo default) | 0.907 | 0.986 | 0.945 | 0.922 | 14 | 4 | 321.0 |
+| qwen3:4b + GLiNER-PII ² | regex + LLM + encoder (demo config) | 0.958 | 0.769 | 0.853 | 0.913 | 305 | 51 | 340.8 |
+| qwen3:4b-instruct-2507-q4_K_M | LLM, 4B | 0.907 | 0.986 | 0.945 | 0.922 | 14 | 4 | 321.0 |
 | urchade/gliner_multi_pii-v1 | Encoder, GLiNER (mDeBERTa) | 0.913 | 0.769 | 0.835 | 0.880 | 291 | 47 | 17.6 |
 | fastino/gliner2-privacy-filter-PII-multi | Encoder, GLiNER2 | 0.856 | 0.717 | 0.780 | 0.824 | 359 | 75 | 16.6 |
 | OpenMed/privacy-filter-multilingual-v2 | Encoder, MoE token classifier | 0.610 | 0.994 | 0.756 | 0.661 | 4 | 16 | 137.5 |
@@ -63,12 +64,18 @@ categories); 1,063 instances.
 |---|---|---|---|---|---|---|
 | qwen3.8:27b-q4_K_M | 453/456 | 100/101 | 151/152 | 146/153 | 99/100 | 100/101 |
 | gpt-oss:20b | 426/456 | 99/101 | 149/152 | 153/153 | 99/100 | 84/101 |
+| qwen3:4b + GLiNER-PII | 456/456 | 101/101 | 151/152 | 153/153 | 100/100 | 57/101 |
 | qwen3:4b-instruct-2507-q4_K_M | 435/456 | 91/101 | 149/152 | 151/153 | 98/100 | 40/101 |
 | gliner_multi_pii-v1 | 456/456 | 99/101 | 127/152 | 153/153 | 93/100 | 42/101 |
 | gliner2-privacy-filter-PII-multi | 452/456 | 74/101 | 72/152 | 153/153 | 100/100 | 59/101 |
 | privacy-filter-multilingual-v2 | 378/456 | 6/101 | 101/152 | 73/153 | 90/100 | 0/101 |
 | xlm-roberta-large-finetuned-conll02-spanish | 432/456 | 83/101 | 0/152 | 0/153 | 29/100 | 4/101 |
 | bert-spanish-cased-finetuned-ner | 348/456 | 58/101 | 0/152 | 0/153 | 1/100 | 0/101 |
+
+² Measured on 2026-11-13 with the new `--mode all` (regex + LLM + encoder, the gateway's
+full configuration), same corpus and detector code. Together the two small detectors find
+95.8% of the soft values, but GLiNER's noise stays (precision 0.769) and health data is
+still the gap (57/101).
 
 ¹ One of the 1,063 cells got an empty response from qwen3.8 and fell back to regex-only for
 that cell (the run exited 2). Its numbers are therefore a lower bound by at most that cell;
@@ -110,6 +117,28 @@ tagging two order numbers as phones.
   For a deployment that must protect it, the 27B model (or a dedicated classifier) is the
   realistic option.
 
+## The demo turn, end to end
+
+Measured on 2026-11-12/13: the presentation prompt (`docs/demo-script.md`) through the real
+gateway, hooks and Claude API, with a recording proxy between the gateway and the API. A leak
+is any of the 22 synthetic values of the demo customer in clear in a forwarded request.
+
+| Gateway configuration | Runs | Turn time (s) | Median | Demo PII leaked |
+|---|---|---|---|---|
+| regex + qwen3.8 27B | 6 | 71, 96, 101, 107, 115, 115 | 104 s | 0 of 6 runs |
+| regex + qwen3.8 27B + GLiNER | 3 | 173, 252, 300 | 252 s | 0 of 3 runs |
+| regex + qwen3 4B + GLiNER (rehearsed demo) | 2 | 63, 181 | 122 s | 0 of 2 runs |
+| regex + qwen3 4B (2026-11-11) | 8 | — | — | 5 of 8 runs |
+
+- qwen3.8 alone is as fast as the rehearsed setup and leaked nothing in 6 runs. The hooks call
+  the 27B model too, so every tool result goes through it.
+- qwen3.8 with GLiNER loads 21.7 of the GPU's 24 GB and every call slows down: about 2.5x
+  slower, no gain in leaks.
+- Separate from the detectors: when the model runs `which`, the printed PATH holds the
+  Windows username (`/c/Users/<user>/bin`), and no layer tags it (1 of 6 runs with qwen3.8,
+  1 of 2 with qwen3 4B + GLiNER). It is not demo data; `scripts/ask.sh` already strips `$HOME`
+  from its own PATH, but Claude Code's Bash tool starts a login shell that adds it back.
+
 ## Caveats
 
 - The corpus is synthetic. It compares detectors against each other; it is not an absolute
@@ -117,9 +146,8 @@ tagging two order numbers as phones.
 - One run per configuration. LLMs at temperature 0 are near-deterministic, but timings vary
   with GPU state. The first call of each LLM includes loading it into VRAM, counted in the
   totals.
-- **The demo configuration is not in the table.** The demo gateway runs regex + qwen3 4b +
-  GLiNER together; `eval.py` has no mode for three layers. Its evidence is the recorded demo
-  runs instead (`docs/demo-script.md`: 6 consecutive turns, no PII in any upstream request).
+- The three-layer demo configuration is in the table since 2026-11-13 (`--mode all`). The
+  three-layer run with qwen3.8 27B was not measured (40 GPU minutes on presentation day).
 - Decoy hits by the soft layers are over-tokenization, not leaks: an invalid DNI tagged as a
   person still becomes a token.
 

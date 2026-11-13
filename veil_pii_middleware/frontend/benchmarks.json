@@ -166,6 +166,55 @@
    "demo": false
   },
   {
+   "id": "all-qwen3-4b-gliner",
+   "detector": "qwen3:4b + GLiNER-PII",
+   "family": "combo",
+   "layers": "regex + LLM + GLiNER",
+   "size": "4B + 209M",
+   "recall": 0.957667,
+   "precision": 0.769463,
+   "f1": 0.853311,
+   "f2": 0.913004,
+   "found": 1018,
+   "support": 1063,
+   "soft_fp": 305,
+   "decoys": 51,
+   "ms_per_cell": 340.8,
+   "seconds": 362.3,
+   "by_type": {
+    "PERSON": [
+     456,
+     456
+    ],
+    "ORG": [
+     101,
+     101
+    ],
+    "ADDRESS": [
+     151,
+     152
+    ],
+    "DOB": [
+     153,
+     153
+    ],
+    "USERNAME": [
+     100,
+     100
+    ],
+    "SENSITIVE": [
+     57,
+     101
+    ]
+   },
+   "structured_fp": {
+    "SECRET": 2
+   },
+   "structured_missed": {},
+   "note": null,
+   "demo": true
+  },
+  {
    "id": "enc-urchade_gliner_multi_pii-v1",
    "detector": "urchade/gliner_multi_pii-v1",
    "family": "encoder",
@@ -485,5 +534,117 @@
    }
   ]
  },
- "demo_runs": []
+ "demo_runs": [
+  {
+   "id": "qwen38-only",
+   "label": "qwen3.8:27b",
+   "family": "llm",
+   "layers": "regex + qwen3.8 27B (no GLiNER)",
+   "demo": false,
+   "runs": [
+    {
+     "exit": 0,
+     "seconds": 96,
+     "requests": 8,
+     "leaks": [],
+     "env_leaks": [
+      "alfon"
+     ]
+    },
+    {
+     "exit": 0,
+     "seconds": 115,
+     "requests": 7,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 101,
+     "requests": 9,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 107,
+     "requests": 9,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 71,
+     "requests": 6,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 115,
+     "requests": 9,
+     "leaks": [],
+     "env_leaks": []
+    }
+   ],
+   "note": "Hooks and gateway both call the 27B model. Health data found in the benchmark: 100 of 101."
+  },
+  {
+   "id": "qwen38-gliner",
+   "label": "qwen3.8:27b + GLiNER-PII",
+   "family": "combo",
+   "layers": "regex + qwen3.8 27B + GLiNER",
+   "demo": false,
+   "runs": [
+    {
+     "exit": 0,
+     "seconds": 252,
+     "requests": 6,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 300,
+     "requests": 7,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 173,
+     "requests": 6,
+     "leaks": [],
+     "env_leaks": []
+    }
+   ],
+   "note": "Both models together fill the 24 GB GPU (21.7 GB loaded); every call slows down."
+  },
+  {
+   "id": "qwen4b-gliner",
+   "label": "qwen3:4b + GLiNER-PII",
+   "family": "combo",
+   "layers": "regex + qwen3 4B + GLiNER",
+   "demo": true,
+   "runs": [
+    {
+     "exit": 0,
+     "seconds": 181,
+     "requests": 7,
+     "leaks": [],
+     "env_leaks": []
+    },
+    {
+     "exit": 0,
+     "seconds": 63,
+     "requests": 9,
+     "leaks": [],
+     "env_leaks": [
+      "alfon"
+     ]
+    }
+   ],
+   "note": null
+  }
+ ]
 }
