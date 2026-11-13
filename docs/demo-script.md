@@ -26,6 +26,20 @@ Run everything from Git Bash.
    scripts/run-gateway.sh
    ```
 
+   **Alternative: regex + qwen3.8 27B, no GLiNER** (measured 2026-11-13, see
+   `docs/benchmarks.md` "The demo turn, end to end": median 104 s per turn, 0 of 6 runs
+   leaked; the slides for it are `veil - CactAI Talks v3 (qwen3.8).pptx`). Do not load GLiNER
+   with it: both models fill the 24 GB GPU and turns take 2.5x longer. Unload qwen3 4b first
+   (step 1), then:
+
+   ```bash
+   export VEIL_LLM_BASE_URL=http://127.0.0.1:11434
+   export VEIL_LLM_MODEL=qwen3.8:27b-q4_K_M
+   export VEIL_LLM_REASONING_EFFORT=none
+   unset VEIL_ENCODER
+   scripts/run-gateway.sh
+   ```
+
 3. Browser: open `http://127.0.0.1:8787/veil-panel` (`/veil-panel/flow` still works). It works offline (vendored
    scripts). Type the prompt in the box at the top left (or click "use the demo prompt") and
    press Enter: the gateway runs `scripts/ask.sh --demo-db` itself, with its own `VEIL_LLM_*`
