@@ -53,7 +53,7 @@ scope and known gaps are documented explicitly below rather than glossed over.
   Studio, Ollama, ...). Verified live against LM Studio on a LAN machine running
   `qwen_qwen3-4b-instruct-2507`. The base URL and model are always environment configuration
   (`VEIL_LLM_BASE_URL`, `VEIL_LLM_MODEL`), never a hardcoded host.
-- **Frontend:** one static, unbuilt HTML file (`frontend/panel.html`) — React + Babel Standalone
+- **Frontend:** one static, unbuilt HTML file (`frontend/flow.html`) — React + Babel Standalone
   vendored under `frontend/vendor/` (works offline), no bundler, no new dependency, served
   directly by the gateway process.
 
@@ -337,52 +337,44 @@ detail rather than something a user of this project needs to reason about direct
 
 ## 7. Observability panel
 
-Served by the gateway process itself — no separate process, no CORS to fight, no network
-needed (React and Babel are vendored). Shows the **live** session, not a recording. Two views:
+Served by the gateway process itself at `/veil-panel` — no separate process, no CORS to
+fight, no network needed (React and Babel are vendored). Shows the **live** session, not a
+recording. Two views, switched at the top:
 
-- **Flow view** at `/veil-panel/flow` (the one used in the demo): an animated diagram of the
-  whole path — your prompt → gateway tokenize → Claude API → `PreToolUse` → local database →
-  `PostToolUse` → back to the API → gateway detokenize → your screen — with one card per step
-  showing its text before and after: the prompt as typed and as Claude receives it, each
-  command Claude wrote (tokens) and the one that runs locally (real values), each query result
-  (real values) and what goes back to Claude (tokens), and the final answer. **Replay this
-  turn** walks through a finished turn step by step. The left sidebar has a prompt box that
-  runs `scripts/ask.sh --demo-db` for you (`POST /veil-panel/ask`; on only with
-  `VEIL_PANEL_ASK=1`, which `scripts/run-gateway.sh` sets; same-origin JSON only, one run at
-  a time), then the turn list, the vault and the audit log.
-- **Classic view** at `/veil-panel`, described below.
+- **Flow**: an animated diagram of the whole path — your prompt → gateway tokenize → Claude
+  API → `PreToolUse` → local database → `PostToolUse` → back to the API → gateway detokenize →
+  your screen — with one card per step showing its text before and after: the prompt as typed
+  and as Claude receives it, each command Claude wrote (tokens) and the one that runs locally
+  (real values), each query result (real values) and what goes back to Claude (tokens), and
+  the final answer. The two boxes of a card scroll together. **Replay this prompt** walks
+  through a finished prompt step by step.
+- **Metrics**: the benchmark results of `docs/benchmarks.md` as data
+  (`frontend/benchmarks.json`, served at `/veil-panel/benchmarks`): the soft-layer detector
+  comparison (recall, precision, F1, F2, soft false positives, decoys, ms per cell, sortable),
+  the per-entity-type breakdown, the structured layer and the end-to-end demo runs.
 
-**One screen per logical request, not per HTTP call.** A single question can take several
-gateway round-trips under the hood (the model asks for a tool, gets a result, asks again) —
-the panel groups every round-trip belonging to the same turn under one chip in the selector,
-instead of splitting them across several. Claude Code's own internal traffic that isn't
-something a human typed (a session-title-generation request, an internal safety/harm-classifier
-check, an agent-loop continuation turn) is recognized and hidden from the selector by default,
-behind a "Show hidden" toggle.
+The left sidebar has a prompt box that runs `scripts/ask.sh --demo-db` for you
+(`POST /veil-panel/ask`; on only with `VEIL_PANEL_ASK=1`, which `scripts/run-gateway.sh`
+sets; same-origin JSON only, one run at a time) and three tabs:
 
-- **Four panes, fixed to the turn's own boundary**: pane 1/2 always show what the human actually
-  typed and that same text tokenized on its way out — the turn's *first* round; pane 3/4 always
-  show the model's final answer, tokenized as the API sent it and then resolved for the
-  developer to read — the turn's *latest completed* round. They stay put regardless of how many
-  intermediate tool round-trips happened, and regardless of what's expanded in the sidebar.
-- **Left sidebar timeline**: every stage of the turn (received → tokenized → forwarded → API
-  response → detokenized → displayed), for every round it took, in chronological order — each
-  row expands inline to show that exact step's text. Interleaved with these are the
-  `PreToolUse`/`PostToolUse` events the hooks report on a best-effort basis
-  (`POST /veil-panel/hook-event`, one call per hook run). Each carries the hook's text before
-  and after (option B): the command with tokens and with real values, the tool output with real
-  values and with tokens, each cut to 6,000 characters. Those texts hold real values, so the
-  gateway puts them on the in-memory panel stream only — never in `audit.jsonl`, never
-  upstream.
-- **Audit-log pane**: a live table fed by `/veil-panel/audit-stream` (SSE tail of
-  `.veil/audit.jsonl`) — timestamp, adapter, entity type, detector, token. Never a value.
-- **Vault inspector**: lists every token minted (type, ciphertext, timestamp) across every
-  session the gateway process has seen; revealing the real value behind a specific token is a
-  separate, explicit action, logged (token + session, never the value) but never shown by
-  default.
-- **Metrics tab**: renders `demo/eval.py`'s regex/LLM/union comparison, computed on an explicit
-  request (it's one real LLM call per manifest entry for the LLM/union modes, so it's not
-  recomputed on every page load) and persisted so it survives a gateway restart.
+- **Prompts**: one entry per prompt you typed, in full. A prompt can take several gateway
+  round-trips under the hood (the model asks for a tool, gets a result, asks again); they are
+  grouped under the prompt. Claude Code's own internal traffic (title generation, safety
+  checks, agent-loop continuations) is hidden.
+- **Vault**: the tokens of the selected prompt — its Claude Code session (pipeline events carry
+  the session id), seen in its texts or minted while it ran — with their ciphertext. Revealing
+  the real value behind a token is a separate, explicit action, logged (token + session, never
+  the value). A checkbox widens the list to every session.
+- **Audit log**: every substitution made while the selected prompt ran, from
+  `/veil-panel/audit-stream?backlog=N` (an SSE tail of `.veil/audit.jsonl` that first replays
+  its last N lines, so prompts that ran before the page opened still have their rows) —
+  timestamp, adapter, detector, token. Never a value.
+
+The hooks report their progress on a best-effort basis (`POST /veil-panel/hook-event`, one
+call per hook run). Each event carries the hook's text before and after (option B): the
+command with tokens and with real values, the tool output with real values and with tokens,
+each cut to 6,000 characters. Those texts hold real values, so the gateway puts them on the
+in-memory panel stream only — never in `audit.jsonl`, never upstream.
 
 Start it with `scripts/run-gateway.sh` (§6) and open the panel URL it prints.
 

@@ -868,6 +868,35 @@ class TestAuditStream:
         assert VALID_EMAIL not in results[0]
 
 
+class TestAuditStreamBacklog:
+    def test_replays_the_last_lines_before_tailing(self, servers: _Servers) -> None:
+        """``?backlog=N`` lets a panel opened later see earlier prompts' audit rows."""
+        _post(
+            f"{servers.gateway_url}/v1/messages",
+            json={"messages": [{"role": "user", "content": f"contact {VALID_EMAIL}"}]},
+        )
+        chunk = _read_one_sse_chunk(f"{servers.gateway_url}/veil-panel/audit-stream?backlog=10")
+        assert "PII_EMAIL_" in chunk
+        assert VALID_EMAIL not in chunk
+
+    def test_bad_backlog_is_ignored(self, servers: _Servers) -> None:
+        chunks = _read_sse_chunks_until_idle(
+            f"{servers.gateway_url}/veil-panel/audit-stream?backlog=-3",
+            idle_timeout=0.8,
+            overall_timeout=2.0,
+        )
+        assert chunks == []
+
+
+class TestBenchmarksRoute:
+    def test_serves_the_benchmark_results(self, servers: _Servers) -> None:
+        resp = _get(f"{servers.gateway_url}/veil-panel/benchmarks")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["soft"] and all("recall" in row for row in data["soft"])
+        assert servers.upstream_state.requests == []
+
+
 def _read_sse_chunks_until_idle(
     url: str, *, idle_timeout: float = 1.5, overall_timeout: float = 8.0
 ) -> list[str]:
@@ -1190,6 +1219,14 @@ class TestCycleKindClassification:
         for stage in gateway_server.PIPELINE_STAGES:
             event = next(e for e in events if e["stage"] == stage)
             assert event["kind"] == "conversation", stage
+
+    def test_every_stage_carries_the_session_id(self, servers: _Servers) -> None:
+        """The panel scopes its vault view to one prompt's session with it."""
+        events = _run_request_and_collect_pipeline_events(
+            servers, {"messages": [{"role": "user", "content": "hello there"}]}
+        )
+        assert events
+        assert all(event["session_id"] == HOOK_SESSION_ID for event in events)
 
     def test_a_real_turn_prefixed_with_a_system_reminder_is_not_hidden(
         self, servers: _Servers

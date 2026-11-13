@@ -69,8 +69,11 @@
   .tab-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px; }
   .turn { display: block; width: 100%; text-align: left; margin-bottom: 6px; padding: 8px 10px; }
   .turn.sel { border-color: #2f5d97; background: #1d2c44; }
-  .turn .p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .turn .m { color: var(--muted); font-size: 12px; }
+  .turn .p { white-space: pre-wrap; word-break: break-word; }
+  .turn .m { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .scope { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .scope .chip { border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; }
+  .scope label { display: flex; gap: 5px; align-items: center; cursor: pointer; margin-left: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   td, th { padding: 4px 4px; text-align: left; border-bottom: 1px solid #1f2633; vertical-align: top; }
   th { color: var(--muted); font-weight: 500; }
@@ -155,6 +158,46 @@
   .dot-pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--api); animation: pulse 1s infinite alternate; }
   @keyframes pulse { from { opacity: 0.25; } to { opacity: 1; } }
   .empty { color: var(--muted); padding: 40px 10px; text-align: center; }
+  .views { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 3px; }
+  .views button { border: none; background: none; padding: 4px 14px; color: var(--muted); }
+  .views button.on { background: var(--panel-2); color: var(--text); box-shadow: inset 0 -2px var(--accent); }
+
+  /* ---- metrics ---- */
+  .metrics { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 22px 48px; }
+  .metrics h2 { font-size: 17px; margin: 26px 0 4px; }
+  .metrics h2:first-child { margin-top: 4px; }
+  .metrics .lede { color: var(--muted); font-size: 13.5px; margin: 0 0 10px; max-width: 980px; }
+  .kpis { display: flex; gap: 10px; flex-wrap: wrap; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; min-width: 130px; }
+  .kpi .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .kpi .l { color: var(--muted); font-size: 12.5px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 4px 6px; overflow-x: auto; }
+  table.bench { font-size: 13.5px; min-width: 900px; }
+  table.bench th { position: sticky; top: 0; background: var(--panel); white-space: nowrap; padding: 8px 8px 6px; cursor: pointer; user-select: none; }
+  table.bench th.num, table.bench td.num { text-align: right; }
+  table.bench td { padding: 7px 8px; border-bottom: 1px solid #1f2633; vertical-align: middle; }
+  table.bench tr:last-child td { border-bottom: none; }
+  table.bench tr.demo td { background: #46d68c0d; }
+  .det-name { font-weight: 600; }
+  .det-sub { color: var(--muted); font-size: 12px; }
+  .fam { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: 0; }
+  .num .n { font-variant-numeric: tabular-nums; }
+  .num .n.best { color: var(--token); font-weight: 700; }
+  .meter { height: 4px; border-radius: 2px; background: #232b39; margin-top: 4px; overflow: hidden; }
+  .meter i { display: block; height: 100%; border-radius: 2px; }
+  .tag { font-size: 11px; border: 1px solid var(--token); color: var(--token); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .heat td.cell { text-align: center; font-variant-numeric: tabular-nums; border-radius: 4px; }
+  .heat td.cell .pct { display: block; font-size: 11px; opacity: 0.8; }
+  .structured { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 8px; }
+  .structured div { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+  .structured b { display: block; font-size: 13px; }
+  .structured span { color: var(--muted); font-size: 12px; }
+  dl.defs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 13.5px; max-width: 980px; }
+  dl.defs dt { font-weight: 600; }
+  dl.defs dd { margin: 0; color: var(--muted); }
+  .leak-0 { color: var(--token); font-weight: 600; }
+  .leak-n { color: var(--danger); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -165,11 +208,14 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } = React;
 
-// Same constants as panel.html / the gateway's PipelineEventBus.
+// Same constants as the gateway's PipelineEventBus.
 const HISTORY_LIMIT = 20;
 const HIDDEN_KINDS = new Set(["title_generation", "safety_check", "internal_continuation"]);
 const TOKEN_RE = /PII_([A-Z]+)_\d{4}/g;
 const REPLAY_STEP_MS = 2600;
+// Audit rows replayed on load, and kept in memory.
+const AUDIT_BACKLOG = 3000;
+const AUDIT_KEEP = 6000;
 const DEMO_PROMPT = "The user lucia.ferrer@riberanorte.es has an invoice problem. Can you check the database and tell me what happened?";
 // Steps older than this page load are history: listed, never animated.
 const PAGE_LOADED_AT = new Date(Date.now() - 1500).toISOString();
@@ -424,6 +470,37 @@ function turnStats(cycles, turnId, steps) {
   return { tokens: tokens.size, rounds: ids.length, tools: steps.filter((s) => s.kind === "pre").length };
 }
 
+// What belongs to one prompt: its Claude Code session, the time it ran (from
+// its first event to its last; open-ended while in flight) and every token
+// seen in its texts. The vault and audit tabs filter on this.
+const SCOPE_BEFORE_MS = 2000;
+const SCOPE_AFTER_MS = 5000;
+function turnScope(cycles, turnId, inFlight) {
+  const ids = roundIdsOf(cycles, turnId);
+  const tokens = new Set();
+  let sessionId = null;
+  let start = Infinity, end = -Infinity;
+  const seeTime = (t) => {
+    if (!t) return;
+    const ms = Date.parse(t);
+    if (ms < start) start = ms;
+    if (ms > end) end = ms;
+  };
+  const seeText = (t) => (t || "").replace(TOKEN_RE, (tok) => tokens.add(tok));
+  ids.forEach((id) => {
+    const c = cycles[id];
+    if (!c) return;
+    sessionId = sessionId || c.sessionId;
+    Object.values(c.stages).forEach((st) => { seeTime(st.timestamp); seeText(st.text); });
+    (c.hookEvents || []).forEach((h) => { seeTime(h.timestamp); seeText(h.before); seeText(h.after); });
+  });
+  return {
+    sessionId, tokens,
+    from: start - SCOPE_BEFORE_MS,
+    to: inFlight ? Infinity : end + SCOPE_AFTER_MS,
+  };
+}
+
 // ------------------------------------------------------------------ step cards
 const STEP_META = {
   prompt: { title: "Your prompt", where: "veil gateway", c: "var(--token)",
@@ -443,17 +520,42 @@ const STEP_META = {
     bl: ["Claude's answer (tokens)", "On your screen"] },
 };
 
-function Box({ label, children }) {
+function Box({ label, children, preRef, onScroll }) {
   return (
     <div className="box">
       <div className="bl">{label}</div>
-      <pre>{children}</pre>
+      <pre ref={preRef} onScroll={onScroll}>{children}</pre>
     </div>
   );
 }
 
+// Scrolling either box of a before/after pair scrolls the other to the same
+// relative position, so the two texts stay side by side. The box being
+// scrolled by the user leads; the follower's own scroll events are ignored
+// until the leader goes quiet.
+function useSyncedScroll() {
+  const left = useRef(null);
+  const right = useRef(null);
+  const leader = useRef(null);
+  const timer = useRef(null);
+  const follow = (src, dst) => () => {
+    if (leader.current && leader.current !== src) return;
+    leader.current = src;
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => { leader.current = null; }, 120);
+    const a = src.current, b = dst.current;
+    if (!a || !b) return;
+    const max = a.scrollHeight - a.clientHeight;
+    const ratio = max > 0 ? a.scrollTop / max : 0;
+    b.scrollTop = ratio * (b.scrollHeight - b.clientHeight);
+  };
+  useEffect(() => () => clearTimeout(timer.current), []);
+  return { left, right, onLeft: follow(left, right), onRight: follow(right, left) };
+}
+
 function StepCard({ step, index, current }) {
   const meta = STEP_META[step.kind];
+  const sync = useSyncedScroll();
   let before = null, after = null, metaText = "", error = false;
   if (step.kind === "prompt") {
     before = renderSpans(step.before, step.beforeSpans);
@@ -487,9 +589,9 @@ function StepCard({ step, index, current }) {
       </div>
       <div className="why">{meta.why}</div>
       <div className="ba">
-        <Box label={meta.bl[0]}>{before}</Box>
+        <Box label={meta.bl[0]} preRef={sync.left} onScroll={sync.onLeft}>{before}</Box>
         <div className="arrow">→</div>
-        <Box label={meta.bl[1]}>{after}</Box>
+        <Box label={meta.bl[1]} preRef={sync.right} onScroll={sync.onRight}>{after}</Box>
       </div>
     </div>
   );
@@ -552,34 +654,47 @@ function AskBox({ onStarted, onRunning }) {
   );
 }
 
-function AuditPane({ hidden }) {
-  const [rows, setRows] = useState([]);
-  useEventSource("/veil-panel/audit-stream", (e) => setRows((prev) => [{ ...e, _k: Math.random() }, ...prev].slice(0, 80)));
+function auditKey(e) {
+  return `${e.timestamp}|${e.token}|${e.offset}|${e.adapter}`;
+}
+
+function inScope(scope, ms) {
+  return ms >= scope.from && ms <= scope.to;
+}
+
+function AuditPane({ hidden, rows, scope }) {
+  const shown = scope ? rows.filter((r) => inScope(scope, Date.parse(r.timestamp))) : [];
+  const byDetector = {};
+  shown.forEach((r) => { byDetector[r.detector] = (byDetector[r.detector] || 0) + 1; });
   return (
     <div hidden={hidden}>
-      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>Every token created. Never a value.</div>
+      <div className="scope">
+        <span>Every substitution made for the selected prompt. Never a value.</span>
+        {Object.entries(byDetector).map(([d, n]) => <span key={d} className="chip">{d.toLowerCase()} {n}</span>)}
+      </div>
       <table>
         <thead><tr><th>Time</th><th>Where</th><th>Detector</th><th>Token</th></tr></thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r._k} className="audit-new">
+          {[...shown].reverse().map((r) => (
+            <tr key={r._k} className={r._live ? "audit-new" : ""}>
               <td>{new Date(r.timestamp).toLocaleTimeString()}</td>
               <td>{(r.adapter || "").replace("hooks:", "")}</td>
               <td>{r.detector}</td>
               <td className="mono">{r.token}</td>
             </tr>
           ))}
-          {!rows.length && <tr><td colSpan="4" className="muted">Waiting for tokens…</td></tr>}
+          {!shown.length && <tr><td colSpan="4" className="muted">{scope ? "No tokens for this prompt yet." : "Select a prompt."}</td></tr>}
         </tbody>
       </table>
     </div>
   );
 }
 
-function VaultPane({ hidden }) {
+function VaultPane({ hidden, scope, onCount }) {
   const [mappings, setMappings] = useState([]);
   const [revealed, setRevealed] = useState({});
   const [filter, setFilter] = useState("");
+  const [everything, setEverything] = useState(false);
   const refresh = useCallback(() => {
     fetch("/veil-panel/vault").then((r) => r.json()).then((d) => setMappings(d.mappings || [])).catch(() => {});
   }, []);
@@ -594,15 +709,28 @@ function VaultPane({ hidden }) {
       .then((d) => setRevealed((p) => ({ ...p, [key(m)]: d.value ?? d.error ?? "(error)" })))
       .catch(() => setRevealed((p) => ({ ...p, [key(m)]: "(gateway unreachable)" })));
   };
-  const shown = mappings.filter((m) => !filter || m.token.includes(filter.toUpperCase()));
+  // A prompt's tokens: same session, and either seen in its texts or minted
+  // while it ran (the hooks' texts are truncated, so a token can be missing
+  // from them).
+  const scoped = !scope ? [] : mappings.filter((m) =>
+    (!scope.sessionId || m.session_id === scope.sessionId) &&
+    (scope.tokens.has(m.token) || inScope(scope, m.created_at * 1000)));
+  const base = everything ? mappings : scoped;
+  useEffect(() => { onCount(scoped.length); });
+  const shown = base
+    .filter((m) => !filter || m.token.includes(filter.toUpperCase()))
+    .sort((a, b) => (a.token < b.token ? -1 : 1));
   return (
     <div hidden={hidden}>
       <input className="filter" placeholder="filter, e.g. IBAN" value={filter} onChange={(e) => setFilter(e.target.value)} />
-      <div className="muted" style={{ fontSize: 12.5, marginBottom: 6 }}>AES-GCM · {mappings.length} tokens</div>
+      <div className="scope">
+        <span>AES-GCM · {everything ? `${mappings.length} tokens, every session` : `${scoped.length} tokens for the selected prompt`}</span>
+        <label><input type="checkbox" checked={everything} onChange={(e) => setEverything(e.target.checked)} /> all sessions</label>
+      </div>
       <table>
         <thead><tr><th>Token</th><th>Stored as</th><th></th></tr></thead>
         <tbody>
-          {shown.slice(0, 200).map((m) => {
+          {shown.slice(0, 300).map((m) => {
             const k = key(m);
             return (
               <tr key={k}>
@@ -618,8 +746,234 @@ function VaultPane({ hidden }) {
               </tr>
             );
           })}
+          {!shown.length && <tr><td colSpan="3" className="muted">{scope || everything ? "No tokens." : "Select a prompt."}</td></tr>}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ metrics
+const FAMILY = {
+  llm: { c: "var(--llm)", label: "local LLM" },
+  encoder: { c: "var(--encoder)", label: "encoder" },
+  combo: { c: "var(--token)", label: "LLM + GLiNER" },
+};
+// Columns of the soft-layer table: key, header, how to read it, higher is better?
+const SOFT_COLS = [
+  ["recall", "Recall", "share of the real PII found (every miss is a leak)", true],
+  ["precision", "Precision", "share of detections that were real PII", true],
+  ["f1", "F1", "harmonic mean of recall and precision", true],
+  ["f2", "F2", "like F1, recall weighted twice", true],
+  ["soft_fp", "Soft FP", "soft spans that matched no real value (over-tokenization)", false],
+  ["decoys", "Decoys", "look-alike values wrongly tagged (of 194)", false],
+  ["ms_per_cell", "ms / cell", "average detection time per database cell", false],
+];
+const RATIO_COLS = new Set(["recall", "precision", "f1", "f2"]);
+const fmtRatio = (v) => v.toFixed(3);
+const fmtInt = (v) => (v == null ? "–" : v.toLocaleString("en-US"));
+const fmtMs = (v) => (v >= 100 ? v.toFixed(0) : v.toFixed(1));
+
+function heat(ratio) {
+  if (ratio >= 0.97) return "#46d68c38";
+  if (ratio >= 0.9) return "#9fd64626";
+  if (ratio >= 0.75) return "#e8b04a2e";
+  if (ratio >= 0.5) return "#ff8a4f2e";
+  return "#ff646433";
+}
+
+function Meter({ value, max, colour, log }) {
+  let w = 0;
+  if (log) w = Math.max(0.04, Math.log10(1 + value) / Math.log10(1 + max));
+  else w = max ? value / max : 0;
+  return <div className="meter"><i style={{ width: `${Math.min(1, w) * 100}%`, background: colour }} /></div>;
+}
+
+function SoftTable({ rows }) {
+  const [sort, setSort] = useState(["f2", true]);
+  const [key, desc] = sort;
+  const sorted = [...rows].sort((a, b) => ((a[key] ?? 0) - (b[key] ?? 0)) * (desc ? -1 : 1));
+  const best = {};
+  const max = {};
+  SOFT_COLS.forEach(([k, , , higher]) => {
+    const vals = rows.map((r) => r[k]).filter((v) => v != null);
+    best[k] = higher ? Math.max(...vals) : Math.min(...vals);
+    max[k] = Math.max(...vals, 0);
+  });
+  return (
+    <div className="card">
+      <table className="bench">
+        <thead>
+          <tr>
+            <th onClick={() => setSort(["f2", true])}>Detector (regex always on)</th>
+            {SOFT_COLS.map(([k, label, help, higher]) => (
+              <th key={k} className="num" title={help}
+                onClick={() => setSort([k, key === k ? !desc : higher])}>
+                {label}{key === k ? (desc ? " ↓" : " ↑") : ""}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((r) => {
+            const fam = FAMILY[r.family] || FAMILY.encoder;
+            return (
+              <tr key={r.id} className={r.demo ? "demo" : ""}>
+                <td>
+                  <div className="det-name"><i className="fam" style={{ background: fam.c }} />{r.detector}{r.demo && <span className="tag">current demo</span>}</div>
+                  <div className="det-sub">{r.layers} · {r.size}</div>
+                  {r.note && <div className="note">{r.note}</div>}
+                </td>
+                {SOFT_COLS.map(([k]) => {
+                  const v = r[k];
+                  const text = v == null ? "–" : RATIO_COLS.has(k) ? fmtRatio(v) : k === "ms_per_cell" ? fmtMs(v) : fmtInt(v);
+                  const colour = RATIO_COLS.has(k) ? fam.c : k === "ms_per_cell" ? "#6aa8ff" : "var(--danger)";
+                  return (
+                    <td key={k} className="num">
+                      <span className={"n" + (v === best[k] ? " best" : "")}>{text}</span>
+                      {v != null && <Meter value={v} max={RATIO_COLS.has(k) ? 1 : max[k]} log={k === "ms_per_cell"} colour={colour} />}
+                    </td>
+                  );
+                })}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TypeHeat({ rows, types }) {
+  return (
+    <div className="card">
+      <table className="bench heat">
+        <thead>
+          <tr><th>Detector</th>{types.map((t) => <th key={t} style={{ textAlign: "center" }}>{t}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.id}>
+              <td><div className="det-name"><i className="fam" style={{ background: (FAMILY[r.family] || FAMILY.encoder).c }} />{r.detector}</div></td>
+              {types.map((t) => {
+                const [found, total] = r.by_type[t];
+                const ratio = total ? found / total : 0;
+                return (
+                  <td key={t} className="cell" style={{ background: heat(ratio) }} title={`${found} of ${total}`}>
+                    {found}/{total}<span className="pct">{(ratio * 100).toFixed(1)}%</span>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function median(xs) {
+  const s = [...xs].sort((a, b) => a - b);
+  if (!s.length) return null;
+  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+}
+
+function DemoRuns({ configs }) {
+  return (
+    <div className="card">
+      <table className="bench">
+        <thead>
+          <tr>
+            <th>Gateway configuration</th>
+            <th className="num" title="median wall time of one full demo turn">Median turn</th>
+            <th className="num">Each run (s)</th>
+            <th className="num" title="requests the gateway forwarded to the Claude API">API requests</th>
+            <th className="num" title="synthetic demo values found in clear in a forwarded request">Demo PII leaked</th>
+            <th className="num" title="the presenter's Windows username, from a PATH printed by a tool call">Username leaked</th>
+          </tr>
+        </thead>
+        <tbody>
+          {configs.map((c) => {
+            const secs = c.runs.map((r) => r.seconds);
+            const leakRuns = c.runs.filter((r) => r.leaks.length);
+            const envRuns = c.runs.filter((r) => r.env_leaks.length).length;
+            return (
+              <tr key={c.id} className={c.demo ? "demo" : ""}>
+                <td>
+                  <div className="det-name"><i className="fam" style={{ background: (FAMILY[c.family] || FAMILY.llm).c }} />{c.label}{c.demo && <span className="tag">current demo</span>}</div>
+                  <div className="det-sub">{c.layers}</div>
+                  {c.note && <div className="note">{c.note}</div>}
+                </td>
+                <td className="num"><span className="n">{secs.length ? `${Math.round(median(secs))} s` : "–"}</span></td>
+                <td className="num"><span className="n">{secs.join(" · ")}</span></td>
+                <td className="num"><span className="n">{c.runs.map((r) => r.requests).join(" · ")}</span></td>
+                <td className="num">
+                  <span className={leakRuns.length ? "leak-n" : "leak-0"}>{leakRuns.length} of {c.runs.length} runs</span>
+                  {leakRuns.map((r, i) => <div key={i} className="note">{r.leaks.join(", ")}</div>)}
+                </td>
+                <td className="num"><span className={envRuns ? "leak-n" : "leak-0"}>{envRuns} of {c.runs.length} runs</span></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MetricsView() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    fetch("/veil-panel/benchmarks").then((r) => r.json()).then(setData).catch(() => setError("could not load the benchmark results"));
+  }, []);
+  if (error) return <div className="metrics"><div className="empty">{error}</div></div>;
+  if (!data) return <div className="metrics"><div className="empty">Loading…</div></div>;
+  const st = data.structured;
+  const stFound = st.types.reduce((a, t) => a + t.found, 0);
+  const stTotal = st.types.reduce((a, t) => a + t.support, 0);
+  return (
+    <div className="metrics">
+      <h2>Benchmark corpus</h2>
+      <p className="lede">Synthetic database from {data.corpus.source}: English free text with Spanish data. Every run is regex plus the soft detector(s) named, the way the gateway runs. Measured {data.measured} at commit {data.commit}; {data.hardware}.</p>
+      <div className="kpis">
+        <div className="kpi"><div className="v">{fmtInt(data.corpus.cells)}</div><div className="l">database cells scanned</div></div>
+        <div className="kpi"><div className="v">{fmtInt(data.corpus.instances)}</div><div className="l">real PII values</div></div>
+        <div className="kpi"><div className="v">{fmtInt(data.corpus.soft_instances)}</div><div className="l">soft values (names, orgs…)</div></div>
+        <div className="kpi"><div className="v">{fmtInt(data.corpus.decoys)}</div><div className="l">decoys (look-alikes)</div></div>
+        <div className="kpi"><div className="v">{((stFound / stTotal) * 100).toFixed(0)}%</div><div className="l">structured recall (regex)</div></div>
+      </div>
+
+      {data.demo_runs && data.demo_runs.length > 0 && <>
+        <h2>The demo turn, end to end</h2>
+        <p className="lede">The presentation prompt run through the real gateway, hooks and Claude API, with a recording proxy between the gateway and the API. A leak is any of the 22 synthetic values of the demo customer found in clear in a forwarded request.</p>
+        <DemoRuns configs={data.demo_runs} />
+      </>}
+
+      <h2>Soft layer: detector comparison</h2>
+      <p className="lede">Names, companies, addresses, birth dates, usernames and health data: what no regex can prove. Click a column to sort; the best value in each column is green. Bars for ms / cell use a log scale.</p>
+      <SoftTable rows={data.soft} />
+
+      <h2>Soft layer by entity type (found / total)</h2>
+      <p className="lede">Green is 97% or more; red is under half.</p>
+      <TypeHeat rows={data.soft} types={data.soft_types} />
+
+      <h2>Structured layer: regex with check digits</h2>
+      <p className="lede">{fmtInt(stFound)} of {fmtInt(stTotal)} found, {st.decoys} decoys hit, {st.ms_per_cell} ms per cell. DNI/NIE letter, IBAN mod-97, card Luhn and the other format rules make these exact.</p>
+      <div className="structured">
+        {st.types.map((t) => <div key={t.type}><b>{t.type}</b><span>{t.found}/{t.support} · {t.fp} FP</span></div>)}
+      </div>
+
+      <h2>How to read it</h2>
+      <dl className="defs">
+        <dt>Recall</dt><dd>Share of the real PII that was detected. The safety metric: every miss is a value that reaches the API in clear.</dd>
+        <dt>Precision</dt><dd>Share of the detections that were real PII. A false positive leaks nothing; it only over-tokenizes.</dd>
+        <dt>F1 / F2</dt><dd>Harmonic means of the two; F2 weights recall twice, which fits a privacy tool.</dd>
+        <dt>Soft FP</dt><dd>Soft-layer spans that matched no real value.</dd>
+        <dt>Decoys</dt><dd>Values that look like PII but are not (DNI with a wrong letter, Luhn-failing card, invalid IP…). Any span on one counts.</dd>
+        <dt>ms / cell</dt><dd>Average detection time for one database cell, GPU, one call at a time.</dd>
+        <dt>Matching</dt><dd>Structured types need the exact span and type. Soft values count as found when the soft spans cover at least 90% of their characters, whatever the label.</dd>
+      </dl>
     </div>
   );
 }
@@ -632,16 +986,30 @@ function App() {
   const [follow, setFollow] = useState(true);
   const [flow, setFlow] = useState(null);
   const [replay, setReplay] = useState(null); // steps shown while replaying
-  const [tab, setTab] = useState("turns");
+  const [tab, setTab] = useState("prompts");
+  const [view, setView] = useState("flow");
   const [askRunning, setAskRunning] = useState(false);
+  const [auditRows, setAuditRows] = useState([]);
+  const [vaultCount, setVaultCount] = useState(0);
+  const auditSeen = useRef(new Set());
   const followRef = useRef(follow);
   followRef.current = follow;
   const known = useRef(new Set());
   const animated = useRef({});
   const stepsRef = useRef(null);
 
+  // The backlog replays earlier prompts' rows; a reconnect replays it again,
+  // so rows are de-duplicated by their own fields.
+  useEventSource(`/veil-panel/audit-stream?backlog=${AUDIT_BACKLOG}`, (e) => {
+    const k = auditKey(e);
+    if (auditSeen.current.has(k)) return;
+    auditSeen.current.add(k);
+    const live = e.timestamp >= PAGE_LOADED_AT;
+    setAuditRows((prev) => [...prev, { ...e, _k: k, _live: live }].slice(-AUDIT_KEEP));
+  });
+
   useEventSource("/veil-panel/pipeline-stream", (ev) => {
-    const { request_id, stage, text, spans, timestamp, kind, parent_request_id } = ev;
+    const { request_id, stage, text, spans, timestamp, kind, parent_request_id, session_id } = ev;
     const isNew = !known.current.has(request_id);
     known.current.add(request_id);
     setCycles((prev) => {
@@ -654,6 +1022,7 @@ function App() {
           requestId: request_id, stages, hookEvents,
           kind: kind && kind !== "hook" ? kind : ex ? ex.kind : "conversation",
           parentRequestId: parent_request_id || (ex ? ex.parentRequestId : null) || null,
+          sessionId: session_id || (ex ? ex.sessionId : null) || null,
           firstSeenAt: ex ? ex.firstSeenAt : timestamp,
         },
       };
@@ -669,6 +1038,8 @@ function App() {
   const latest = turns[turns.length - 1];
   const { steps, inFlight } = useMemo(() => (selected ? buildSteps(cycles, selected) : { steps: [], inFlight: false }), [cycles, selected]);
   const stats = selected ? turnStats(cycles, selected, steps) : null;
+  const scope = useMemo(() => (selected ? turnScope(cycles, selected, inFlight) : null), [cycles, selected, inFlight]);
+  const auditCount = scope ? auditRows.filter((r) => inScope(scope, Date.parse(r.timestamp))).length : 0;
   const visible = replay == null ? steps : steps.slice(0, replay);
 
   const scrollTo = (index, block) => {
@@ -722,43 +1093,49 @@ function App() {
         <div className="brand"><b>veil</b><span>what leaves your machine</span></div>
         <AskBox onStarted={() => { setReplay(null); setFollow(true); }} onRunning={setAskRunning} />
         <div className="tabs">
-          {[["turns", `Turns (${turns.length})`], ["vault", "Vault"], ["audit", "Audit log"]].map(([id, label]) => (
+          {[["prompts", `Prompts (${turns.length})`], ["vault", `Vault (${scope ? vaultCount : 0})`], ["audit", `Audit log (${auditCount})`]].map(([id, label]) => (
             <button key={id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
           ))}
         </div>
         <div className="tab-body">
-          <div hidden={tab !== "turns"}>
+          <div hidden={tab !== "prompts"}>
             {[...turns].reverse().map((id) => {
               const c = cycles[id];
               const t = (c.stages.tokenized && c.stages.tokenized.text) || (c.stages.received && c.stages.received.text) || "…";
               return (
                 <button key={id} className={"turn" + (id === selected ? " sel" : "")} onClick={() => select(id)}>
-                  <div className="p">{renderTokens(t.slice(0, 120))}</div>
+                  <div className="p">{renderTokens(t)}</div>
                   <div className="m">{new Date(c.firstSeenAt).toLocaleTimeString()}</div>
                 </button>
               );
             })}
-            {!turns.length && <div className="muted">No turns yet. Run a prompt above.</div>}
+            {!turns.length && <div className="muted">No prompts yet. Run one above.</div>}
           </div>
-          <VaultPane hidden={tab !== "vault"} />
-          <AuditPane hidden={tab !== "audit"} />
+          <VaultPane hidden={tab !== "vault"} scope={scope} onCount={setVaultCount} />
+          <AuditPane hidden={tab !== "audit"} rows={auditRows} scope={scope} />
         </div>
       </aside>
       <main className="main">
-        <div className="top">
+        <div className="top" style={view === "metrics" ? { paddingBottom: 0, borderBottom: "none" } : null}>
           <div className="bar">
-            {stats && <>
+            <div className="views">
+              <button className={view === "flow" ? "on" : ""} onClick={() => setView("flow")}>Flow</button>
+              <button className={view === "metrics" ? "on" : ""} onClick={() => setView("metrics")}>Metrics</button>
+            </div>
+            {view === "flow" && stats && <>
               <div className="stat good"><span className="v">{stats.tokens}</span><span className="l">values kept local</span></div>
               <div className="stat"><span className="v">{stats.tools}</span><span className="l">local tool calls</span></div>
               <div className="stat"><span className="v">{stats.rounds}</span><span className="l">API requests</span></div>
               <div className="stat"><span className="v">{inFlight || (askRunning && selected === latest) ? "running" : "done"}</span></div>
             </>}
             <span className="spacer" />
-            <label className="follow"><input type="checkbox" checked={follow} onChange={(e) => toggleFollow(e.target.checked)} /> follow latest</label>
-            <button className="primary" disabled={!steps.length || replay != null} onClick={() => setReplay(0)}>▶ Replay this turn</button>
-            {replay != null && <button onClick={() => setReplay(null)}>Stop</button>}
-            <a href="/veil-panel" style={{ color: "#7fb4ff", fontSize: 13 }}>classic panel</a>
+            {view === "flow" && <>
+              <label className="follow"><input type="checkbox" checked={follow} onChange={(e) => toggleFollow(e.target.checked)} /> follow latest</label>
+              <button className="primary" disabled={!steps.length || replay != null} onClick={() => setReplay(0)}>▶ Replay this prompt</button>
+              {replay != null && <button onClick={() => setReplay(null)}>Stop</button>}
+            </>}
           </div>
+          <div hidden={view !== "flow"}>
           <Diagram flow={flow} />
           <div className="legend">
             <span><i style={{ background: "var(--regex)" }} />regex</span>
@@ -767,9 +1144,11 @@ function App() {
             <span><i style={{ background: "var(--token)" }} />token</span>
             <span><i style={{ background: "var(--detoken)" }} />real value, resolved locally</span>
           </div>
+          </div>
         </div>
-        <div className="steps" ref={stepsRef}>
-          {!selected && <div className="empty">Type a prompt on the left. The turn appears here as it happens.</div>}
+        {view === "metrics" && <MetricsView />}
+        <div className="steps" ref={stepsRef} hidden={view !== "flow"}>
+          {!selected && <div className="empty">Type a prompt on the left. Each step appears here as it happens.</div>}
           {visible.map((s, i) => (
             <StepCard key={s.key} step={s} index={i} current={replay != null ? i === replay - 1 : i === visible.length - 1 && inFlight} />
           ))}

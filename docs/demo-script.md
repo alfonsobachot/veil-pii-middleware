@@ -26,10 +26,10 @@ Run everything from Git Bash.
    scripts/run-gateway.sh
    ```
 
-3. Browser: open `http://127.0.0.1:8787/veil-panel/flow`. It works offline (vendored
+3. Browser: open `http://127.0.0.1:8787/veil-panel` (`/veil-panel/flow` still works). It works offline (vendored
    scripts). Type the prompt in the box at the top left (or click "use the demo prompt") and
    press Enter: the gateway runs `scripts/ask.sh --demo-db` itself, with its own `VEIL_LLM_*`
-   settings, so no second terminal is needed. The classic panel stays at `/veil-panel`.
+   settings, so no second terminal is needed.
 
 4. Fallback without the box: a second terminal with the same two `VEIL_LLM_*` exports, then
    the command below. The hooks only use the LLM when it is exported in the shell that runs
@@ -47,9 +47,9 @@ A turn takes about a minute, so narrate while it runs and use the replay afterwa
   right: only the local database sees it); the big **PostToolUse** card (left: the
   database output with names, DNI, IBANs, card; right: what Claude gets, all tokens);
   **The answer** (tokens on the left, real values on your screen on the right).
-- **▶ Replay this turn** walks through the finished turn one step every 2.6 s.
+- **▶ Replay this prompt** walks through the finished prompt one step every 2.6 s.
 - The counters on top: distinct values kept local, local tool calls, API requests.
-- Sidebar: **Vault** → filter `IBAN` → **Reveal** one token to show the encrypted store
+- Sidebar: **Vault** (the tokens of the selected prompt only) → filter `IBAN` → **Reveal** one token to show the encrypted store
   resolving it locally; the **Audit log** lists every token minted, never a value.
 
 Why each piece is there (live runs on 2026-11-11, recording what the gateway sent upstream):

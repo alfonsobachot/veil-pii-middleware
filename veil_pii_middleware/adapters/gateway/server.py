@@ -413,6 +413,10 @@ def _publish_stage(
         ]
     if kind is not None:
         event["kind"] = kind
+    if session_id:
+        # Not PII (a Claude Code session UUID): lets the panel scope its vault
+        # view to the tokens of one session.
+        event["session_id"] = session_id
     bus.publish(event, session_id=session_id)
 
 
@@ -420,10 +424,15 @@ def _publish_stage(
 #: plain HTML/CSS/vanilla-loaded React, no bundler, served directly
 #: by this process so there is no CORS to fight (see module docstring).
 _FRONTEND_DIR: Final = Path(__file__).resolve().parent.parent.parent / "frontend"
-_PANEL_HTML_PATH: Final = _FRONTEND_DIR / "panel.html"
-#: The flow view (prompt → tokenize → API → hooks → DB → answer), served at
-#: ``/veil-panel/flow``; ``panel.html`` stays as the classic view.
-_FLOW_HTML_PATH: Final = _FRONTEND_DIR / "flow.html"
+#: The panel (prompt → tokenize → API → hooks → DB → answer, plus the vault,
+#: the audit log and the benchmark results), served at ``/veil-panel`` and,
+#: for older links, ``/veil-panel/flow``.
+_PANEL_HTML_PATH: Final = _FRONTEND_DIR / "flow.html"
+#: Benchmark results shown in the panel's Metrics view (``docs/benchmarks.md``
+#: in data form), served at ``/veil-panel/benchmarks``.
+_BENCHMARKS_PATH: Final = _FRONTEND_DIR / "benchmarks.json"
+#: Most audit-log lines ``/veil-panel/audit-stream?backlog=N`` replays.
+_AUDIT_BACKLOG_MAX: Final = 5000
 #: Third-party scripts the panel loads, shipped in the package so the panel
 #: works without network access (React 18.3.1, Babel standalone 7.24.7).
 #: Served by exact name only: nothing outside this set is ever read from disk.
@@ -1628,14 +1637,14 @@ def make_handler(
                 self.send_response(204)
                 self.end_headers()
                 return True
-            if path in (_PANEL_PREFIX, f"{_PANEL_PREFIX}/"):
-                _write_html(self, 200, _PANEL_HTML_PATH.read_bytes())
-                return True
             if (
-                path in (f"{_PANEL_PREFIX}/flow", f"{_PANEL_PREFIX}/flow/")
+                path in (_PANEL_PREFIX, f"{_PANEL_PREFIX}/", f"{_PANEL_PREFIX}/flow")
                 and self.command == "GET"
             ):
-                _write_html(self, 200, _FLOW_HTML_PATH.read_bytes())
+                _write_html(self, 200, _PANEL_HTML_PATH.read_bytes())
+                return True
+            if path == f"{_PANEL_PREFIX}/benchmarks" and self.command == "GET":
+                _write_json(self, 200, json.loads(_BENCHMARKS_PATH.read_text(encoding="utf-8")))
                 return True
             vendor_prefix = f"{_PANEL_PREFIX}/vendor/"
             if path.startswith(vendor_prefix) and self.command == "GET":
@@ -1739,12 +1748,27 @@ def make_handler(
             return last_session_id.get("value", fallback_session_id)
 
         def _serve_audit_stream(self) -> None:
+            """Tail the audit log; ``?backlog=N`` first replays its last N lines.
+
+            The backlog lets a freshly opened panel show the audit rows of
+            prompts that ran before it connected (capped at
+            ``_AUDIT_BACKLOG_MAX``). Without it the tail starts at the end.
+            """
+            raw_backlog = _query_param(self.path, "backlog") or "0"
+            backlog = min(int(raw_backlog), _AUDIT_BACKLOG_MAX) if raw_backlog.isdigit() else 0
             _write_sse_headers(self)
             AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             AUDIT_LOG_PATH.touch(exist_ok=True)
             try:
                 with AUDIT_LOG_PATH.open(encoding="utf-8") as handle:
-                    handle.seek(0, os.SEEK_END)
+                    if backlog:
+                        # Reading to the end leaves the handle where the tail starts.
+                        tail: deque[str] = deque(handle, maxlen=backlog)
+                        for line in tail:
+                            if line.strip():
+                                _write_chunk(self, f"data: {line.strip()}\n\n".encode())
+                    else:
+                        handle.seek(0, os.SEEK_END)
                     while True:
                         line = handle.readline()
                         if not line:

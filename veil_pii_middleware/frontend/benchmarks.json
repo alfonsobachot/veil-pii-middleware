@@ -1,0 +1,489 @@
+{
+ "measured": "2026-11-12/13",
+ "commit": "5806341",
+ "hardware": "Windows 11, NVIDIA RTX 4090 (24 GB), Ollama 0.40.16, PyTorch 2.11 (CUDA 12.8)",
+ "corpus": {
+  "cells": 1063,
+  "instances": 2590,
+  "soft_instances": 1063,
+  "decoys": 194,
+  "source": "demo/seed.py (Faker es_ES, fixed seed)"
+ },
+ "soft_types": [
+  "PERSON",
+  "ORG",
+  "ADDRESS",
+  "DOB",
+  "USERNAME",
+  "SENSITIVE"
+ ],
+ "soft": [
+  {
+   "id": "llm-qwen3.8-27b",
+   "detector": "qwen3.8:27b-q4_K_M",
+   "family": "llm",
+   "layers": "regex + LLM",
+   "size": "27.8B dense",
+   "recall": 0.98683,
+   "precision": 0.997148,
+   "f1": 0.991962,
+   "f2": 0.988876,
+   "found": 1049,
+   "support": 1063,
+   "soft_fp": 3,
+   "decoys": 7,
+   "ms_per_cell": 2060.1,
+   "seconds": 2189.9,
+   "by_type": {
+    "PERSON": [
+     453,
+     456
+    ],
+    "ORG": [
+     100,
+     101
+    ],
+    "ADDRESS": [
+     151,
+     152
+    ],
+    "DOB": [
+     146,
+     153
+    ],
+    "USERNAME": [
+     99,
+     100
+    ],
+    "SENSITIVE": [
+     100,
+     101
+    ]
+   },
+   "structured_fp": {
+    "SECRET": 11
+   },
+   "structured_missed": {},
+   "note": "1 of 1,063 cells got an empty answer and fell back to regex-only (lower bound)",
+   "demo": false
+  },
+  {
+   "id": "llm-gpt-oss-20b",
+   "detector": "gpt-oss:20b",
+   "family": "llm",
+   "layers": "regex + LLM",
+   "size": "21B MoE",
+   "recall": 0.950141,
+   "precision": 0.995074,
+   "f1": 0.972089,
+   "f2": 0.9588,
+   "found": 1010,
+   "support": 1063,
+   "soft_fp": 5,
+   "decoys": 3,
+   "ms_per_cell": 821.9,
+   "seconds": 873.7,
+   "by_type": {
+    "PERSON": [
+     426,
+     456
+    ],
+    "ORG": [
+     99,
+     101
+    ],
+    "ADDRESS": [
+     149,
+     152
+    ],
+    "DOB": [
+     153,
+     153
+    ],
+    "USERNAME": [
+     99,
+     100
+    ],
+    "SENSITIVE": [
+     84,
+     101
+    ]
+   },
+   "structured_fp": {
+    "SECRET": 1
+   },
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  },
+  {
+   "id": "llm-qwen3-4b",
+   "detector": "qwen3:4b-instruct-2507-q4_K_M",
+   "family": "llm",
+   "layers": "regex + LLM",
+   "size": "4B",
+   "recall": 0.906867,
+   "precision": 0.985685,
+   "f1": 0.944635,
+   "f2": 0.921606,
+   "found": 964,
+   "support": 1063,
+   "soft_fp": 14,
+   "decoys": 4,
+   "ms_per_cell": 321.0,
+   "seconds": 341.2,
+   "by_type": {
+    "PERSON": [
+     435,
+     456
+    ],
+    "ORG": [
+     91,
+     101
+    ],
+    "ADDRESS": [
+     149,
+     152
+    ],
+    "DOB": [
+     151,
+     153
+    ],
+    "USERNAME": [
+     98,
+     100
+    ],
+    "SENSITIVE": [
+     40,
+     101
+    ]
+   },
+   "structured_fp": {
+    "SECRET": 2
+   },
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  },
+  {
+   "id": "enc-urchade_gliner_multi_pii-v1",
+   "detector": "urchade/gliner_multi_pii-v1",
+   "family": "encoder",
+   "layers": "regex + encoder",
+   "size": "GLiNER, mDeBERTa",
+   "recall": 0.912512,
+   "precision": 0.769231,
+   "f1": 0.834768,
+   "f2": 0.879739,
+   "found": 970,
+   "support": 1063,
+   "soft_fp": 291,
+   "decoys": 47,
+   "ms_per_cell": 17.6,
+   "seconds": 18.7,
+   "by_type": {
+    "PERSON": [
+     456,
+     456
+    ],
+    "ORG": [
+     99,
+     101
+    ],
+    "ADDRESS": [
+     127,
+     152
+    ],
+    "DOB": [
+     153,
+     153
+    ],
+    "USERNAME": [
+     93,
+     100
+    ],
+    "SENSITIVE": [
+     42,
+     101
+    ]
+   },
+   "structured_fp": {},
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  },
+  {
+   "id": "enc-fastino_gliner2-privacy-filter-PII-multi",
+   "detector": "fastino/gliner2-privacy-filter-PII-multi",
+   "family": "encoder",
+   "layers": "regex + encoder",
+   "size": "GLiNER2",
+   "recall": 0.856068,
+   "precision": 0.7171,
+   "f1": 0.780446,
+   "f2": 0.824126,
+   "found": 910,
+   "support": 1063,
+   "soft_fp": 359,
+   "decoys": 75,
+   "ms_per_cell": 16.6,
+   "seconds": 17.6,
+   "by_type": {
+    "PERSON": [
+     452,
+     456
+    ],
+    "ORG": [
+     74,
+     101
+    ],
+    "ADDRESS": [
+     72,
+     152
+    ],
+    "DOB": [
+     153,
+     153
+    ],
+    "USERNAME": [
+     100,
+     100
+    ],
+    "SENSITIVE": [
+     59,
+     101
+    ]
+   },
+   "structured_fp": {},
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  },
+  {
+   "id": "enc-OpenMed_privacy-filter-multilingual-v2",
+   "detector": "OpenMed/privacy-filter-multilingual-v2",
+   "family": "encoder",
+   "layers": "regex + encoder",
+   "size": "MoE token classifier",
+   "recall": 0.609595,
+   "precision": 0.993865,
+   "f1": 0.755685,
+   "f2": 0.660685,
+   "found": 648,
+   "support": 1063,
+   "soft_fp": 4,
+   "decoys": 16,
+   "ms_per_cell": 137.5,
+   "seconds": 146.1,
+   "by_type": {
+    "PERSON": [
+     378,
+     456
+    ],
+    "ORG": [
+     6,
+     101
+    ],
+    "ADDRESS": [
+     101,
+     152
+    ],
+    "DOB": [
+     73,
+     153
+    ],
+    "USERNAME": [
+     90,
+     100
+    ],
+    "SENSITIVE": [
+     0,
+     101
+    ]
+   },
+   "structured_fp": {},
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  },
+  {
+   "id": "enc-FacebookAI_xlm-roberta-large-finetuned-conll02-spanish",
+   "detector": "FacebookAI/xlm-roberta-large-finetuned-conll02-spanish",
+   "family": "encoder",
+   "layers": "regex + encoder",
+   "size": "classic NER",
+   "recall": 0.515522,
+   "precision": 0.971631,
+   "f1": 0.673632,
+   "f2": 0.568937,
+   "found": 548,
+   "support": 1063,
+   "soft_fp": 16,
+   "decoys": 0,
+   "ms_per_cell": 11.3,
+   "seconds": 12.1,
+   "by_type": {
+    "PERSON": [
+     432,
+     456
+    ],
+    "ORG": [
+     83,
+     101
+    ],
+    "ADDRESS": [
+     0,
+     152
+    ],
+    "DOB": [
+     0,
+     153
+    ],
+    "USERNAME": [
+     29,
+     100
+    ],
+    "SENSITIVE": [
+     4,
+     101
+    ]
+   },
+   "structured_fp": {},
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  },
+  {
+   "id": "enc-mrm8488_bert-spanish-cased-finetuned-ner",
+   "detector": "mrm8488/bert-spanish-cased-finetuned-ner",
+   "family": "encoder",
+   "layers": "regex + encoder",
+   "size": "classic NER",
+   "recall": 0.382879,
+   "precision": 0.326645,
+   "f1": 0.352534,
+   "f2": 0.370135,
+   "found": 407,
+   "support": 1063,
+   "soft_fp": 839,
+   "decoys": 10,
+   "ms_per_cell": 7.2,
+   "seconds": 7.7,
+   "by_type": {
+    "PERSON": [
+     348,
+     456
+    ],
+    "ORG": [
+     58,
+     101
+    ],
+    "ADDRESS": [
+     0,
+     152
+    ],
+    "DOB": [
+     0,
+     153
+    ],
+    "USERNAME": [
+     1,
+     100
+    ],
+    "SENSITIVE": [
+     0,
+     101
+    ]
+   },
+   "structured_fp": {},
+   "structured_missed": {},
+   "note": null,
+   "demo": false
+  }
+ ],
+ "structured": {
+  "ms_per_cell": 0.1,
+  "decoys": 0,
+  "types": [
+   {
+    "type": "EMAIL",
+    "support": 106,
+    "found": 106,
+    "fp": 0
+   },
+   {
+    "type": "DNI",
+    "support": 154,
+    "found": 154,
+    "fp": 0
+   },
+   {
+    "type": "NIE",
+    "support": 100,
+    "found": 100,
+    "fp": 0
+   },
+   {
+    "type": "IBAN",
+    "support": 108,
+    "found": 108,
+    "fp": 0
+   },
+   {
+    "type": "CARD",
+    "support": 101,
+    "found": 101,
+    "fp": 0
+   },
+   {
+    "type": "PHONE",
+    "support": 155,
+    "found": 155,
+    "fp": 0
+   },
+   {
+    "type": "IP",
+    "support": 202,
+    "found": 202,
+    "fp": 0
+   },
+   {
+    "type": "CIF",
+    "support": 101,
+    "found": 101,
+    "fp": 0
+   },
+   {
+    "type": "NSS",
+    "support": 100,
+    "found": 100,
+    "fp": 0
+   },
+   {
+    "type": "SECRET",
+    "support": 100,
+    "found": 100,
+    "fp": 0
+   },
+   {
+    "type": "PLATE",
+    "support": 100,
+    "found": 100,
+    "fp": 0
+   },
+   {
+    "type": "MAC",
+    "support": 100,
+    "found": 100,
+    "fp": 0
+   },
+   {
+    "type": "GPS",
+    "support": 100,
+    "found": 100,
+    "fp": 0
+   }
+  ]
+ },
+ "demo_runs": []
+}
