@@ -449,3 +449,29 @@ class TestDetectLayerErrorHandler:
     ) -> None:
         detector.detect("hello", use_llm=False, encoder=self._BrokenEncoder())
         assert "veil detector: encoder layer failed (RuntimeError" in capsys.readouterr().err
+
+
+def test_all_mode_runs_every_layer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--mode all`` is the gateway's full setup: regex, the LLM and the encoder."""
+    seen: list[dict[str, Any]] = []
+
+    def fake_detect(text: str, **kwargs: Any) -> list[Span]:
+        seen.append(kwargs)
+        return []
+
+    class _Encoder:
+        identity = "fake"
+
+        def detect_spans(self, text: str) -> list[Span]:
+            return []
+
+    encoder = _Encoder()
+    monkeypatch.setattr(eval_module, "detect", fake_detect)
+    evaluate(
+        *_corpus(tmp_path, [_instance("PERSON", _NAME)]),
+        mode="all",
+        llm_client=object(),  # type: ignore[arg-type]
+        encoder=encoder,
+    )
+    assert seen and seen[0]["use_regex"] and seen[0]["use_llm"]
+    assert seen[0]["encoder"] is encoder

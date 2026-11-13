@@ -55,13 +55,14 @@ from veil_pii_middleware.demo.seed import (
 )
 
 #: Which layers a run enables. "regex" is today's default and the only mode
-#: the recall gate is bound to; "llm"/"union" report, they do not gate.
-Mode = Literal["regex", "llm", "union", "encoder", "regex+encoder"]
+#: the recall gate is bound to; every other mode reports, it does not gate.
+#: "all" is regex + LLM + encoder, the gateway's full configuration.
+Mode = Literal["regex", "llm", "union", "encoder", "regex+encoder", "all"]
 
 #: Modes that need an LLM client / an encoder.
-LLM_MODES: Final = frozenset({"llm", "union"})
-ENCODER_MODES: Final = frozenset({"encoder", "regex+encoder"})
-REGEX_MODES: Final = frozenset({"regex", "union", "regex+encoder"})
+LLM_MODES: Final = frozenset({"llm", "union", "all"})
+ENCODER_MODES: Final = frozenset({"encoder", "regex+encoder", "all"})
+REGEX_MODES: Final = frozenset({"regex", "union", "regex+encoder", "all"})
 
 __all__ = [
     "DecoyHit",
@@ -540,14 +541,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decoys", type=Path, default=DEFAULT_DECOYS_PATH)
     parser.add_argument(
         "--mode",
-        choices=("regex", "llm", "union", "encoder", "regex+encoder"),
+        choices=("regex", "llm", "union", "encoder", "regex+encoder", "all"),
         default="regex",
         help=(
             "Which layer(s) to score. Only 'regex' (the default) gates on "
             "--min-recall/--max-false-positives; every other mode is report-only "
             "and exits 0 unless a layer call fails (exit 2). 'llm'/'union' read "
             f"{LLM_BASE_URL_ENV_VAR}/{LLM_MODEL_ENV_VAR}; 'encoder'/'regex+encoder' "
-            "read --encoder or VEIL_ENCODER."
+            "read --encoder or VEIL_ENCODER; 'all' (regex + LLM + encoder) reads both."
         ),
     )
     parser.add_argument(
